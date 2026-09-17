@@ -61,6 +61,24 @@ Keep the creator and the view owner the same identity and no `databricks_superus
 direct `GRANT SELECT` on the writer-owned base table is possible, but granting it to a *different*
 identity is the superuser path — the view avoids it.)
 
+### Row-level filtering (RLS is off the table — use the view)
+
+Row-level security policies **cannot be applied to a synced table** (an owner-only operation on the
+writer-owned table). Since consumers already read through a view, do row filtering **in the view**:
+give each consumer group its own view with a `WHERE` clause, and grant that group `SELECT` on only
+its view.
+
+```sql
+-- Example: a plan-scoped view for one consumer group
+CREATE OR REPLACE VIEW cicd_proj.members_gold_v AS
+  SELECT * FROM cicd_proj.members WHERE plan_code = 'GOLD';
+GRANT SELECT ON cicd_proj.members_gold_v TO gold_app_ro;
+```
+
+It's not policy-based RLS, but it achieves per-consumer row scoping with the same no-superuser,
+view-owned-by-deploy-identity model. Keep these views in a `runAlways:true` changeset so they
+survive a table replacement like the others.
+
 ## One database vs a database per app
 
 The permission limit above is not a reason to split into a database per app. Roles plus explicit

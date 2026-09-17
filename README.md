@@ -95,6 +95,8 @@ liquibase/          changelog: 001 app role, 002 explicit grants, 003 indexes, 0
 scripts/            seed_source.sh, wait_for_sync.sh, deploy.sh, branch_test.sh
 .github/workflows/  deploy.yml, pr-validate.yml, pr-cleanup.yml (reference-only; see RUNBOOK CI auth)
 docs/               DESIGN-NOTES.md (design reasoning), TROUBLESHOOTING.md, pipeline + access-model diagrams
+docs/adr/           architecture decision records — the load-bearing "why"s
+examples/           read_via_view.py — a consumer reading a synced table through its view
 Makefile            one-command entrypoint: make help | validate | seed | deploy | branch
 CONTRIBUTING.md     local checks + ground rules   |   LICENSE (MIT)
 ```

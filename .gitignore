@@ -9,3 +9,6 @@ crash.log
 # Liquibase secrets
 liquibase/liquibase.properties
 *.env
+
+# Local planning doc (grill-with-docs) — not shared
+CONTEXT.md
