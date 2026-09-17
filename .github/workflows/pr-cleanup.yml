@@ -1,0 +1,22 @@
+name: pr-cleanup
+
+# Delete the PR's ephemeral Lakebase branch when the PR closes. (Branches also auto-expire
+# via their TTL, so this is belt-and-suspenders.)
+# REFERENCE ONLY -- not wired (see RUNBOOK.md "CI auth"). Manual trigger only.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      PROJECT: my-lakebase-project
+    steps:
+      - name: Install Databricks CLI
+        run: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+      - name: Delete branch
+        run: |
+          databricks postgres delete-branch "projects/$PROJECT/branches/pr-${{ github.event.number }}" || true

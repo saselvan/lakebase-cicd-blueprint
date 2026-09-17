@@ -1,0 +1,40 @@
+name: pr-validate
+
+# On a PR: spin up an ephemeral copy-on-write Lakebase branch, run the migrations against
+# THAT branch (never production), validate, and leave it for review. pr-cleanup deletes it
+# on close. One branch per PR.
+# REFERENCE ONLY -- not wired (see RUNBOOK.md "CI auth"). Manual trigger only.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      PROJECT: my-lakebase-project
+    steps:
+      - uses: actions/checkout@v4
+      - uses: liquibase/setup-liquibase@v1
+        with: { version: "4.33.0", edition: "oss" }
+      - name: Install Databricks CLI
+        run: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+      - name: Branch slug from PR
+        run: echo "BRANCH=pr-${{ github.event.number }}" >> "$GITHUB_ENV"
+      - name: Create ephemeral CoW branch + run migrations on it
+        run: |
+          databricks postgres create-branch "projects/$PROJECT" "$BRANCH" \
+            --json '{"spec":{"ttl":"7200s"}}' --replace-existing
+          HOST=$(databricks postgres list-endpoints "projects/$PROJECT/branches/$BRANCH" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['status']['hosts']['host'])")
+          TOKEN=$(databricks database generate-database-credential \
+            --json "{\"instance_names\":[\"$PROJECT\"]}" -o json \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
+          cd liquibase && liquibase update \
+            --changeLogFile=changelog/db.changelog-master.xml \
+            --url="jdbc:postgresql://$HOST:5432/databricks_postgres?sslmode=require" \
+            --username="${{ secrets.DATABRICKS_CLIENT_ID }}" --password="$TOKEN" \
+            --liquibase-schema-name=cicd_proj
+          # add pytest/psycopg validation here -- it runs against the branch, not prod

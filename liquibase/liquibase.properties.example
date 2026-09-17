@@ -1,0 +1,7 @@
+# Copy to liquibase.properties (gitignored) and fill via env. Never commit real creds.
+# host = the instance read_write DNS endpoint for your Lakebase project/branch.
+url=jdbc:postgresql://your-lakebase-endpoint.database.cloud.databricks.com:5432/databricks_postgres?sslmode=require
+username=${LAKEBASE_USER}
+password=${LAKEBASE_PASSWORD}
+changelogFile=changelog/db.changelog-master.xml
+liquibase.hub.mode=off

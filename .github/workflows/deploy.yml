@@ -1,0 +1,28 @@
+name: deploy
+
+# Main deploy: Terraform (synced table) -> wait for sync -> Liquibase (grants + indexes).
+# This is the exact sequence in scripts/deploy.sh, which you can also run locally.
+# REFERENCE ONLY -- not wired to run by default. See RUNBOOK.md "CI auth" for the
+# recommended OIDC / Workload Identity Federation setup before enabling it.
+# Manual trigger only so it never auto-fails on a runner that can't reach the workspace.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}         # service principal
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }} # OAuth (M2M)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - uses: liquibase/setup-liquibase@v1
+        with: { version: "4.33.0", edition: "oss" }
+      - name: Install Databricks CLI
+        run: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+      - name: Deploy (terraform apply -> wait sync -> liquibase update)
+        run: ./scripts/deploy.sh
+        env:
+          PROFILE: DEFAULT   # CLI reads DATABRICKS_* env for auth

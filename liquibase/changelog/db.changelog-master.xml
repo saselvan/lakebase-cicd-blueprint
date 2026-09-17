@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+  xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+    http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+  <!-- Parameters. Override at runtime with -Dkey=value or a properties file
+       entry `parameter.key=value`. Defaults match the demo synced table. -->
+  <property name="app_schema"   value="cicd_proj"     global="true"/>
+  <property name="synced_table" value="members"       global="true"/>
+  <property name="app_role"     value="members_app_ro" global="true"/>
+
+  <!-- Order: role, then explicit app grants (reapplied after each sync),
+       then indexes (run only AFTER the initial sync has loaded data),
+       then the no-superuser consumer view + its grant. -->
+  <include file="001-app-role.sql"   relativeToChangelogFile="true"/>
+  <include file="002-app-grants.sql" relativeToChangelogFile="true"/>
+  <include file="003-indexes.sql"    relativeToChangelogFile="true"/>
+  <include file="004-app-view.sql"   relativeToChangelogFile="true"/>
+</databaseChangeLog>
