@@ -45,7 +45,8 @@ jobs:
 
       - name: Liquibase changelog offline validate (no database)
         run: |
-          docker run --rm -v "$PWD/liquibase:/liquibase/changelog" liquibase/liquibase:4.33 \
-            --changeLogFile=changelog/db.changelog-master.xml \
+          docker run --rm -v "$PWD/liquibase/changelog:/work" liquibase/liquibase:4.33 \
+            --search-path=/work \
+            --changeLogFile=db.changelog-master.xml \
             --url="offline:postgresql?version=16" \
             validate
