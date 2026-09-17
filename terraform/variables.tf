@@ -34,14 +34,6 @@ variable "storage_schema" {
   default     = "cicd_proj"
 }
 
-variable "source_table_full_name" {
-  description = "3-part Delta (UC) table to sync FROM."
-  type        = string
-  default     = "my_catalog.cicd_app.members_src"
-}
-
-variable "synced_table_id" {
-  description = "3-part UC name for the synced table (catalog.schema.table)."
-  type        = string
-  default     = "my_catalog.cicd_proj.members"
-}
+# NOTE: per-table settings (synced_table_id, source_table_full_name, primary_key_columns,
+# app_schema, app_role, index_columns) are NOT variables — they live in config/tables.json
+# and are read by both Terraform (for_each in main.tf) and scripts/deploy.sh.

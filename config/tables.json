@@ -1,0 +1,20 @@
+[
+  {
+    "name": "members",
+    "synced_table_id": "my_catalog.cicd_proj.members",
+    "source_table_full_name": "my_catalog.cicd_proj.members_src",
+    "primary_key_columns": ["id"],
+    "app_schema": "cicd_proj",
+    "app_role": "members_app_ro",
+    "index_columns": ["member_id", "plan_code"]
+  },
+  {
+    "name": "providers",
+    "synced_table_id": "my_catalog.cicd_proj.providers",
+    "source_table_full_name": "my_catalog.cicd_proj.providers_src",
+    "primary_key_columns": ["id"],
+    "app_schema": "cicd_proj",
+    "app_role": "providers_app_ro",
+    "index_columns": ["provider_id", "specialty_code"]
+  }
+]

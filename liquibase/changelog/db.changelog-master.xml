@@ -6,10 +6,13 @@
     http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
 
   <!-- Parameters. Override at runtime with -Dkey=value or a properties file
-       entry `parameter.key=value`. Defaults match the demo synced table. -->
+       entry `parameter.key=value`. Defaults match the demo `members` synced table.
+       scripts/deploy.sh overrides all of these per table from config/tables.json. -->
   <property name="app_schema"   value="cicd_proj"     global="true"/>
   <property name="synced_table" value="members"       global="true"/>
   <property name="app_role"     value="members_app_ro" global="true"/>
+  <property name="index_col_1"  value="member_id"     global="true"/>
+  <property name="index_col_2"  value="plan_code"     global="true"/>
 
   <!-- Order: role, then explicit app grants (reapplied after each sync),
        then indexes (run only AFTER the initial sync has loaded data),

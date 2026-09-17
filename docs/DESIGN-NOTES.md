@@ -107,6 +107,25 @@ Use copy-on-write branches to rehearse destructive migrations (dropping an index
 an ephemeral branch; the production copy is untouched. Two concerns, two tools: load speed →
 load-then-index; risky rebuild/move → branch test. Don't use one to solve the other.
 
+## Managing many tables
+
+Scale to many synced tables from **one config file**, not by copy-pasting resources or scripts.
+`config/tables.json` is the single source of truth, read by both layers:
+
+- **Terraform** does `for_each` over `jsondecode(file(".../config/tables.json"))`, so one
+  `databricks_postgres_synced_table` block provisions every entry. Adding a table is a one-line
+  edit to the JSON — no new resource, no new variable.
+- **The deploy loop** (`scripts/deploy.sh`) reads the same file, runs `terraform apply` once, then
+  iterates the entries: wait-for-`ONLINE` → Liquibase migrate (passing per-table `synced_table`,
+  `app_schema`, `app_role`, and index columns) → verify.
+
+The Liquibase changesets are already parametrized (`${synced_table}`, `${app_schema}`,
+`${app_role}`), so the same changelog serves every table. **Index columns are the one inherently
+table-specific customization point** — the two-index template in `003-indexes.sql` covers the
+common case (`${index_col_1}`/`${index_col_2}` from each entry's `index_columns`), and a table
+needing a different index shape (more indexes, composite/partial, or a different type) edits that
+changeset directly. Everything else is data in `config/tables.json`.
+
 ## Key decisions at a glance
 
 - Provision with Terraform; apply the DB layer with Liquibase; sequence with a wait-for-`ONLINE` gate.

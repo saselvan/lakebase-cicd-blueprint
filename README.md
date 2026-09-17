@@ -33,10 +33,11 @@ so app access never depends on a privilege no user can hold.*
 
 The pipeline is four ordered steps, run identically by hand (`scripts/deploy.sh`) and by CI:
 
-1. **Terraform provisions** the synced table (`databricks_postgres_synced_table`) — Delta → Lakebase
-   Postgres. Terraform owns its state, so reruns are a no-op.
-2. **Wait for ONLINE** (`scripts/wait_for_sync.sh`) — poll until the initial snapshot has loaded.
-   This is what guarantees indexes are built *after* the data lands.
+1. **Terraform provisions** the synced tables (`databricks_postgres_synced_table`, `for_each` over
+   `config/tables.json`) — Delta → Lakebase Postgres. One apply creates them all; Terraform owns its
+   state, so reruns are a no-op.
+2. **Wait for ONLINE** (`scripts/wait_for_sync.sh`), per table — poll until the initial snapshot has
+   loaded. This is what guarantees indexes are built *after* the data lands.
 3. **Liquibase applies** the database objects, in order:
    - `001-app-role.sql` — an idempotent read-only app role.
    - `002-app-grants.sql` — **explicit** `GRANT USAGE`/`GRANT SELECT` on the writer-owned synced table.
@@ -88,7 +89,8 @@ v1.132.0, Terraform v1.16.2, Liquibase 4.33.0):
 ## Repo layout
 
 ```
-terraform/          databricks_postgres_synced_table on the project
+config/tables.json  single source of truth: the tables to manage (read by BOTH Terraform and deploy.sh)
+terraform/          databricks_postgres_synced_table (for_each over config/tables.json)
 liquibase/          changelog: 001 app role, 002 explicit grants, 003 indexes, 004 consumer view
 scripts/            seed_source.sh, wait_for_sync.sh, deploy.sh, branch_test.sh
 .github/workflows/  deploy.yml, pr-validate.yml, pr-cleanup.yml (reference-only; see RUNBOOK CI auth)
@@ -115,15 +117,45 @@ export WAREHOUSE_ID=<your-sql-warehouse-id>
 export HOST=<your-lakebase-rw-endpoint-host>
 export PGUSER=<your-databricks-username>
 
-# copy and edit the examples, then:
+# 1. list your tables (the ONE file most users edit):
+$EDITOR config/tables.json
+
+# 2. copy and edit the shared Terraform vars:
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit for your workspace
 
 ./scripts/seed_source.sh   # one-time: demo Delta source table + UC schemas
-./scripts/deploy.sh        # THE pipeline: terraform apply -> wait sync -> liquibase update -> verify
+./scripts/deploy.sh        # THE pipeline: terraform apply -> (per table) wait sync -> liquibase -> verify
 ```
 
 `deploy.sh` is the exact sequence GitHub Actions runs. See `RUNBOOK.md` for the walkthrough and the
 CI auth guidance, and `docs/DESIGN-NOTES.md` for the design reasoning.
+
+### Multiple tables (the one-file pattern)
+
+`config/tables.json` is the **single source of truth** for which tables the pipeline manages.
+Both Terraform (`for_each` in `terraform/main.tf`) and the deploy loop (`scripts/deploy.sh`) read
+it, so **adding a table is a one-line edit there — no Terraform or script changes.** Each entry
+declares the synced table id, its Delta source, primary key, app schema/role, and up to two index
+columns:
+
+```json
+[
+  {
+    "name": "members",
+    "synced_table_id": "my_catalog.cicd_proj.members",
+    "source_table_full_name": "my_catalog.cicd_proj.members_src",
+    "primary_key_columns": ["id"],
+    "app_schema": "cicd_proj",
+    "app_role": "members_app_ro",
+    "index_columns": ["member_id", "plan_code"]
+  }
+]
+```
+
+`terraform apply` runs once and provisions all of them; the deploy loop then waits for each table's
+sync, migrates it (role, grants, indexes, view), and verifies access. The **index columns are the
+one inherently table-specific spot** — a table needing a different index shape customizes
+`liquibase/changelog/003-indexes.sql`. Field-by-field reference: `config/README.md`.
 
 ### Branching (test risky changes safely)
 
