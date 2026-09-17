@@ -94,8 +94,13 @@ terraform/          databricks_postgres_synced_table (for_each over config/table
 liquibase/          changelog: 001 app role, 002 explicit grants, 003 indexes, 004 consumer view
 scripts/            seed_source.sh, wait_for_sync.sh, deploy.sh, branch_test.sh
 .github/workflows/  deploy.yml, pr-validate.yml, pr-cleanup.yml (reference-only; see RUNBOOK CI auth)
-docs/               DESIGN-NOTES.md (design reasoning), pipeline + access-model diagrams
+docs/               DESIGN-NOTES.md (design reasoning), TROUBLESHOOTING.md, pipeline + access-model diagrams
+Makefile            one-command entrypoint: make help | validate | seed | deploy | branch
+CONTRIBUTING.md     local checks + ground rules   |   LICENSE (MIT)
 ```
+
+Prefer a single entrypoint? `make help` lists everything; `make validate` runs the no-cloud checks.
+Stuck? See `docs/TROUBLESHOOTING.md`.
 
 ---
 
