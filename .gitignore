@@ -12,3 +12,12 @@ liquibase/liquibase.properties
 
 # Local planning doc (grill-with-docs) — not shared
 CONTEXT.md
+
+# Local planning (specs/tickets) — not shared
+.scratch/
+
+# Python (Alembic variant dev venv + caches)
+.venv*
+__pycache__/
+*.pyc
+.pytest_cache/

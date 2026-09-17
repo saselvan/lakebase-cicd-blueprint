@@ -1,0 +1,20 @@
+[
+  {
+    "name": "alpha",
+    "synced_table_id": "some_catalog.sch_alpha.alpha",
+    "source_table_full_name": "some_catalog.sch_alpha.alpha_src",
+    "primary_key_columns": ["id"],
+    "app_schema": "sch_alpha",
+    "app_role": "alpha_reader",
+    "index_columns": ["region_key"]
+  },
+  {
+    "name": "beta",
+    "synced_table_id": "some_catalog.sch_beta.beta",
+    "source_table_full_name": "some_catalog.sch_beta.beta_src",
+    "primary_key_columns": ["id"],
+    "app_schema": "sch_beta",
+    "app_role": "beta_reporting_ro",
+    "index_columns": []
+  }
+]
