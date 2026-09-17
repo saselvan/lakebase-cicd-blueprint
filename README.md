@@ -92,7 +92,7 @@ terraform/          databricks_postgres_synced_table on the project
 liquibase/          changelog: 001 app role, 002 explicit grants, 003 indexes, 004 consumer view
 scripts/            seed_source.sh, wait_for_sync.sh, deploy.sh, branch_test.sh
 .github/workflows/  deploy.yml, pr-validate.yml, pr-cleanup.yml (reference-only; see RUNBOOK CI auth)
-docs/               ANSWERS.md (Q&A), pipeline + access-model diagrams
+docs/               DESIGN-NOTES.md (design reasoning), pipeline + access-model diagrams
 ```
 
 ---
@@ -123,7 +123,7 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit for yo
 ```
 
 `deploy.sh` is the exact sequence GitHub Actions runs. See `RUNBOOK.md` for the walkthrough and the
-CI auth guidance, and `docs/ANSWERS.md` for a point-by-point Q&A.
+CI auth guidance, and `docs/DESIGN-NOTES.md` for the design reasoning.
 
 ### Branching (test risky changes safely)
 

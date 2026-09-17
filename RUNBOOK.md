@@ -7,7 +7,7 @@ A step-by-step walkthrough of the reference pipeline, so you can run it and expl
 **Terraform builds the infrastructure (the synced table), we wait for the first load to finish, then
 Liquibase applies the database objects (role, grants, indexes, consumer view) — and it's all
 idempotent, so grants are reapplied every run and access is restored after a table replace.** (A
-drop/replace still has a brief gap — it is not zero-downtime; see `docs/ANSWERS.md` §7.)
+drop/replace still has a brief gap — it is not zero-downtime; see `docs/DESIGN-NOTES.md` → "Keeping access through refreshes and rebuilds".)
 
 ## Who does what
 
