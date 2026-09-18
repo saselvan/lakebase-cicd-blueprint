@@ -134,8 +134,10 @@ def test_malformed_config_fails_the_pipeline(tmp_path):
         "codegen exited 0 on MALFORMED tables.json — a corrupt config passed silently.\n"
         f"STDOUT:{cg.stdout}"
     )
-    # And there is no valid generated resource for validate to accept.
-    assert not list((bundle / "resources").glob("*.yml")) or True
+    # And codegen wrote NO resource files, so there is nothing for validate to accept.
+    resources_dir = bundle / "resources"
+    produced = list(resources_dir.glob("*.yml")) if resources_dir.exists() else []
+    assert produced == [], f"codegen wrote resources despite a malformed config: {produced}"
 
 
 def test_injected_bad_resource_field_fails_strict_validate(tmp_path):

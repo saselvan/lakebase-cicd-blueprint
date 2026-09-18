@@ -10,12 +10,13 @@ Schema mapping (field names verified against `databricks bundle schema`, CLI v1.
 
   config/tables.json field    -> bundle location
   --------------------------      -----------------
-  name                        -> resource key for both the synced table and the role
+  name                        -> synced-table resource key <name>; role resource key <name>_role
+                                 (resource keys share one namespace, so the role cannot reuse <name>)
   synced_table_id             -> postgres_synced_tables.<name>.synced_table_id   (required)
   source_table_full_name      -> postgres_synced_tables.<name>.source_table_full_name
   primary_key_columns         -> postgres_synced_tables.<name>.primary_key_columns
-  app_role                    -> postgres_roles.<name>.postgres_role  (the PG role name)
-                                 postgres_roles.<name>.role_id        (RFC-1123 slug of app_role)
+  app_role                    -> postgres_roles.<name>_role.postgres_role  (the PG role name)
+                                 postgres_roles.<name>_role.role_id        (RFC-1123 slug of app_role)
   app_schema, index_columns   -> variables.migration_targets.default[]  (see note)
 
 Both `postgres_synced_tables` and `postgres_roles` declare `additionalProperties: false` in the
@@ -161,6 +162,32 @@ def write_resources(tables: list[dict], out_dir: str | Path) -> list[Path]:
     return written
 
 
+def check_drift(config_path: str | Path, resources_dir: str | Path) -> list[str]:
+    """Verify committed resource files in `resources_dir` byte-match a FRESH generation from
+    `config_path`. Returns a list of human-readable drift descriptions; empty list == no drift.
+
+    This is the anti-drift guard: `write_resources` is never called, so nothing is mutated. Three
+    ways a committed tree can drift from the single source of truth are all reported —
+      - a committed file whose bytes differ from the freshly generated content (stale/hand-edited),
+      - an expected file that is missing from the committed tree,
+      - a committed .yml that no config row generates (orphan/leftover).
+    """
+    expected = {fn: _dump(fragment) for fn, fragment in build_bundle_fragments(load_tables(config_path)).items()}
+    resources = Path(resources_dir)
+    committed = {p.name: p for p in resources.glob("*.yml")}
+
+    problems: list[str] = []
+    for fn, content in expected.items():
+        if fn not in committed:
+            problems.append(f"missing committed resource: {fn} (expected from config, not present)")
+        elif committed[fn].read_text() != content:
+            problems.append(f"drift in {fn}: committed bytes differ from fresh generation")
+    for fn in committed:
+        if fn not in expected:
+            problems.append(f"unexpected committed resource: {fn} (no config row generates it)")
+    return problems
+
+
 def main(argv: list[str] | None = None) -> int:
     repo_root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -174,7 +201,27 @@ def main(argv: list[str] | None = None) -> int:
         default=str(Path(__file__).resolve().parent / "resources"),
         help="Output directory for generated bundle resource YAML (default: dabs/resources).",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Verify-only: confirm the committed resources in --out byte-match a fresh generation "
+             "from --config, exit non-zero on any drift. Writes nothing (for CI / the offline gate).",
+    )
     args = parser.parse_args(argv)
+
+    if args.check:
+        problems = check_drift(args.config, args.out)
+        if problems:
+            for p in problems:
+                print(f"DRIFT: {p}", file=sys.stderr)
+            print(
+                f"ERROR: committed resources in {args.out} are stale vs {args.config} "
+                f"({len(problems)} issue(s)). Re-run codegen and commit dabs/resources/*.yml.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"no drift: committed resources in {args.out} match a fresh generation from {args.config}")
+        return 0
 
     tables = load_tables(args.config)
     written = write_resources(tables, args.out)

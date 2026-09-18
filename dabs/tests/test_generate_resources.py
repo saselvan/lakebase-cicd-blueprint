@@ -23,6 +23,7 @@ where index columns are asserted "carried through".
 """
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +33,9 @@ import yaml
 HERE = Path(__file__).resolve().parent
 FIXTURE = HERE / "fixtures" / "tables.json"
 GEN_MODULE_DIR = HERE.parent.parent  # repo root, so `import dabs.generate_resources` works
+REPO_ROOT = GEN_MODULE_DIR
+REAL_CONFIG = REPO_ROOT / "config" / "tables.json"
+COMMITTED_RESOURCES = REPO_ROOT / "dabs" / "resources"
 
 
 def _fixture_rows() -> list:
@@ -167,6 +171,102 @@ def test_every_emitted_file_is_valid_yaml(tmp_path):
     for f in out["files"]:
         doc = yaml.safe_load(Path(f).read_text())
         assert isinstance(doc, dict), f"{Path(f).name} is not a YAML mapping"
+
+
+# --------------------------------------------------------------------------------------------
+# Drift check (ticket 02 fix round): the COMMITTED dabs/resources/*.yml must byte-match a fresh
+# generation from config/tables.json. Without this, committed files can silently diverge from the
+# single source of truth and neither the gate nor CI would notice.
+# --------------------------------------------------------------------------------------------
+
+
+def _copy_committed(dst: Path) -> Path:
+    """Copy the committed dabs/resources/*.yml into dst (a fresh dir) — the drift-check subject."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in COMMITTED_RESOURCES.glob("*.yml"):
+        shutil.copy(f, dst / f.name)
+    return dst
+
+
+def test_committed_resources_match_fresh_generation():
+    """The real committed dabs/resources/*.yml byte-match a fresh generation from the real config.
+
+    This is the guard itself: if someone edits config/tables.json without re-running codegen (or
+    hand-edits a committed resource), this goes red. GREEN state == committed files are in sync.
+    """
+    from dabs.generate_resources import check_drift
+
+    problems = check_drift(REAL_CONFIG, COMMITTED_RESOURCES)
+    assert problems == [], f"committed dabs/resources drifted from config/tables.json: {problems}"
+
+
+def test_drift_check_detects_stale_committed_file(tmp_path):
+    """HOSTILE: a committed resource with ONE edited field must make the drift check go RED.
+
+    A no-op check (always returns []) cannot pass this — the mutated byte content must be caught.
+    """
+    from dabs.generate_resources import check_drift
+
+    subject = _copy_committed(tmp_path / "resources")
+    victim = subject / "members.yml"
+    text = victim.read_text()
+    assert "members_app_ro" in text, "fixture regression: expected role name in committed members.yml"
+    victim.write_text(text.replace("members_app_ro", "members_app_TAMPERED"))
+
+    problems = check_drift(REAL_CONFIG, subject)
+    assert problems, "drift check did not flag a stale (edited) committed resource file"
+    assert any("members.yml" in p for p in problems), problems
+
+
+def test_drift_check_detects_missing_committed_file(tmp_path):
+    """HOSTILE: a deleted committed resource must make the drift check go RED (not silently pass)."""
+    from dabs.generate_resources import check_drift
+
+    subject = _copy_committed(tmp_path / "resources")
+    (subject / "members.yml").unlink()
+
+    problems = check_drift(REAL_CONFIG, subject)
+    assert problems, "drift check did not flag a MISSING committed resource file"
+    assert any("members.yml" in p for p in problems), problems
+
+
+def test_drift_check_flags_unexpected_committed_file(tmp_path):
+    """HOSTILE: a committed .yml that no config row generates must be flagged (stale leftover)."""
+    from dabs.generate_resources import check_drift
+
+    subject = _copy_committed(tmp_path / "resources")
+    (subject / "orphan_table.yml").write_text("resources: {}\n")
+
+    problems = check_drift(REAL_CONFIG, subject)
+    assert problems, "drift check did not flag an unexpected/orphan committed resource file"
+    assert any("orphan_table.yml" in p for p in problems), problems
+
+
+def test_check_drift_cli_flag_exits_nonzero_on_drift(tmp_path):
+    """The `--check` CLI flag exits non-zero when committed --out resources drift from --config,
+    and does NOT write (verify-only). Guards the CI/gate wiring that replaces the overwrite step.
+    """
+    subject = _copy_committed(tmp_path / "resources")
+    (subject / "members.yml").unlink()
+    before = sorted(p.name for p in subject.glob("*.yml"))
+
+    result = subprocess.run(
+        [sys.executable, "-m", "dabs.generate_resources",
+         "--check", "--config", str(REAL_CONFIG), "--out", str(subject)],
+        cwd=str(REPO_ROOT), capture_output=True, text=True,
+    )
+    assert result.returncode != 0, f"--check exited 0 despite drift:\n{result.stdout}\n{result.stderr}"
+    after = sorted(p.name for p in subject.glob("*.yml"))
+    assert before == after, f"--check wrote/regenerated files (should be verify-only): {before} -> {after}"
+
+
+def test_check_drift_cli_flag_exits_zero_when_in_sync():
+    """`--check` against the real committed resources exits 0 (in-sync happy path)."""
+    result = subprocess.run(
+        [sys.executable, "-m", "dabs.generate_resources", "--check"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"--check red on in-sync repo:\n{result.stdout}\n{result.stderr}"
 
 
 def test_module_runs_as_cli_against_repo_config(tmp_path):

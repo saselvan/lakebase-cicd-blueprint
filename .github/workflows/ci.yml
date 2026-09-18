@@ -97,10 +97,10 @@ jobs:
       - name: Install Python deps (codegen + tests)
         run: pip install "pyyaml==6.0.2" "pytest==9.1.1"
 
-      - name: Codegen — config/tables.json -> dabs/resources/*.yml (ticket 01)
-        run: python3 -m dabs.generate_resources
+      - name: Verify committed dabs/resources match config (drift check — no overwrite)
+        run: python3 -m dabs.generate_resources --check
 
-      - name: Offline bundle validate gate (codegen -> validate --strict dev+prod -> resource count)
+      - name: Offline bundle validate gate (drift check + temp codegen -> validate --strict dev+prod -> resource count)
         run: bash dabs/scripts/offline_validate.sh
 
       - name: Falsifiability tests — validate passes on valid, FAILS on malformed/invalid resource
