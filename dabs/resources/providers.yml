@@ -10,7 +10,7 @@ resources:
       postgres_database: ${var.lakebase_database}
       create_database_objects_if_missing: true
   postgres_roles:
-    providers:
+    providers_role:
       role_id: providers-app-ro
       postgres_role: providers_app_ro
       parent: ${var.lakebase_branch}

@@ -1,0 +1,43 @@
+# Lakebase CI/CD — DABs variant (the documented lead; Terraform+Liquibase is the portable alt).
+#
+# REQUIRES Databricks CLI >= 1.5.0. The Lakebase DAB resources used here
+# (postgres_synced_tables, postgres_roles) are BETA — CLIs older than 1.5.0 drop the resource
+# `role_id`, so this pin is a correctness requirement. The offline PR CI (ci.yml, `dabs-validate`
+# job) installs a pinned CLI and runs `bundle validate` with no secrets.
+#
+# Resources are GENERATED from the single source of truth config/tables.json by
+# `python -m dabs.generate_resources` (ticket 01) into resources/*.yml — re-run codegen after
+# editing tables.json; do not hand-edit the generated files.
+bundle:
+  name: lakebase-cicd-dabs
+
+include:
+  - resources/*.yml
+
+variables:
+  lakebase_branch:
+    description: Lakebase project branch the app roles live on.
+    default: projects/PLACEHOLDER/branches/main
+  lakebase_database:
+    description: Lakebase Postgres database that hosts the synced tables.
+    default: databricks_postgres
+
+# Environments are selected with `--target dev|prod`; switching targets changes only the
+# deployment mode, never the resources. No workspace host/URL/profile is committed here
+# (public-safe): the workspace binding is supplied at RUNTIME so adopters and forkers use their
+# own auth without editing this file. Pick one:
+#   - a CLI profile:      databricks bundle validate -p my-dev-profile   --target dev
+#   - env auth:           DATABRICKS_HOST=... DATABRICKS_TOKEN=...        databricks bundle validate --target dev
+# Offline PR CI (no secrets) points DATABRICKS_HOST at a localhost stub that answers the one
+# SCIM `Me` call validate makes (see the `dabs-validate` job in .github/workflows/ci.yml +
+# dabs/tests/mock_workspace.py).
+targets:
+  dev:
+    default: true
+    mode: development
+  prod:
+    mode: production
+    workspace:
+      # Deterministic, per-principal deploy root (production best practice: exactly one copy).
+      # Interpolated at runtime from the resolved identity — no committed workspace value.
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/prod

@@ -115,10 +115,14 @@ def build_bundle_fragments(tables: list[dict]) -> dict[str, dict]:
     targets: list[dict] = []
     for table in tables:
         name = table["name"]
+        # DABs resource keys share ONE namespace across all resource types (they are the
+        # `${resources.<key>}` reference handles), so the synced table and its role cannot both
+        # be keyed `<name>` — the CLI rejects it as a duplicate key. The role gets a distinct
+        # `<name>_role` key; the synced table keeps `<name>` as its natural handle.
         fragments[f"{name}.yml"] = {
             "resources": {
                 "postgres_synced_tables": {name: build_synced_table_resource(table)},
-                "postgres_roles": {name: build_role_resource(table)},
+                "postgres_roles": {f"{name}_role": build_role_resource(table)},
             }
         }
         targets.append(build_migration_target(table))

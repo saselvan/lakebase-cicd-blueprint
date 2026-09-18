@@ -71,3 +71,37 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # DABs variant: offline `databricks bundle validate` — no secrets, no workspace.
+  # Runs the codegen, then validates the generated bundle (dev + prod, --strict)
+  # against a localhost workspace stub so any fork can run it without cloud access.
+  #
+  # CLI PIN: Databricks CLI >= 1.5.0 is required. Lakebase DABs resources
+  # (postgres_synced_tables / postgres_roles) are BETA; CLIs older than 1.5.0 drop the
+  # resource `role_id`, so the pin is a correctness requirement, not just hygiene.
+  dabs-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Databricks CLI (pinned v1.17.0, >= 1.5.0 — Lakebase DABs Beta)
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/v1.17.0/install.sh | sh
+          databricks version
+
+      - name: Install Python deps (codegen + tests)
+        run: pip install "pyyaml==6.0.2" "pytest==9.1.1"
+
+      - name: Codegen — config/tables.json -> dabs/resources/*.yml (ticket 01)
+        run: python3 -m dabs.generate_resources
+
+      - name: Offline bundle validate gate (codegen -> validate --strict dev+prod -> resource count)
+        run: bash dabs/scripts/offline_validate.sh
+
+      - name: Falsifiability tests — validate passes on valid, FAILS on malformed/invalid resource
+        run: pytest dabs/tests -q
