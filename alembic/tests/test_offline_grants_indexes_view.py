@@ -163,3 +163,38 @@ def test_role_creation_still_emitted_from_ticket_01():
 def test_emission_is_idempotent_across_two_runs():
     """Two offline emissions are byte-identical (runAlways-equivalent, no per-run state)."""
     assert _generate_offline_sql() == _generate_offline_sql()
+
+
+# --- Downgrade (offline) ----------------------------------------------------
+
+def _generate_offline_downgrade_sql() -> str:
+    """Run `alembic downgrade 0001_app_role:base --sql` offline against the fixture config."""
+    env = dict(os.environ)
+    env["LAKEBASE_TABLES_CONFIG"] = str(FIXTURE)
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "-c", str(ALEMBIC_INI),
+         "downgrade", "0001_app_role:base", "--sql"],
+        cwd=str(ALEMBIC_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"alembic offline downgrade --sql exited {result.returncode}\n"
+        f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+    )
+    return result.stdout
+
+
+def test_downgrade_revokes_grants_before_dropping_role():
+    """Downgrade REVOKEs the base-table grant, and does so BEFORE DROP ROLE — Postgres
+    refuses to drop a role that still holds object privileges (Liquibase 002 rollback parity)."""
+    sql = _norm(_generate_offline_downgrade_sql())
+    for t in TABLES:
+        revoke = f"REVOKE SELECT ON TABLE {t['schema']}.{t['table']} FROM {t['role']}"
+        drop_role = f"DROP ROLE IF EXISTS {t['role']}"
+        assert revoke in sql, f"missing revoke for {t['role']} in:\n{sql}"
+        assert drop_role in sql, f"missing drop role for {t['role']} in:\n{sql}"
+        assert sql.index(revoke) < sql.index(drop_role), (
+            f"REVOKE must precede DROP ROLE for {t['role']}"
+        )

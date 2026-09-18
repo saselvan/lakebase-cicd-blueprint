@@ -55,6 +55,10 @@ def _grant_statements(app_schema: str, app_role: str, synced_table: str) -> list
 
     Mirrors liquibase/changelog/002-app-grants.sql: GRANT is idempotent (no-op when
     already held) and reapplied every deploy so access survives a table replace.
+
+    Note: `GRANT USAGE ON SCHEMA` is emitted here only. Liquibase 004 repeats it because
+    its changesets run as independent units; this single upgrade() always runs the grant
+    group before the view group, so repeating it would be redundant.
     """
     return [
         f"GRANT USAGE ON SCHEMA {app_schema} TO {app_role}",
@@ -91,6 +95,18 @@ def _view_statements(app_schema: str, app_role: str, synced_table: str) -> list:
     ]
 
 
+def _revoke_statements(app_schema: str, app_role: str, synced_table: str) -> list:
+    """Reverse of _grant_statements, for downgrade.
+
+    Mirrors the rollback of liquibase/changelog/002-app-grants.sql. These must run BEFORE
+    `DROP ROLE`: Postgres refuses to drop a role that still holds object privileges.
+    """
+    return [
+        f"REVOKE SELECT ON TABLE {app_schema}.{synced_table} FROM {app_role}",
+        f"REVOKE USAGE ON SCHEMA {app_schema} FROM {app_role}",
+    ]
+
+
 def _tables() -> list:
     """Tables handed in by env.py (the single config seam)."""
     return context.config.attributes.get("tables", [])
@@ -120,4 +136,8 @@ def downgrade() -> None:
         op.execute(f"DROP VIEW IF EXISTS {app_schema}.{synced_table}_v;")
         for col in table.get("index_columns", []):
             op.execute(f"DROP INDEX IF EXISTS {app_schema}.idx_{synced_table}_{col};")
+        # REVOKE remaining grants before dropping the role (a role holding privileges
+        # cannot be dropped in Postgres).
+        for stmt in _revoke_statements(app_schema, app_role, synced_table):
+            op.execute(stmt)
         op.execute(f"DROP ROLE IF EXISTS {app_role};")
