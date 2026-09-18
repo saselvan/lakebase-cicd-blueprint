@@ -119,11 +119,34 @@ Verified across all three sync modes (Snapshot, Triggered, Continuous):
 Treat a sync-mode change as a planned rebuild, not a live toggle — and pick Triggered/Continuous at
 create time if row-incremental is the goal, since flipping mode on a live table forces the replace above.
 
-## Testing risky changes
+## Branch-per-PR (ephemeral test environments)
 
-Use copy-on-write branches to rehearse destructive migrations (dropping an index, moving a table) on
-an ephemeral branch; the production copy is untouched. Two concerns, two tools: load speed →
-load-then-index; risky rebuild/move → branch test. Don't use one to solve the other.
+Use copy-on-write branches to give each change its own throwaway environment: branch off production,
+run the migration and tests against the branch, tear it down when the PR merges. Verified live on the
+Autoscaling projects model:
+
+- A branch forks from production at a fixed point and comes up **ready in seconds**. A destructive
+  change on the branch (e.g. dropping an index) is **invisible to production** — production kept all
+  its indexes and rows throughout. Teardown is seconds and leaves only production.
+- **Each branch has its own connection endpoint** — resolve the branch's endpoint (list the project's
+  branch endpoints) rather than reusing the production host. This is the main gotcha for scripts/CI.
+- Branches take an **expiry (TTL) at create time** and auto-clean at the TTL even without an explicit
+  delete — a safety net against orphaned branches.
+- The database credential is **minted at runtime** (short-lived OAuth), never stored.
+
+`scripts/branch_test.sh` runs this lifecycle from an authenticated machine.
+
+### Automating it in CI (the included workflows are reference-only)
+
+The `pr-validate` / `pr-cleanup` workflows show the intended shape — create a branch per PR, deploy and
+test on it, tear it down on close — but they are **reference-only**. To run them live you need two
+things the reference can't assume: a CI runner that can actually reach your workspace (public
+GitHub-hosted runners are commonly blocked by a workspace IP ACL, so a self-hosted / allowlisted runner
+is typical), and a no-secret auth path (OIDC / Workload Identity Federation), which a workspace or
+account admin sets up. Wire them to your own workspace deliberately.
+
+Two concerns, two tools: load speed → load-then-index; risky rebuild/move → branch test. Don't use one
+to solve the other.
 
 ## Managing many tables
 

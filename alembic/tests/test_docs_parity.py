@@ -50,3 +50,12 @@ def test_design_notes_states_runalways_equivalent_correctly():
     assert "not gated" in text, (
         "DESIGN-NOTES must say the Alembic path is NOT gated by the version table"
     )
+
+
+def test_design_notes_documents_branch_per_pr_caveats():
+    """The branch-per-PR section must carry the two load-bearing caveats: each branch has
+    its OWN endpoint, and the included CI workflows are reference-only."""
+    text = DESIGN.lower()
+    assert "branch-per-pr" in text, "DESIGN-NOTES missing the Branch-per-PR section"
+    assert "own connection endpoint" in text, "missing the per-branch endpoint caveat"
+    assert "reference-only" in text, "must state the CI workflows are reference-only"
