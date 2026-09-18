@@ -27,9 +27,10 @@ function names. The status source / SDK are MOCKED; nothing hits a real workspac
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -40,7 +41,24 @@ from dabs import migration_job as mj
 REPO_ROOT = Path(__file__).resolve().parents[2]
 # Reuse the SHARED alembic hostile fixture (alpha: 1 index col; beta: 0 index cols) — no dup fixture.
 ALEMBIC_FIXTURE = REPO_ROOT / "alembic" / "tests" / "fixtures" / "tables.json"
-_HAS_ALEMBIC = importlib.util.find_spec("alembic") is not None
+
+
+def _alembic_runtime_available() -> bool:
+    """True only if the INSTALLED alembic package is runnable via sys.executable — the exact thing
+    render_migration_sql shells out to. NOTE: importlib.util.find_spec('alembic') is NOT usable here
+    because the repo's local `alembic/` DIRECTORY matches as a namespace package even with no alembic
+    installed; this probe imports `alembic.config`, which the local dir does not provide.
+    """
+    probe = subprocess.run(
+        [sys.executable, "-c", "import alembic.config, sqlalchemy"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+    )
+    return probe.returncode == 0
+
+
+_HAS_ALEMBIC = _alembic_runtime_available()
 _needs_alembic = pytest.mark.skipif(
     not _HAS_ALEMBIC,
     reason="alembic not installed; the render seam shells out to it (the CI 'alembic' job has it)",

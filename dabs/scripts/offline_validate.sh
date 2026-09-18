@@ -38,7 +38,17 @@ MOCK_PID=""
 cleanup() { [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true; rm -rf "$WORK" "$MOCK_LOG"; }
 trap cleanup EXIT
 
-cp "$REPO_ROOT/dabs/databricks.yml" "$WORK/databricks.yml"
+# Mirror the repo layout in the temp tree: the bundle root is $WORK/dabs, with alembic/ and config/
+# as siblings, because databricks.yml's `sync.paths` references ../alembic and ../config (the shared
+# migration + single-source config the job task reuses) and `bundle validate` stats those paths.
+BUNDLE="$WORK/dabs"
+mkdir -p "$BUNDLE"
+cp "$REPO_ROOT/dabs/databricks.yml" "$BUNDLE/databricks.yml"
+# The migration Workflow job's task points at ./migration_job.py (relative to the bundle root),
+# so validate resolves the local file — copy the entrypoint into the isolated bundle too (ticket 03).
+cp "$REPO_ROOT/dabs/migration_job.py" "$BUNDLE/migration_job.py"
+ln -s "$REPO_ROOT/alembic" "$WORK/alembic"
+ln -s "$REPO_ROOT/config" "$WORK/config"
 
 # --- 0) Drift check: the COMMITTED dabs/resources/*.yml must byte-match a fresh generation. ----
 # Verify-only (writes nothing). If someone edits tables.json without re-running codegen, or hand-
@@ -47,7 +57,7 @@ echo "--- drift check: committed dabs/resources vs fresh codegen from config ---
 ( cd "$REPO_ROOT" && python3 -m dabs.generate_resources --check --config "$CONFIG" )
 
 # --- 1) Codegen into an ISOLATED temp dir for validation. Mutation 3 removes this line. --------
-python3 -m dabs.generate_resources --config "$CONFIG" --out "$WORK/resources"
+python3 -m dabs.generate_resources --config "$CONFIG" --out "$BUNDLE/resources"
 
 # --- 2) Localhost stub for offline auth (answers the CLI's Me / get-status calls) -------------
 python3 -m dabs.tests.mock_workspace --port 0 >"$MOCK_LOG" 2>&1 &
@@ -63,12 +73,12 @@ unset DATABRICKS_CONFIG_PROFILE DATABRICKS_CONFIG_FILE 2>/dev/null || true
 # --- 3) Validate both targets in strict mode -------------------------------------------------
 for target in dev prod; do
   echo "--- bundle validate --target $target --strict ---"
-  ( cd "$WORK" && databricks bundle validate --target "$target" --strict )
+  ( cd "$BUNDLE" && databricks bundle validate --target "$target" --strict )
 done
 
 # --- 4) Count check: the bundle must carry one synced table + one role per config row ---------
 expected="$(python3 -c "import json,sys; print(len(json.load(open('$CONFIG'))))")"
-json="$(cd "$WORK" && databricks bundle validate --target dev -o json 2>/dev/null)"
+json="$(cd "$BUNDLE" && databricks bundle validate --target dev -o json 2>/dev/null)"
 read -r n_synced n_roles < <(python3 - "$expected" <<PY
 import json,sys
 d=json.loads('''$json''')

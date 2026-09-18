@@ -14,6 +14,48 @@ bundle:
 include:
   - resources/*.yml
 
+# --- Migration Workflow job (ticket 03) -------------------------------------------------------
+# STATIC resource (not table-driven), so it lives inline here rather than under resources/*.yml —
+# which is 100% codegen-owned and drift-checked; a hand-written file there would trip the guard.
+#
+# The task runs dabs/migration_job.py on SERVERLESS Python compute (no Java, so Alembic not
+# Liquibase — ADR 0006/D1). At run time it: reads config/tables.json, BLOCKS until every synced
+# table reports ONLINE (ADR 0003), then applies the SHARED alembic/ migration via a RUNTIME OAuth
+# token minted inside the workspace (no stored secret). It loops config/tables.json at run time —
+# exactly like the migration — so adding a table needs no job edit. The live run is ticket 04.
+#
+# config/ and alembic/ live at the repo root (above this bundle root), so sync.paths pulls them
+# into the deployment alongside dabs/ (the task shells out to `alembic upgrade head --sql`).
+sync:
+  paths:
+    - .
+    - ../alembic
+    - ../config
+
+resources:
+  jobs:
+    lakebase_migration:
+      name: "lakebase-cicd migration (${bundle.target})"
+      tasks:
+        - task_key: alembic_migrate
+          spark_python_task:
+            # Relative to the synced bundle root; migration_job.py syncs from dabs/.
+            python_file: ./migration_job.py
+            parameters:
+              - "--instance"
+              - "${var.lakebase_instance}"
+          environment_key: migration
+      environments:
+        - environment_key: migration
+          spec:
+            client: "2"
+            dependencies:
+              - alembic>=1.13
+              - psycopg[binary]>=3.1
+              - databricks-sdk>=0.133
+      queue:
+        enabled: true
+
 variables:
   lakebase_branch:
     description: Lakebase project branch the app roles live on.
@@ -21,6 +63,11 @@ variables:
   lakebase_database:
     description: Lakebase Postgres database that hosts the synced tables.
     default: databricks_postgres
+  lakebase_instance:
+    description: Lakebase database instance the migration job connects to (runtime OAuth, no
+      stored secret). Overridden per environment at deploy time — no workspace-specific value
+      is committed.
+    default: PLACEHOLDER_INSTANCE
 
 # Environments are selected with `--target dev|prod`; switching targets changes only the
 # deployment mode, never the resources. No workspace host/URL/profile is committed here
