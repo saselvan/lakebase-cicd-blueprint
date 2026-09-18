@@ -26,10 +26,11 @@ consumer view), so they are carried as a bundle `variables` complex default (`mi
 This keeps index columns "carried through" in full (no fixed-count truncation) without inventing
 a resource field that the CLI would reject.
 
-Environment-specific placement (the Lakebase branch a synced table / role lives on, the target
-Postgres database) is left as bundle variable references (`${var.lakebase_branch}`,
-`${var.lakebase_database}`) so no customer/workspace-specific value is committed; those variables
-are declared in the bundle's `databricks.yml` targets (ticket 02).
+Environment-specific placement is left as bundle variable references so no customer/workspace-specific
+value is committed: the role's `parent` (the Lakebase branch it lives on) uses `${var.lakebase_branch}`,
+and the synced table's `postgres_database` uses `${var.lakebase_database}`. (The synced table places via
+`postgres_database` only — it carries no branch reference.) Those variables are declared in the bundle's
+`databricks.yml` targets (ticket 02).
 """
 
 from __future__ import annotations

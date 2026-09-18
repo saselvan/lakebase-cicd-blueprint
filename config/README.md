@@ -14,7 +14,7 @@ It is a JSON array; add one object per synced table you want the pipeline to man
 | `primary_key_columns` | Array of PK column names for the synced table. |
 | `app_schema` | Postgres/UC schema the table lands in (Liquibase `${app_schema}`). |
 | `app_role` | Read-only app role granted access (Liquibase `${app_role}`). |
-| `index_columns` | Up to 2 columns to index after load (Liquibase `${index_col_1}`/`${index_col_2}`). |
+| `index_columns` | Columns to index after load. **Path-specific:** the Liquibase/Terraform path templates the first 2 (`${index_col_1}`/`${index_col_2}`); the DABs/Alembic path carries all of them. So a 3rd+ column works on DABs but is silently ignored on the Liquibase path unless you extend `003-indexes.sql`. |
 
 **Indexes are the one inherently table-specific spot.** The two-index template in
 `liquibase/changelog/003-indexes.sql` covers the common case (0, 1, or 2 columns from
