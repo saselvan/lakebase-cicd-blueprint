@@ -1,0 +1,9 @@
+# Optional local guard against committing secrets. Enable with:
+#   pip install pre-commit && pre-commit install
+# The same scan also runs in CI (.github/workflows/ci.yml -> secret-scan job),
+# so it is enforced on every PR even if a contributor hasn't installed this.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks

@@ -22,7 +22,8 @@ python3 -c "import json; json.load(open('config/tables.json'))"
 ## Ground rules
 
 - **No secrets, ever.** No real hostnames, tokens, `*.tfvars`, `*.tfstate`, or credentials. Only
-  `.example` templates are committed. `.gitignore` enforces this; don't bypass it.
+  `.example` templates are committed. `.gitignore` enforces this; don't bypass it. A **gitleaks**
+  secret scan runs in CI on every PR — run it locally too with `pip install pre-commit && pre-commit install`.
 - **No workspace- or customer-specific values.** Use the placeholders (`<your-...>`, `my_catalog`,
   `cicd_proj`). Keep the demo names neutral.
 - **Keep changesets idempotent.** Grants/indexes/views are `runAlways:true` and must stay safe to

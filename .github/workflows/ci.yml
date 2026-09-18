@@ -60,3 +60,14 @@ jobs:
         run: |
           pip install "alembic==1.20.0" "pytest==9.1.1"
           pytest alembic/tests -q
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
