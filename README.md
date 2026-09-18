@@ -135,7 +135,7 @@ Stuck? See `docs/TROUBLESHOOTING.md`.
 
 - A Databricks workspace with a Lakebase **Autoscaling project** and a `production` branch.
 - Databricks CLI, authenticated to your workspace (a named CLI profile).
-- Terraform ≥ 1.5 and the `databricks/databricks` provider ≥ 1.90.
+- Terraform and the `databricks/databricks` provider — this reference was built and tested with Terraform 1.16.2 and provider 1.132.0 (use those or newer; the `databricks_postgres_*` resources are recent, so don't pin older).
 - Liquibase (OSS) ≥ 4.33 and `psql`.
 - A SQL warehouse (for seeding the demo source table) and an existing UC catalog + schema.
 
