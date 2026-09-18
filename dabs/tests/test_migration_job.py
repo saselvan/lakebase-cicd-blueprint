@@ -168,6 +168,13 @@ CREATE TABLE alembic_version (
 
 -- Running upgrade  -> 0001_app_role
 
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'alpha_reader') THEN
+    CREATE ROLE alpha_reader NOLOGIN;
+  END IF;
+END $$;
+
 CREATE INDEX IF NOT EXISTS idx_alpha_region_key ON sch_alpha.alpha (region_key);
 
 CREATE OR REPLACE VIEW sch_alpha.alpha_v AS SELECT * FROM sch_alpha.alpha;

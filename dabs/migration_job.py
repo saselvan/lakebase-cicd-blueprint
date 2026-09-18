@@ -7,12 +7,15 @@ in dabs/databricks.yml). On a run it:
   2. BLOCKS until every synced table reports ONLINE (the wait-for-ONLINE gate, ADR 0003) — so
      grants/indexes/view never run against a not-yet-loaded table,
   3. renders the EXISTING alembic/ migration to idempotent DDL (`alembic upgrade head --sql`) —
-     reused, never copied — and
+     reused, never copied — then makes that SQL fully RE-RUNNABLE (see make_rerunnable), and
   4. applies it to Lakebase using a RUNTIME OAuth token minted inside the workspace (no stored
      secret; consistent with the repo's no-secret posture).
 
 Re-running is a reconciling no-op: the shared migration emits guarded CREATE ROLE, CREATE INDEX
-IF NOT EXISTS, and CREATE OR REPLACE VIEW (ADR 0002), so a synced-table replace self-heals.
+IF NOT EXISTS, and CREATE OR REPLACE VIEW (ADR 0002) — AND make_rerunnable guards the alembic
+version bookkeeping alembic prepends (CREATE TABLE alembic_version / the version INSERT), which is
+otherwise unguarded and would error on a 2nd apply and roll the whole transaction back. So a
+synced-table replace self-heals: every run re-applies the object DDL.
 
 Design constraints that keep this OFFLINE-UNIT-TESTABLE (the live apply is ticket 04):
   * The gate (`wait_for_online`) is a pure function over an injected `get_status` callable and an
@@ -27,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -132,16 +136,75 @@ def run_migration_task(
 
 # --- Seam C: reuse of the shared Alembic migration (rendered offline, applied at runtime) ---
 
+# The alembic_version bookkeeping alembic emits offline. The object DDL (role guard / CREATE INDEX
+# IF NOT EXISTS / CREATE OR REPLACE VIEW) is ALREADY idempotent; only these two bookkeeping
+# statements are unguarded, so only these two are rewritten by make_rerunnable().
+_CREATE_VERSION_TABLE = re.compile(
+    r"CREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS)(alembic_version\b)", re.IGNORECASE
+)
+_INSERT_VERSION_ROW = re.compile(r"INSERT\s+INTO\s+alembic_version\b[^;]*;", re.IGNORECASE)
+_HAS_ON_CONFLICT = re.compile(r"ON\s+CONFLICT", re.IGNORECASE)
+_RETURNING = re.compile(r"(\s+)(RETURNING\b)", re.IGNORECASE)
+
+
+def make_rerunnable(sql: str) -> str:
+    """Rewrite alembic's UNGUARDED version bookkeeping so the rendered SQL is fully RE-RUNNABLE,
+    while leaving the reconciling object DDL byte-for-byte untouched.
+
+    Why this is required. `alembic upgrade head --sql` (offline, from base) always prepends its
+    bookkeeping and wraps EVERYTHING in one transaction:
+
+        BEGIN;
+        CREATE TABLE alembic_version (...);                       -- no IF NOT EXISTS
+        ... role guard / CREATE INDEX IF NOT EXISTS / CREATE OR REPLACE VIEW (idempotent) ...
+        INSERT INTO alembic_version (version_num) VALUES ('...')  -- no conflict guard
+            RETURNING alembic_version.version_num;
+        COMMIT;
+
+    apply_sql_to_lakebase() executes that blob in one shot. On a SECOND run the unguarded
+    `CREATE TABLE alembic_version` raises DuplicateTable, the BEGIN;…COMMIT; ROLLS BACK, and the
+    reconciling object DDL never re-applies. This job's whole purpose is to RECONCILE object DDL on
+    every run (e.g. after a synced-table replace, ADR 0002/0003), so alembic's run-once version
+    gating must not error on re-run and must not block the object DDL from re-applying.
+
+    Two surgical rewrites, confined to the alembic_version bookkeeping:
+      1. `CREATE TABLE alembic_version`  -> `CREATE TABLE IF NOT EXISTS alembic_version`
+         (no DuplicateTable on the 2nd apply; the negative lookahead makes it a fixpoint).
+      2. the `INSERT INTO alembic_version ...` statement gets `ON CONFLICT DO NOTHING`
+         (no PK unique-violation on the 2nd apply). The guard is injected BEFORE any RETURNING
+         clause (alembic emits one), because `ON CONFLICT` must precede `RETURNING` in Postgres.
+
+    With both guards the whole transaction is a clean no-op on re-run: IF NOT EXISTS create,
+    role guard, GRANT (no-op when held), CREATE INDEX IF NOT EXISTS, CREATE OR REPLACE VIEW, and a
+    conflict-safe version INSERT. Object DDL therefore reconciles on EVERY run. The function is
+    idempotent (safe to apply to already-guarded SQL).
+    """
+    sql = _CREATE_VERSION_TABLE.sub(r"CREATE TABLE IF NOT EXISTS \1", sql)
+
+    def _guard_insert(match: re.Match) -> str:
+        stmt = match.group(0)
+        if _HAS_ON_CONFLICT.search(stmt):
+            return stmt  # already conflict-safe — fixpoint
+        if _RETURNING.search(stmt):
+            return _RETURNING.sub(r" ON CONFLICT DO NOTHING\1\2", stmt, count=1)
+        return re.sub(r";\s*$", " ON CONFLICT DO NOTHING;", stmt, count=1)
+
+    return _INSERT_VERSION_ROW.sub(_guard_insert, sql)
+
+
 def render_migration_sql(
     *,
     alembic_dir: str | Path | None = None,
     config_path: str | Path | None = None,
 ) -> str:
-    """Render the SHARED alembic migration to idempotent DDL via `alembic upgrade head --sql`.
+    """Render the SHARED alembic migration to RE-RUNNABLE DDL, ready to apply twice safely.
 
     Reuses the repo's alembic/ (no copy): shells out to `python -m alembic` in that directory, with
-    LAKEBASE_TABLES_CONFIG pointed at the same tables config. The emitted SQL is guarded/reconciling
-    (IF NOT EXISTS / OR REPLACE / role guard), so applying it twice is a safe no-op. Returns the SQL.
+    LAKEBASE_TABLES_CONFIG pointed at the same tables config. The object DDL alembic emits is
+    already idempotent (IF NOT EXISTS / OR REPLACE / role guard), but alembic ALSO prepends
+    unguarded version bookkeeping that would error on a 2nd apply — so the raw render is passed
+    through make_rerunnable() before returning. The result (what --dry-run prints AND what
+    apply_sql_to_lakebase executes) is a safe reconciling no-op on re-run. Returns the SQL.
     """
     adir = Path(alembic_dir) if alembic_dir else shared_alembic_dir()
     ini = adir / "alembic.ini"
@@ -159,7 +222,7 @@ def render_migration_sql(
         raise RuntimeError(
             f"shared alembic render failed (exit {result.returncode}) in {adir}:\n{result.stderr}"
         )
-    return result.stdout
+    return make_rerunnable(result.stdout)
 
 
 # --- Runtime OAuth + apply (live path, exercised by ticket 04; SDK/psycopg imported lazily) --
@@ -203,6 +266,10 @@ def _lakebase_conninfo(instance_name: str) -> str:
 
 def apply_sql_to_lakebase(sql: str, *, instance_name: str) -> None:
     """Apply rendered DDL to Lakebase over a runtime-OAuth psycopg connection (no stored secret).
+
+    `sql` is the output of render_migration_sql, which is already RE-RUNNABLE (make_rerunnable has
+    guarded the version bookkeeping), so executing this blob a second time — e.g. after a
+    synced-table replace — is a clean reconciling no-op rather than a DuplicateTable rollback.
 
     Live path — exercised by ticket 04's FEVM acceptance, not by offline unit tests. psycopg is
     imported lazily so the unit suite imports this module without it installed.
