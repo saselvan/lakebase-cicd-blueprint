@@ -64,6 +64,31 @@ recreated after a table replace.
 
 ---
 
+## Alembic (Python) alternative
+
+Prefer Python/Alembic to Liquibase? `alembic/` is a parallel path that produces the **same
+objects** from the **same `config/tables.json`** — idempotent and generated offline (no database).
+Both paths are equal footing; pick one.
+
+Generate the SQL offline and pipe it to psql on each deploy:
+
+```bash
+cd alembic
+pip install alembic
+LAKEBASE_TABLES_CONFIG=../config/tables.json alembic upgrade head --sql
+```
+
+Parity with the Liquibase changelog — one Alembic migration, one helper per changeset:
+
+| Liquibase changeset | Alembic equivalent |
+|---|---|
+| `001-app-role.sql` | `_role_guard_sql` — idempotent `CREATE ROLE` via a `pg_roles` existence guard |
+| `002-app-grants.sql` | `_grant_statements` — `GRANT USAGE` on schema + `GRANT SELECT` on the synced table |
+| `003-indexes.sql` | `_index_statements` — `CREATE INDEX IF NOT EXISTS` per `index_columns` (handles 0/1/N) |
+| `004-app-view.sql` | `_view_statements` — `CREATE OR REPLACE VIEW` + `GRANT SELECT` on the view |
+
+How the Alembic path stays idempotent (the `runAlways`-equivalent) is explained in `docs/DESIGN-NOTES.md`.
+
 ## Key findings (from live testing)
 
 Verified end to end on the Autoscaling projects model (PostgreSQL 16, Databricks Terraform provider

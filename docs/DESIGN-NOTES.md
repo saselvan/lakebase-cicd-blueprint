@@ -144,6 +144,17 @@ common case (`${index_col_1}`/`${index_col_2}` from each entry's `index_columns`
 needing a different index shape (more indexes, composite/partial, or a different type) edits that
 changeset directly. Everything else is data in `config/tables.json`.
 
+## Alembic parity (Python teams)
+
+An `alembic/` variant mirrors the Liquibase changesets from the same `config/tables.json`, so Python
+shops can adopt the pattern in their own tool. Because Alembic tracks a revision as applied-once, the
+`runAlways`-equivalent is achieved differently: the migration emits **idempotent** SQL (a `pg_roles`
+guard around `CREATE ROLE`, `CREATE INDEX IF NOT EXISTS`, `CREATE OR REPLACE VIEW`, and `GRANT`) that a
+deploy renders offline (`alembic upgrade head --sql`) and applies **on every deploy** — it is
+**not gated** by Alembic's version table. That is what lets access self-heal after a synced-table
+replace, exactly like Liquibase `runAlways:true`. Object names come from the same config; index
+columns are the one table-specific spot, as with the Liquibase path.
+
 ## Key decisions at a glance
 
 - Provision with Terraform; apply the DB layer with Liquibase; sequence with a wait-for-`ONLINE` gate.
