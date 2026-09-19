@@ -342,6 +342,117 @@ def test_bundle_declares_migration_job_running_the_entrypoint():
     assert "migration_job.py" in blob, "job task does not run the migration_job.py entrypoint"
 
 
+# --- Seam D: config/alembic resolution survives the exec-without-__file__ runtime -------------
+#
+# THE runtime bug (ticket 06): the bundle spark_python_task runs the entrypoint via
+# exec(compile(src, filename, "exec")) into a namespace where __file__ is NOT bound. repo_root()
+# used Path(__file__), so a live serverless run died with
+#   NameError: name '__file__' is not defined
+# at load_tables -> tables_config_path -> repo_root(), BEFORE the config was ever read. Only the
+# unit suite (which imports the module, where __file__ IS bound) ever ran it, so it never surfaced.
+#
+# Two layered guarantees, each with a falsifiable test:
+#   (1) repo_root() no longer needs __file__  -> test_config_resolves_when_dunder_file_undefined.
+#   (2) the deploy passes the DEPLOYED config/alembic paths explicitly (belt to (1)'s suspenders)
+#       -> test_bundle_task_passes_deployed_config_and_alembic_paths.
+
+# A child that reproduces the bundle runtime EXACTLY: read the entrypoint source and run it via
+# exec(compile(...)) into a globals dict with NO "__file__" key, with sys.argv[0] set to the
+# entrypoint path (as a spark_python_task sets it). Then call load_tables() — which reaches
+# repo_root(). If repo_root() still needs __file__, this raises NameError and the child exits != 0.
+_EXEC_WITHOUT_DUNDER_FILE = r'''
+import json, sys
+from pathlib import Path
+
+entry = sys.argv[1]
+config_root = sys.argv[2]  # <root>/dabs/migration_job.py has <root>/config/tables.json as sibling-of-dabs
+
+src = Path(entry).read_text()
+g = {"__name__": "not_dunder_main"}          # deliberately NOT "__main__", and crucially NO __file__
+assert "__file__" not in g, "test harness leaked __file__ into the exec namespace"
+sys.argv = [entry]                            # emulate the task's argv[0]; NO --config passed here
+exec(compile(src, entry, "exec"), g)          # define the module's functions in a __file__-less ns
+
+# repo_root() must resolve WITHOUT __file__ (via sys.argv[0]) and find config/tables.json.
+rows = g["load_tables"]()                      # load_tables -> tables_config_path -> repo_root()
+resolved = g["tables_config_path"]()
+print(json.dumps({"rows": rows, "resolved": str(resolved)}))
+'''
+
+
+def test_config_resolves_when_dunder_file_undefined(tmp_path):
+    """The config resolver locates config/tables.json in the deployed bundle tree even when
+    __file__ is UNAVAILABLE — the exact serverless exec runtime that killed the live job.
+
+    Reproduces the runtime faithfully: a deployed-like tree (<root>/dabs/migration_job.py with
+    <root>/config/tables.json as a sibling-of-dabs, matching the deploy's sync manifest) whose
+    entrypoint is run via exec(compile(...)) into a namespace with no __file__.
+
+    MUTATION GATE — restore the __file__-only resolution
+    (`def repo_root(): return Path(__file__).resolve().parent.parent`) and this goes RED: the
+    exec namespace has no __file__, so repo_root() raises NameError, load_tables() never returns,
+    the child exits non-zero, and the returncode/JSON assertions below fail.
+    """
+    # Mirror the DEPLOYED layout: files/{dabs/migration_job.py, config/tables.json}.
+    root = tmp_path / "files"
+    (root / "dabs").mkdir(parents=True)
+    (root / "config").mkdir(parents=True)
+    entry = root / "dabs" / "migration_job.py"
+    entry.write_bytes((REPO_ROOT / "dabs" / "migration_job.py").read_bytes())
+    # A hostile config: a KNOWN, distinctive row that a mirror/hardcoded resolver could not fake,
+    # and an extra row so a single-row assumption is caught too.
+    cfg_rows = [
+        {"name": "sentinel_only_here", "synced_table_id": "c.s.sentinel"},
+        {"name": "second_row", "synced_table_id": "c.s.second"},
+    ]
+    (root / "config" / "tables.json").write_text(json.dumps(cfg_rows))
+
+    proc = subprocess.run(
+        [sys.executable, "-c", _EXEC_WITHOUT_DUNDER_FILE, str(entry), str(root)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, (
+        "resolver failed when __file__ was undefined (the live serverless exec runtime):\n"
+        f"STDOUT:{proc.stdout}\nSTDERR:{proc.stderr}"
+    )
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["rows"] == cfg_rows, f"resolved the wrong config rows: {out['rows']}"
+    # And it resolved to the config that sits as a sibling-of-dabs (the deployed layout), proving
+    # repo_root() walked dabs/ -> files/ -> files/config, not some unrelated path.
+    assert Path(out["resolved"]).resolve() == (root / "config" / "tables.json").resolve(), (
+        f"resolved config path is not the deployed sibling-of-dabs location: {out['resolved']}"
+    )
+
+
+def test_bundle_task_passes_deployed_config_and_alembic_paths():
+    """The deploy passes the DEPLOYED config/ and alembic/ locations to the task explicitly, via
+    bundle interpolation — so the live task never depends on the __file__/argv fallback at all, and
+    no literal workspace path is committed.
+
+    Guards a regression that would re-expose the __file__ failure: drop the explicit --config /
+    --alembic-dir params (or hardcode a literal path) and this goes RED.
+    """
+    bundle = yaml.safe_load((mj.repo_root() / "dabs" / "databricks.yml").read_text())
+    tasks = bundle["resources"]["jobs"]["lakebase_migration"]["tasks"]
+    params = tasks[0]["spark_python_task"]["parameters"]
+
+    def _value_after(flag: str) -> str:
+        assert flag in params, f"task parameters missing {flag}: {params}"
+        return params[params.index(flag) + 1]
+
+    assert _value_after("--config") == "${workspace.file_path}/config/tables.json", (
+        f"--config is not the interpolated DEPLOYED config path: {params}"
+    )
+    assert _value_after("--alembic-dir") == "${workspace.file_path}/alembic", (
+        f"--alembic-dir is not the interpolated DEPLOYED alembic dir: {params}"
+    )
+    # Credential-free / no committed literal: the deployed paths are interpolated, never hardcoded.
+    blob = json.dumps(params)
+    assert "/Workspace/" not in blob, f"a literal workspace path leaked into task params: {params}"
+
+
 @_needs_alembic
 def test_task_render_reuses_shared_alembic():
     """The task's default render (no alembic_dir) is byte-identical to an explicit render from the

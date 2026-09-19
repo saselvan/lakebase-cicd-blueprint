@@ -45,9 +45,43 @@ _TERMINAL_FAILURES = ("FAILED", "ERROR")
 
 # --- Single-source-of-truth locators (shared with Terraform + the Alembic migration) --------
 
+def _entrypoint_file() -> Path:
+    """Locate THIS entrypoint file WITHOUT depending on ``__file__``.
+
+    The bundle ``spark_python_task`` runs the entrypoint via ``exec(compile(src, filename,
+    "exec"))`` into a namespace where ``__file__`` is NOT bound — a live serverless run therefore
+    raised ``NameError: name '__file__' is not defined`` the moment ``repo_root()`` was reached
+    (before the config was ever read). The unit suite only ever imported this module (where
+    ``__file__`` IS bound), so the failure never surfaced offline.
+
+    Resolution order, from most to least reliable:
+      1. ``__file__`` when it is bound — local import, pytest, ``python migration_job.py``.
+      2. ``sys.argv[0]`` — the path the runtime invoked; a ``spark_python_task`` sets it to the
+         entrypoint. Guarded against the interactive/exec sentinels ('' and '-c').
+      3. ``cwd``/migration_job.py — a coarse last resort so a call still returns a Path, not raise.
+    """
+    try:
+        return Path(__file__)
+    except NameError:
+        argv0 = sys.argv[0] if sys.argv else ""
+        if argv0 and not argv0.startswith("-"):
+            return Path(argv0)
+        return Path.cwd() / "migration_job.py"
+
+
 def repo_root() -> Path:
-    """Repo root — parent of the dabs/ package that holds this entrypoint."""
-    return Path(__file__).resolve().parent.parent
+    """Repo root — parent of the dabs/ package that holds this entrypoint.
+
+    Derived via ``_entrypoint_file()`` so it never depends on ``__file__`` (the deployed bundle
+    runs the task under ``exec`` where ``__file__`` is undefined). In BOTH the local checkout and
+    the deployed bundle tree the entrypoint lives at ``<root>/dabs/migration_job.py`` with
+    ``config/`` and ``alembic/`` as siblings of ``dabs/`` (verified against the deploy's sync
+    manifest: files land under ``${workspace.file_path}/{dabs,config,alembic}``), so
+    parent-of-dabs is the correct root in both. The live path ALSO passes ``--config`` and
+    ``--alembic-dir`` explicitly (see ``main`` / ``databricks.yml``), so this is a robust
+    fallback, not the sole locator.
+    """
+    return _entrypoint_file().resolve().parent.parent
 
 
 def shared_alembic_dir() -> Path:
@@ -289,7 +323,20 @@ def main(argv: list[str] | None = None) -> int:
     is what the offline gate exercises.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--config", default=None, help="Path to config/tables.json (default: repo/env).")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to config/tables.json. The deploy passes the DEPLOYED location "
+        "(${workspace.file_path}/config/tables.json) so runtime config resolution is explicit "
+        "and never depends on __file__. Default: LAKEBASE_TABLES_CONFIG env / repo default.",
+    )
+    parser.add_argument(
+        "--alembic-dir",
+        default=None,
+        help="Path to the shared alembic/ dir. The deploy passes the DEPLOYED location "
+        "(${workspace.file_path}/alembic) so the render never depends on __file__. "
+        "Default: repo-relative shared alembic/.",
+    )
     parser.add_argument(
         "--instance",
         default=os.environ.get("LAKEBASE_INSTANCE_NAME"),
@@ -304,7 +351,7 @@ def main(argv: list[str] | None = None) -> int:
     table_ids = synced_table_ids(tables)
     print(f"migration job: {len(table_ids)} synced table(s) to gate on ONLINE: {table_ids}")
 
-    sql = render_migration_sql(config_path=args.config)
+    sql = render_migration_sql(alembic_dir=args.alembic_dir, config_path=args.config)
 
     if args.dry_run:
         print("dry-run: rendered shared alembic migration; skipping wait-gate + apply.")

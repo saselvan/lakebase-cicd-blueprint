@@ -39,9 +39,19 @@ resources:
       tasks:
         - task_key: alembic_migrate
           spark_python_task:
-            # Relative to the synced bundle root; migration_job.py syncs from dabs/.
+            # Relative to the synced bundle root; migration_job.py syncs from dabs/, i.e. the
+            # entrypoint lands at ${workspace.file_path}/dabs/migration_job.py.
             python_file: ./migration_job.py
+            # The task runs via exec(compile(...)) where __file__ is UNDEFINED, so the entrypoint
+            # can't locate config/ or alembic/ off __file__. We pass their DEPLOYED locations
+            # explicitly via bundle interpolation: sync.paths puts config/ and alembic/ at the
+            # files root (siblings of dabs/), so ${workspace.file_path}/{config,alembic} is where
+            # they land. Interpolated at deploy time — credential-free, no literal path committed.
             parameters:
+              - "--config"
+              - "${workspace.file_path}/config/tables.json"
+              - "--alembic-dir"
+              - "${workspace.file_path}/alembic"
               - "--instance"
               - "${var.lakebase_instance}"
           environment_key: migration
