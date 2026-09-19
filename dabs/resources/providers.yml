@@ -8,6 +8,7 @@ resources:
       primary_key_columns:
       - id
       postgres_database: ${var.lakebase_database}
+      branch: ${var.lakebase_branch}
       create_database_objects_if_missing: true
   postgres_roles:
     providers_role:

@@ -29,8 +29,10 @@ a resource field that the CLI would reject.
 
 Environment-specific placement is left as bundle variable references so no customer/workspace-specific
 value is committed: the role's `parent` (the Lakebase branch it lives on) uses `${var.lakebase_branch}`,
-and the synced table's `postgres_database` uses `${var.lakebase_database}`. (The synced table places via
-`postgres_database` only — it carries no branch reference.) Those variables are declared in the bundle's
+the synced table's `postgres_database` uses `${var.lakebase_database}`, and the synced table's `branch`
+also uses `${var.lakebase_branch}` — the SAME var the role's `parent` uses, so a target sets the branch
+once and both the synced table and its role follow it onto the same Lakebase branch (dev/prod placement
+stays separated, and an ephemeral-branch test can isolate). Those variables are declared in the bundle's
 `databricks.yml` targets (ticket 02).
 """
 
@@ -82,6 +84,7 @@ def build_synced_table_resource(table: dict) -> dict[str, Any]:
         "source_table_full_name": table["source_table_full_name"],
         "primary_key_columns": list(table["primary_key_columns"]),
         "postgres_database": DATABASE_VAR,
+        "branch": BRANCH_VAR,
         "create_database_objects_if_missing": True,
     }
 

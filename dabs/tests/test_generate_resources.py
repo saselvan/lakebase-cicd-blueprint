@@ -110,6 +110,51 @@ def test_each_synced_table_carries_source_pk_and_id_unswapped(tmp_path):
         )
 
 
+def test_each_synced_table_carries_branch_var_reference(tmp_path):
+    """Every emitted postgres_synced_tables resource carries `branch` == ${var.lakebase_branch}.
+
+    The synced table must place on the SAME Lakebase branch the target selects (the var the role's
+    `parent` already uses), or dev/prod targets can't separate synced-table placement and an
+    ephemeral-branch test can't isolate. This is the load-bearing ticket-04 pre-flight finding.
+
+    Guards the mutation: dropping the `branch` emission from build_synced_table_resource() makes
+    `branch` missing -> red. A literal branch path (e.g. "projects/…/branches/…") instead of the
+    var reference is ALSO rejected (a committed literal would leak a workspace-specific value).
+    """
+    from dabs.generate_resources import BRANCH_VAR
+
+    out = _generate(tmp_path)
+    assert out["synced"], "generator emitted no synced tables"
+    for key, st in out["synced"].items():
+        assert "branch" in st, f"synced table {key!r} has no `branch` field: {sorted(st)}"
+        assert st["branch"] == BRANCH_VAR, (
+            f"synced table {key!r} branch is {st['branch']!r}, expected the var reference "
+            f"{BRANCH_VAR!r} (not a literal, not missing)"
+        )
+        # Hostile: reject a hardcoded literal branch path masquerading as placement.
+        assert st["branch"].startswith("${var."), (
+            f"synced table {key!r} branch {st['branch']!r} is not a bundle variable reference — "
+            "a literal branch path must never be committed"
+        )
+        assert "projects/" not in st["branch"], (
+            f"synced table {key!r} branch {st['branch']!r} looks like a literal branch resource path"
+        )
+
+
+def test_synced_table_and_role_share_the_same_branch_var(tmp_path):
+    """The synced table's `branch` and its role's `parent` reference the SAME var, so a target that
+    sets ${var.lakebase_branch} moves BOTH the table and its role to that branch in lockstep.
+
+    Guards a mutation that points the synced table at a different/new var than the role's parent.
+    """
+    out = _generate(tmp_path)
+    role_parents = {r["parent"] for r in out["roles"].values()}
+    table_branches = {st["branch"] for st in out["synced"].values()}
+    assert role_parents == table_branches, (
+        f"synced-table branch {table_branches} and role parent {role_parents} must be the same var"
+    )
+
+
 def test_each_role_carries_its_rows_app_role(tmp_path):
     """Every row's app_role is carried on a role resource as postgres_role.
 
