@@ -9,6 +9,10 @@ resources:
       - id
       postgres_database: ${var.lakebase_database}
       branch: ${var.lakebase_branch}
+      scheduling_policy: SNAPSHOT
+      new_pipeline_spec:
+        storage_catalog: my_catalog
+        storage_schema: cicd_proj
       create_database_objects_if_missing: true
   postgres_roles:
     members_role:
