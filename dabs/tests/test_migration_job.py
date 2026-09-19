@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import pytest
@@ -571,4 +572,145 @@ def test_rendered_migration_double_apply_reconciles(hermetic_pg):
     # to_regclass NOT NULL for both (view + index reconciled back), version row count exactly 1.
     assert check.stdout.strip() == "t|t|1", (
         f"objects not reconciled or version row duplicated after 2nd apply: {check.stdout!r}"
+    )
+
+
+# --- Seam E: the migration connects to the TARGET BRANCH endpoint, not the instance default ----
+#
+# Finding #5 (surfaced by ticket 04's live run): _lakebase_conninfo built the psycopg conninfo from
+# the Lakebase INSTANCE `read_write_dns` — which is the instance DEFAULT endpoint = the PRODUCTION
+# branch. So the migration job connected to production, not the ephemeral target branch, and raised
+#   InvalidSchemaName: schema "cicd_dabs" does not exist
+# because the intended target branch was never migrated. The fix: resolve the host from the
+# ${var.lakebase_branch} value ("projects/<proj>/branches/<branch>") via that branch's compute
+# endpoint (SDK postgres.list_endpoints -> status.hosts.host — the SAME field the proven-live
+# scripts/branch_test.sh reads as JSON[0]['status']['hosts']['host']), NOT the instance read_write_dns.
+#
+# All seams are injected as pure callables (mirroring the get_status / sdk_status_source pattern),
+# so these run fully offline with NO databricks-sdk and NO psycopg installed.
+
+_PROD_DNS = "instance-abc123.database.cloud.databricks.com"     # hostile decoy: the INSTANCE default
+_BRANCH_HOST = "ep-branch-pr42.database.cloud.databricks.com"   # the TARGET branch endpoint host
+_BRANCH = "projects/lakebase-cicd/branches/pr-42"
+
+
+def test_conninfo_host_is_branch_endpoint_not_instance_default():
+    """When a branch is given, the conninfo host is the BRANCH endpoint host — never the instance
+    default (production) DNS. Hostile decoy: the instance's read_write_dns is a DIFFERENT, realistic
+    production host, so a resolver that accidentally reads the instance default cannot go green.
+
+    MUTATION GATE — both go RED here:
+      (a) revert host resolution to `instance_dns_source(instance_name)` (== read_write_dns)
+          -> host is the prod decoy, not the branch endpoint.
+      (b) ignore the branch (force `branch = None`) -> falls to the instance-default fallback.
+    """
+    seen_branches: list[str] = []
+
+    def resolve_host(branch: str) -> str:
+        seen_branches.append(branch)
+        return _BRANCH_HOST
+
+    def instance_dns_source(instance_name: str) -> str:
+        return _PROD_DNS  # the instance DEFAULT endpoint = production branch (the bug's host)
+
+    def credential_source(instance_name: str) -> tuple[str, str]:
+        return ("svc@databricks.com", "tok-runtime-oauth")
+
+    conninfo = mj._lakebase_conninfo(
+        "my-instance",
+        branch=_BRANCH,
+        resolve_host=resolve_host,
+        instance_dns_source=instance_dns_source,
+        credential_source=credential_source,
+    )
+
+    fields = dict(kv.split("=", 1) for kv in conninfo.split())
+    assert fields["host"] == _BRANCH_HOST, (
+        f"conninfo host must be the branch endpoint, got {fields['host']!r} "
+        f"(prod decoy is {_PROD_DNS!r})"
+    )
+    assert fields["host"] != _PROD_DNS, (
+        "conninfo used the INSTANCE DEFAULT (production) host — this is exactly finding #5"
+    )
+    assert seen_branches == [_BRANCH], f"branch not passed to the host resolver: {seen_branches}"
+    # The runtime-OAuth credential path still populates user/password (no stored secret).
+    assert fields["user"] == "svc@databricks.com"
+    assert fields["password"] == "tok-runtime-oauth"
+
+
+def test_host_from_endpoints_prefers_read_write():
+    """The pure host picker returns the READ_WRITE endpoint's connection host (a migration must
+    WRITE). Hostile fixture: a READ_ONLY endpoint is listed FIRST with a different host, so a naive
+    `[0]` pick would grab the read-only host — the picker must skip it for the read-write one.
+    """
+    def _ep(host: str, etype: str):
+        return types.SimpleNamespace(
+            status=types.SimpleNamespace(
+                hosts=types.SimpleNamespace(host=host),
+                endpoint_type=etype,
+            )
+        )
+
+    eps = [_ep("ro-host.example", "READ_ONLY"), _ep("rw-host.example", "READ_WRITE")]
+    assert mj._host_from_endpoints(eps) == "rw-host.example", (
+        "host picker did not prefer the READ_WRITE endpoint (a migration writes)"
+    )
+
+
+def test_apply_threads_branch_into_conninfo(monkeypatch):
+    """apply_sql_to_lakebase threads the branch through to the conninfo builder, so the live apply
+    connects to the branch endpoint. Guards the threading half of mutation (b): if apply drops the
+    branch before building the conninfo, this goes red.
+    """
+    captured: dict[str, object] = {}
+
+    def fake_conninfo(instance_name, *, branch=None, **kw):
+        captured["instance"] = instance_name
+        captured["branch"] = branch
+        return "host=x port=5432 dbname=d user=u password=p sslmode=require"
+
+    monkeypatch.setattr(mj, "_lakebase_conninfo", fake_conninfo)
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql):
+            captured["sql"] = sql
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return _Cur()
+
+    fake_psycopg.connect = lambda conninfo, autocommit=False: _Conn()
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    mj.apply_sql_to_lakebase("SELECT 1;", instance_name="inst", branch="projects/p/branches/b")
+
+    assert captured["branch"] == "projects/p/branches/b", "branch not threaded into the conninfo builder"
+    assert captured["instance"] == "inst"
+    assert captured["sql"] == "SELECT 1;"
+
+
+def test_bundle_task_passes_branch_variable():
+    """The deploy passes the target branch to the task via ${var.lakebase_branch}, mirroring how
+    --instance / ${var.lakebase_instance} is passed — so the job migrates the TARGET branch endpoint
+    (finding #5), never the instance default. Guards a regression that drops the --branch param.
+    """
+    bundle = yaml.safe_load((mj.repo_root() / "dabs" / "databricks.yml").read_text())
+    params = bundle["resources"]["jobs"]["lakebase_migration"]["tasks"][0]["spark_python_task"]["parameters"]
+    assert "--branch" in params, f"task parameters missing --branch: {params}"
+    assert params[params.index("--branch") + 1] == "${var.lakebase_branch}", (
+        f"--branch is not the interpolated lakebase_branch var: {params}"
     )
