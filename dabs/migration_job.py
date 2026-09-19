@@ -280,26 +280,125 @@ def sdk_status_source(instance_name: str) -> Callable[[str], str]:
     return get_status
 
 
-def _lakebase_conninfo(instance_name: str) -> str:
-    """Build a psycopg conninfo string for Lakebase using a RUNTIME OAuth credential — no stored
-    secret. Imported lazily; only used on the live apply path (ticket 04)."""
+def _host_from_endpoints(endpoints: object) -> str:
+    """Pick the connection host from a branch's compute endpoints (pure, no SDK/network).
+
+    A migration WRITES, so it must target the branch's READ_WRITE endpoint; a branch has exactly
+    one. We therefore prefer the READ_WRITE endpoint's `status.hosts.host` and only fall back to the
+    first endpoint that exposes a host — this is stricter than the proven-live `JSON[0]` pick in
+    scripts/branch_test.sh (which is correct only because a fresh branch has a single endpoint), so
+    it stays correct even if a read-only endpoint is listed first. Reads the SAME field the live
+    script reads: `status.hosts.host`. Duck-typed so a mocked endpoint needs no SDK types.
+    """
+    eps = list(endpoints)
+
+    def _host(ep: object) -> str | None:
+        status = getattr(ep, "status", None)
+        hosts = getattr(status, "hosts", None)
+        return getattr(hosts, "host", None)
+
+    def _is_read_write(ep: object) -> bool:
+        etype = getattr(getattr(ep, "status", None), "endpoint_type", None)
+        # endpoint_type is an enum on the SDK object; compare by string so a plain string works too.
+        return "READ_WRITE" in str(getattr(etype, "value", etype) or "").upper()
+
+    for ep in eps:
+        if _is_read_write(ep) and _host(ep):
+            return _host(ep)  # type: ignore[return-value]
+    for ep in eps:
+        if _host(ep):
+            return _host(ep)  # type: ignore[return-value]
+    raise RuntimeError("no compute endpoint with a connection host found for the branch")
+
+
+def sdk_branch_host_source() -> Callable[[str], str]:
+    """Return `resolve_host(branch)` -> connection host, backed by the Databricks Postgres SDK.
+
+    Imported lazily so offline unit tests need no databricks-sdk. `branch` is the
+    ``projects/<proj>/branches/<branch>`` value carried by ${var.lakebase_branch}. Lists that
+    branch's compute endpoints and returns the READ_WRITE endpoint's host — the SDK equivalent of
+    the proven-live CLI `databricks postgres list-endpoints <branch>` -> JSON[0].status.hosts.host.
+
+    SDK-over-CLI (justified): the migration runs as a spark_python_task on SERVERLESS, where the
+    `databricks` CLI binary is NOT guaranteed present, but databricks-sdk>=0.133 is a declared job
+    dependency. The exact call is CONFIRMED against databricks-sdk (WorkspaceClient().postgres,
+    class PostgresAPI.list_endpoints(parent=...) -> Iterator[Endpoint], Endpoint.status.hosts.host).
+    """
+    from databricks.sdk import WorkspaceClient  # lazy: not needed for offline unit tests
+
+    workspace = WorkspaceClient()
+
+    def resolve_host(branch: str) -> str:
+        return _host_from_endpoints(workspace.postgres.list_endpoints(parent=branch))
+
+    return resolve_host
+
+
+def _sdk_instance_dns_source(instance_name: str) -> str:
+    """The instance DEFAULT endpoint DNS (`read_write_dns`) — the no-branch FALLBACK host only.
+
+    Kept as a documented fallback for callers that pass no branch; the live job always passes a
+    branch (see main / databricks.yml), so this default endpoint (which points at PRODUCTION) is
+    NOT used on the fixed path. Imported lazily. This is the very host finding #5 was wrongly using.
+    """
+    from databricks.sdk import WorkspaceClient  # lazy
+
+    return WorkspaceClient().database.get_database_instance(name=instance_name).read_write_dns
+
+
+def _sdk_credential_source(instance_name: str) -> tuple[str, str]:
+    """Return (user, token) for a RUNTIME OAuth credential — no stored secret. Imported lazily."""
     from databricks.sdk import WorkspaceClient  # lazy
 
     workspace = WorkspaceClient()
-    instance = workspace.database.get_database_instance(name=instance_name)
     cred = workspace.database.generate_database_credential(
         request_id=str(time.time_ns()), instance_names=[instance_name]
     )
     user = workspace.current_user.me().user_name
-    host = instance.read_write_dns
+    return user, cred.token
+
+
+def _lakebase_conninfo(
+    instance_name: str,
+    *,
+    branch: str | None = None,
+    resolve_host: Callable[[str], str] | None = None,
+    instance_dns_source: Callable[[str], str] | None = None,
+    credential_source: Callable[[str], tuple[str, str]] | None = None,
+) -> str:
+    """Build a psycopg conninfo string for Lakebase using a RUNTIME OAuth credential — no stored
+    secret. Only used on the live apply path.
+
+    Finding #5: the host MUST be the TARGET BRANCH's endpoint, not the instance `read_write_dns`
+    (which is the instance DEFAULT endpoint = the production branch). When `branch`
+    (``projects/<proj>/branches/<branch>``) is given, the host is resolved from that branch's
+    compute endpoint; only when NO branch is given do we fall back to the instance default DNS.
+
+    The host resolver, the instance-DNS fallback, and the credential source are all INJECTABLE
+    pure callables (mirroring get_status / sdk_status_source), defaulting to SDK-backed sources —
+    so this is offline-unit-testable without databricks-sdk installed.
+    """
+    resolve_host = resolve_host or sdk_branch_host_source()
+    instance_dns_source = instance_dns_source or _sdk_instance_dns_source
+    credential_source = credential_source or _sdk_credential_source
+
+    if branch:
+        host = resolve_host(branch)  # the TARGET branch endpoint — the fix
+    else:
+        host = instance_dns_source(instance_name)  # no-branch fallback (instance DEFAULT endpoint)
+
+    user, token = credential_source(instance_name)
     return (
         f"host={host} port=5432 dbname={os.environ.get('PGDATABASE', 'databricks_postgres')} "
-        f"user={user} password={cred.token} sslmode=require"
+        f"user={user} password={token} sslmode=require"
     )
 
 
-def apply_sql_to_lakebase(sql: str, *, instance_name: str) -> None:
+def apply_sql_to_lakebase(sql: str, *, instance_name: str, branch: str | None = None) -> None:
     """Apply rendered DDL to Lakebase over a runtime-OAuth psycopg connection (no stored secret).
+
+    `branch` (``projects/<proj>/branches/<branch>``) selects the TARGET branch endpoint host so the
+    migration lands on that branch, not the instance default endpoint (production) — finding #5.
 
     `sql` is the output of render_migration_sql, which is already RE-RUNNABLE (make_rerunnable has
     guarded the version bookkeeping), so executing this blob a second time — e.g. after a
@@ -310,7 +409,7 @@ def apply_sql_to_lakebase(sql: str, *, instance_name: str) -> None:
     """
     import psycopg  # lazy: only the live apply needs a driver
 
-    with psycopg.connect(_lakebase_conninfo(instance_name), autocommit=True) as conn:
+    with psycopg.connect(_lakebase_conninfo(instance_name, branch=branch), autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
 
@@ -342,6 +441,14 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("LAKEBASE_INSTANCE_NAME"),
         help="Lakebase database instance name (default: LAKEBASE_INSTANCE_NAME).",
     )
+    parser.add_argument(
+        "--branch",
+        default=os.environ.get("LAKEBASE_BRANCH"),
+        help="Target Lakebase branch (projects/<proj>/branches/<branch>) whose compute-endpoint "
+        "host the migration connects to. The deploy passes ${var.lakebase_branch}. Without it the "
+        "apply falls back to the instance DEFAULT endpoint (production) — finding #5. "
+        "Default: LAKEBASE_BRANCH env.",
+    )
     parser.add_argument("--timeout", type=float, default=1800, help="Wait-for-ONLINE timeout (s).")
     parser.add_argument("--poll-interval", type=float, default=10, help="Wait-for-ONLINE poll interval (s).")
     parser.add_argument("--dry-run", action="store_true", help="Render only; do not connect/apply (offline).")
@@ -365,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
     run_migration_task(
         table_ids,
         get_status,
-        lambda: apply_sql_to_lakebase(sql, instance_name=args.instance),
+        lambda: apply_sql_to_lakebase(sql, instance_name=args.instance, branch=args.branch),
         poll_interval=args.poll_interval,
         timeout=args.timeout,
     )

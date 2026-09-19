@@ -54,6 +54,11 @@ resources:
               - "${workspace.file_path}/alembic"
               - "--instance"
               - "${var.lakebase_instance}"
+              # The migration connects to the TARGET BRANCH's compute-endpoint host, NOT the
+              # instance default endpoint (= production). Without this the job migrates the wrong
+              # branch and raises InvalidSchemaName (finding #5). Interpolated at deploy time.
+              - "--branch"
+              - "${var.lakebase_branch}"
           environment_key: migration
       environments:
         - environment_key: migration
