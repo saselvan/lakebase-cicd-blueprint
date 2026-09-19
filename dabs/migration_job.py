@@ -334,18 +334,6 @@ def sdk_branch_host_source() -> Callable[[str], str]:
     return resolve_host
 
 
-def _sdk_instance_dns_source(instance_name: str) -> str:
-    """The instance DEFAULT endpoint DNS (`read_write_dns`) — the no-branch FALLBACK host only.
-
-    Kept as a documented fallback for callers that pass no branch; the live job always passes a
-    branch (see main / databricks.yml), so this default endpoint (which points at PRODUCTION) is
-    NOT used on the fixed path. Imported lazily. This is the very host finding #5 was wrongly using.
-    """
-    from databricks.sdk import WorkspaceClient  # lazy
-
-    return WorkspaceClient().database.get_database_instance(name=instance_name).read_write_dns
-
-
 def _sdk_credential_source(instance_name: str) -> tuple[str, str]:
     """Return (user, token) for a RUNTIME OAuth credential — no stored secret. Imported lazily."""
     from databricks.sdk import WorkspaceClient  # lazy
@@ -361,32 +349,35 @@ def _sdk_credential_source(instance_name: str) -> tuple[str, str]:
 def _lakebase_conninfo(
     instance_name: str,
     *,
-    branch: str | None = None,
+    branch: str,
     resolve_host: Callable[[str], str] | None = None,
-    instance_dns_source: Callable[[str], str] | None = None,
     credential_source: Callable[[str], tuple[str, str]] | None = None,
 ) -> str:
     """Build a psycopg conninfo string for Lakebase using a RUNTIME OAuth credential — no stored
     secret. Only used on the live apply path.
 
-    Finding #5: the host MUST be the TARGET BRANCH's endpoint, not the instance `read_write_dns`
-    (which is the instance DEFAULT endpoint = the production branch). When `branch`
-    (``projects/<proj>/branches/<branch>``) is given, the host is resolved from that branch's
-    compute endpoint; only when NO branch is given do we fall back to the instance default DNS.
+    Finding #5 / #1: the host MUST be the TARGET BRANCH's endpoint, never the instance
+    `read_write_dns` (which is the instance DEFAULT endpoint = the production branch). `branch`
+    (``projects/<proj>/branches/<branch>``) is therefore REQUIRED and is resolved to a host via the
+    branch's compute endpoint. A missing/empty branch RAISES rather than reconnecting to the
+    instance default — that fallback was dead-but-dangerous machinery (no caller omits the branch;
+    the bundle always passes ``${var.lakebase_branch}``) that latently re-armed finding #5, so it
+    was removed along with the instance-DNS seam.
 
-    The host resolver, the instance-DNS fallback, and the credential source are all INJECTABLE
-    pure callables (mirroring get_status / sdk_status_source), defaulting to SDK-backed sources —
-    so this is offline-unit-testable without databricks-sdk installed.
+    The host resolver and the credential source are INJECTABLE pure callables (mirroring
+    get_status / sdk_status_source), defaulting to SDK-backed sources — so this is
+    offline-unit-testable without databricks-sdk installed.
     """
+    if not branch:
+        raise ValueError(
+            "a target branch (projects/<proj>/branches/<branch>) is required to build the "
+            "Lakebase conninfo; refusing to fall back to the instance default endpoint "
+            "(production) — finding #5/#1"
+        )
     resolve_host = resolve_host or sdk_branch_host_source()
-    instance_dns_source = instance_dns_source or _sdk_instance_dns_source
     credential_source = credential_source or _sdk_credential_source
 
-    if branch:
-        host = resolve_host(branch)  # the TARGET branch endpoint — the fix
-    else:
-        host = instance_dns_source(instance_name)  # no-branch fallback (instance DEFAULT endpoint)
-
+    host = resolve_host(branch)  # the TARGET branch endpoint — never the instance default
     user, token = credential_source(instance_name)
     return (
         f"host={host} port=5432 dbname={os.environ.get('PGDATABASE', 'databricks_postgres')} "
@@ -394,11 +385,12 @@ def _lakebase_conninfo(
     )
 
 
-def apply_sql_to_lakebase(sql: str, *, instance_name: str, branch: str | None = None) -> None:
+def apply_sql_to_lakebase(sql: str, *, instance_name: str, branch: str) -> None:
     """Apply rendered DDL to Lakebase over a runtime-OAuth psycopg connection (no stored secret).
 
-    `branch` (``projects/<proj>/branches/<branch>``) selects the TARGET branch endpoint host so the
-    migration lands on that branch, not the instance default endpoint (production) — finding #5.
+    `branch` (``projects/<proj>/branches/<branch>``) is REQUIRED — it selects the TARGET branch
+    endpoint host so the migration lands on that branch, not the instance default endpoint
+    (production) — finding #5/#1. A missing/empty branch raises in _lakebase_conninfo.
 
     `sql` is the output of render_migration_sql, which is already RE-RUNNABLE (make_rerunnable has
     guarded the version bookkeeping), so executing this blob a second time — e.g. after a
@@ -445,8 +437,9 @@ def main(argv: list[str] | None = None) -> int:
         "--branch",
         default=os.environ.get("LAKEBASE_BRANCH"),
         help="Target Lakebase branch (projects/<proj>/branches/<branch>) whose compute-endpoint "
-        "host the migration connects to. The deploy passes ${var.lakebase_branch}. Without it the "
-        "apply falls back to the instance DEFAULT endpoint (production) — finding #5. "
+        "host the migration connects to. The deploy passes ${var.lakebase_branch}. REQUIRED for a "
+        "live apply (like --instance): without it the job would connect to the instance DEFAULT "
+        "endpoint = production — finding #5/#1, so it is refused rather than defaulted. "
         "Default: LAKEBASE_BRANCH env.",
     )
     parser.add_argument("--timeout", type=float, default=1800, help="Wait-for-ONLINE timeout (s).")
@@ -467,6 +460,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.instance:
         parser.error("--instance / LAKEBASE_INSTANCE_NAME is required for a live apply")
+    if not args.branch:
+        parser.error(
+            "--branch / LAKEBASE_BRANCH is required for a live apply — refusing to fall back to "
+            "the instance DEFAULT endpoint (production); finding #5/#1"
+        )
 
     get_status = sdk_status_source(args.instance)
     run_migration_task(
