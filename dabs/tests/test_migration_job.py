@@ -27,6 +27,7 @@ function names. The status source / SDK are MOCKED; nothing hits a real workspac
 
 from __future__ import annotations
 
+import enum
 import json
 import os
 import re
@@ -595,23 +596,18 @@ _BRANCH = "projects/lakebase-cicd/branches/pr-42"
 
 
 def test_conninfo_host_is_branch_endpoint_not_instance_default():
-    """When a branch is given, the conninfo host is the BRANCH endpoint host — never the instance
-    default (production) DNS. Hostile decoy: the instance's read_write_dns is a DIFFERENT, realistic
-    production host, so a resolver that accidentally reads the instance default cannot go green.
+    """When a branch is given, the conninfo host is the BRANCH endpoint host — resolved from the
+    ${var.lakebase_branch} value via the injected resolver, never the instance default (production).
 
-    MUTATION GATE — both go RED here:
-      (a) revert host resolution to `instance_dns_source(instance_name)` (== read_write_dns)
-          -> host is the prod decoy, not the branch endpoint.
-      (b) ignore the branch (force `branch = None`) -> falls to the instance-default fallback.
+    MUTATION GATE — goes RED here:
+      revert host resolution to a silent instance-default fallback / a hardcoded prod host
+      -> host is not the branch endpoint.
     """
     seen_branches: list[str] = []
 
     def resolve_host(branch: str) -> str:
         seen_branches.append(branch)
         return _BRANCH_HOST
-
-    def instance_dns_source(instance_name: str) -> str:
-        return _PROD_DNS  # the instance DEFAULT endpoint = production branch (the bug's host)
 
     def credential_source(instance_name: str) -> tuple[str, str]:
         return ("svc@databricks.com", "tok-runtime-oauth")
@@ -620,7 +616,6 @@ def test_conninfo_host_is_branch_endpoint_not_instance_default():
         "my-instance",
         branch=_BRANCH,
         resolve_host=resolve_host,
-        instance_dns_source=instance_dns_source,
         credential_source=credential_source,
     )
 
@@ -638,12 +633,70 @@ def test_conninfo_host_is_branch_endpoint_not_instance_default():
     assert fields["password"] == "tok-runtime-oauth"
 
 
+@pytest.mark.parametrize("missing", [None, ""])
+def test_conninfo_missing_branch_raises(missing):
+    """A missing/empty branch must RAISE — never silently fall back to the instance default
+    endpoint (production). That fallback IS the finding #5 defect; the branch is now REQUIRED, so
+    the dead-but-dangerous fallback machinery is gone. Observable behavior: a ValueError is raised
+    and NEITHER the host resolver NOR the credential source is ever consulted (so no accidental
+    instance-default connection is even attempted).
+
+    MUTATION GATE: re-add a silent instance-default fallback instead of raising -> this goes RED.
+    """
+    resolver_calls: list[str] = []
+    cred_calls: list[str] = []
+
+    def resolve_host(branch: str) -> str:
+        resolver_calls.append(branch)
+        return "should-not-be-used.example"
+
+    def credential_source(instance_name: str) -> tuple[str, str]:
+        cred_calls.append(instance_name)
+        return ("u", "t")
+
+    with pytest.raises(ValueError):
+        mj._lakebase_conninfo(
+            "my-instance",
+            branch=missing,
+            resolve_host=resolve_host,
+            credential_source=credential_source,
+        )
+    assert resolver_calls == [], "host resolver must not be called when the branch is missing"
+    assert cred_calls == [], "credential source must not be called when the branch is missing"
+
+
+def test_main_requires_branch_for_live_apply(monkeypatch, tmp_path):
+    """A live apply (no --dry-run) must REQUIRE --branch / LAKEBASE_BRANCH, exactly as it already
+    requires --instance — so it can never fall back to the instance default endpoint (production).
+    argparse's parser.error exits with SystemExit(2). Guards the finding #1 fix at the CLI layer.
+    """
+    # Minimal one-row tables config so load_tables/render succeed before the branch check.
+    cfg = tmp_path / "tables.json"
+    cfg.write_text('[{"synced_table_id": "cat.sch.tbl"}]')
+    monkeypatch.setattr(mj, "render_migration_sql", lambda **kw: "SELECT 1;")
+    monkeypatch.delenv("LAKEBASE_BRANCH", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        mj.main(["--config", str(cfg), "--instance", "my-instance"])  # instance given, branch absent
+    assert exc.value.code == 2, "missing --branch on a live apply must exit non-zero (parser.error)"
+
+
 def test_host_from_endpoints_prefers_read_write():
     """The pure host picker returns the READ_WRITE endpoint's connection host (a migration must
-    WRITE). Hostile fixture: a READ_ONLY endpoint is listed FIRST with a different host, so a naive
-    `[0]` pick would grab the read-only host — the picker must skip it for the read-write one.
+    WRITE). Pinned against the REAL databricks-sdk shape (service/postgres.py, sdk >= 0.133):
+      * Endpoint.status.endpoint_type  -> EndpointStatus.endpoint_type, an EndpointType enum
+      * Endpoint.status.hosts.host     -> EndpointHosts.host
+      * enum VALUES ENDPOINT_TYPE_READ_WRITE / ENDPOINT_TYPE_READ_ONLY (confirmed in the installed
+        SDK) — NOT a fabricated 'READ_WRITE' short form.
+    Hostile fixture: the READ_ONLY endpoint is listed FIRST with a different host, so a blind `[0]`
+    pick grabs the read-only host, and the read-write marker sits behind an enum `.value` — so a
+    picker that reads the WRONG attribute name degrades to first-pick and this goes RED.
     """
-    def _ep(host: str, etype: str):
+    class _EndpointType(enum.Enum):  # mirrors databricks.sdk.service.postgres.EndpointType
+        ENDPOINT_TYPE_READ_ONLY = "ENDPOINT_TYPE_READ_ONLY"
+        ENDPOINT_TYPE_READ_WRITE = "ENDPOINT_TYPE_READ_WRITE"
+
+    def _ep(host: str, etype: _EndpointType):
         return types.SimpleNamespace(
             status=types.SimpleNamespace(
                 hosts=types.SimpleNamespace(host=host),
@@ -651,7 +704,10 @@ def test_host_from_endpoints_prefers_read_write():
             )
         )
 
-    eps = [_ep("ro-host.example", "READ_ONLY"), _ep("rw-host.example", "READ_WRITE")]
+    eps = [
+        _ep("ro-host.example", _EndpointType.ENDPOINT_TYPE_READ_ONLY),
+        _ep("rw-host.example", _EndpointType.ENDPOINT_TYPE_READ_WRITE),
+    ]
     assert mj._host_from_endpoints(eps) == "rw-host.example", (
         "host picker did not prefer the READ_WRITE endpoint (a migration writes)"
     )
