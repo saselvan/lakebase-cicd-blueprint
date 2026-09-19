@@ -14,6 +14,12 @@ break a lazy implementation:
   - `claims.synced_table_id` (cat_a.shared_schema.claims_synced) differs non-trivially from
     `claims.source_table_full_name` (cat_b.raw_landing.claims_delta_source) — different catalog,
     schema, AND table — so a swap/echo of the two fields cannot pass.
+  - `providers` carries an EXPLICIT `scheduling_policy: "TRIGGERED"` while `claims`/`members`
+    OMIT it — so a codegen that hardcodes SNAPSHOT (ignoring the override) fails on providers,
+    and one that never emits the field fails the default rows.
+  - `providers.synced_table_id` is `cat_c.prov.*` (catalog cat_c, schema prov) while
+    `claims`/`members` are `cat_a.shared_schema.*` — so new_pipeline_spec.storage_catalog /
+    storage_schema DERIVED from the id (1st/2nd dotted parts) cannot be hardcoded to one value.
 
 Bundle-schema note: `postgres_synced_tables` and `postgres_roles` both set
 `additionalProperties: false` (verified against `databricks bundle schema`, CLI v1.14.1), so the
@@ -107,6 +113,94 @@ def test_each_synced_table_carries_source_pk_and_id_unswapped(tmp_path):
         )
         assert st["primary_key_columns"] == row["primary_key_columns"], (
             f"primary_key_columns wrong for {row['name']}"
+        )
+
+
+_VALID_SCHEDULING_POLICIES = {"CONTINUOUS", "TRIGGERED", "SNAPSHOT"}
+
+
+def test_every_synced_table_has_valid_scheduling_policy_defaulting_snapshot(tmp_path):
+    """Every emitted synced table carries a `scheduling_policy` in the bundle-schema enum, and a
+    row that OMITS the field defaults to SNAPSHOT.
+
+    `bundle deploy` against real FEVM failed with 'Unsupported scheduling policy: None' because the
+    codegen omitted this required field (the strict schema allows omitting it; the create API
+    rejects it). Enum verified against `databricks bundle schema`, CLI v1.14.1
+    (postgres.SyncedTableSyncedTableSpecSyncedTableSchedulingPolicy): CONTINUOUS|TRIGGERED|SNAPSHOT.
+
+    Guards the mutation: dropping the `scheduling_policy` emission makes the field missing -> red.
+    """
+    out = _generate(tmp_path)
+    by_id = {st["synced_table_id"]: st for st in out["synced"].values()}
+    for row in _fixture_rows():
+        st = by_id[row["synced_table_id"]]
+        assert "scheduling_policy" in st, (
+            f"synced table for {row['name']} has no scheduling_policy: {sorted(st)}"
+        )
+        assert st["scheduling_policy"] in _VALID_SCHEDULING_POLICIES, (
+            f"scheduling_policy {st['scheduling_policy']!r} for {row['name']} is not in the "
+            f"bundle-schema enum {_VALID_SCHEDULING_POLICIES}"
+        )
+        if "scheduling_policy" not in row:
+            assert st["scheduling_policy"] == "SNAPSHOT", (
+                f"{row['name']} omits scheduling_policy but did not default to SNAPSHOT: "
+                f"{st['scheduling_policy']!r}"
+            )
+
+
+def test_scheduling_policy_row_override_is_honored(tmp_path):
+    """A row's explicit `scheduling_policy` is emitted verbatim; rows without one stay SNAPSHOT.
+
+    The fixture's `providers` row sets TRIGGERED while `claims`/`members` omit it.
+
+    Guards the mutation: hardcoding SNAPSHOT (ignoring the row override) makes providers' emitted
+    policy SNAPSHOT != TRIGGERED -> red. It also proves the default rows are NOT hardcoded to the
+    override value.
+    """
+    out = _generate(tmp_path)
+    by_id = {st["synced_table_id"]: st for st in out["synced"].values()}
+    rows = {r["name"]: r for r in _fixture_rows()}
+
+    override_row = rows["providers"]
+    assert override_row.get("scheduling_policy") == "TRIGGERED", "fixture regression: providers override"
+    assert by_id[override_row["synced_table_id"]]["scheduling_policy"] == "TRIGGERED", (
+        "providers' explicit scheduling_policy override was not honored (hardcoded SNAPSHOT?)"
+    )
+    # A row that omits it must NOT pick up the override value.
+    default_st = by_id[rows["claims"]["synced_table_id"]]
+    assert default_st["scheduling_policy"] == "SNAPSHOT", (
+        f"claims omits scheduling_policy; expected default SNAPSHOT, got {default_st['scheduling_policy']!r}"
+    )
+
+
+def test_every_synced_table_has_new_pipeline_spec_derived_from_id(tmp_path):
+    """Every synced table carries new_pipeline_spec.{storage_catalog,storage_schema} equal to the
+    1st and 2nd dotted parts of its OWN synced_table_id.
+
+    `bundle deploy` requires new_pipeline_spec on the create; the deployed reference Terraform set
+    storage_catalog/storage_schema to the synced table's own catalog/schema. Sub-field names
+    verified against `databricks bundle schema`, CLI v1.14.1 (postgres.NewPipelineSpec):
+    storage_catalog, storage_schema.
+
+    Guards the mutations: dropping new_pipeline_spec makes the key missing -> red; hardcoding a
+    single catalog/schema fails `providers` (cat_c.prov) which differs from claims/members
+    (cat_a.shared_schema) -> red.
+    """
+    out = _generate(tmp_path)
+    by_id = {st["synced_table_id"]: st for st in out["synced"].values()}
+    for row in _fixture_rows():
+        st = by_id[row["synced_table_id"]]
+        assert "new_pipeline_spec" in st, (
+            f"synced table for {row['name']} has no new_pipeline_spec: {sorted(st)}"
+        )
+        catalog, schema = row["synced_table_id"].split(".")[:2]
+        assert st["new_pipeline_spec"] == {
+            "storage_catalog": catalog,
+            "storage_schema": schema,
+        }, (
+            f"new_pipeline_spec for {row['name']} not derived from its synced_table_id "
+            f"({row['synced_table_id']}): got {st['new_pipeline_spec']}, "
+            f"expected storage_catalog={catalog}, storage_schema={schema}"
         )
 
 

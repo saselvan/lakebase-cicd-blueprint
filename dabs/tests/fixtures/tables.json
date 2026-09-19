@@ -24,6 +24,7 @@
     "primary_key_columns": ["npi"],
     "app_schema": "prov",
     "app_role": "providers_reader_ro",
-    "index_columns": []
+    "index_columns": [],
+    "scheduling_policy": "TRIGGERED"
   }
 ]
