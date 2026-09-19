@@ -770,3 +770,60 @@ def test_bundle_task_passes_branch_variable():
     assert params[params.index("--branch") + 1] == "${var.lakebase_branch}", (
         f"--branch is not the interpolated lakebase_branch var: {params}"
     )
+
+
+# --- Seam F: the entrypoint wrapper must NOT raise SystemExit on the success path -------------
+#
+# Finding #6 (surfaced by ticket 04's live run): the migration APPLIED correctly (schema/view/role/
+# grants verified present on the target branch) but the job RUN was marked INTERNAL_ERROR / FAILED
+# with `SystemExit: 0`. Root cause: a spark_python_task runs the entrypoint via
+# exec(compile(src, filename, "exec")), and the serverless runtime catches ANY raised SystemExit —
+# even code 0 — and reports it as a task FAILURE. So `if __name__ == "__main__": sys.exit(main())`
+# turns a fully successful migration into a failed job, which would fail the GitHub Actions pipeline.
+#
+# The fix: a small, TESTABLE wrapper (`_run_cli`) that calls main() and only raises SystemExit when
+# the return code is NON-ZERO; on rc == 0 it returns normally (no SystemExit), so the serverless
+# task is marked succeeded. A real failure (non-zero rc) still raises SystemExit — and an uncaught
+# exception under spark_python_task is a failure, which is the correct signal. We test the WRAPPER,
+# never the un-observable `if __name__ == "__main__"` line.
+
+
+def test_run_cli_success_does_not_raise_systemexit(monkeypatch):
+    """SUCCESS path: when main() returns 0, the CLI wrapper returns normally and does NOT raise
+    SystemExit — so the serverless spark_python_task (which reports ANY raised SystemExit, even
+    code 0, as a task FAILURE) is marked SUCCEEDED. This is finding #6.
+
+    MUTATION GATE — revert the wrapper to always `sys.exit(rc)` (raise even on rc == 0) and this
+    goes RED: sys.exit(0) raises SystemExit(0), so the `does not raise` assertion fails.
+    """
+    monkeypatch.setattr(mj, "main", lambda argv=None: 0)
+    # Must complete without raising SystemExit — assert by simply calling it inside the test body.
+    rc = mj._run_cli([])
+    assert rc == 0, f"wrapper did not return the success code; got {rc!r}"
+
+
+def test_run_cli_failure_raises_systemexit_with_code(monkeypatch):
+    """FAILURE path: when main() returns a NON-ZERO code, the wrapper raises SystemExit carrying
+    that exact code — a real failure still surfaces as a failure to the task runner.
+    """
+    monkeypatch.setattr(mj, "main", lambda argv=None: 3)
+    with pytest.raises(SystemExit) as exc:
+        mj._run_cli([])
+    assert exc.value.code == 3, f"wrapper did not propagate the non-zero code; got {exc.value.code!r}"
+
+
+def test_run_cli_threads_argv_into_main(monkeypatch):
+    """The wrapper passes its argv through to main() unchanged (so CLI/local use is preserved),
+    and still returns normally on the success code.
+    """
+    seen: dict[str, object] = {}
+
+    def fake_main(argv=None):
+        seen["argv"] = argv
+        return 0
+
+    monkeypatch.setattr(mj, "main", fake_main)
+    mj._run_cli(["--dry-run", "--config", "x.json"])
+    assert seen["argv"] == ["--dry-run", "--config", "x.json"], (
+        f"wrapper did not thread argv into main: {seen.get('argv')!r}"
+    )

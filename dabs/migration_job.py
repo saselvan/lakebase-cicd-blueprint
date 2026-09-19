@@ -478,5 +478,24 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def _run_cli(argv: list[str] | None = None) -> int:
+    """Entrypoint wrapper: run main() and raise SystemExit ONLY on a non-zero return code.
+
+    WHY (finding #6): a bundle spark_python_task runs this file via exec(compile(src, ..., "exec")),
+    and the serverless runtime catches ANY raised SystemExit — even code 0 — and reports the task
+    as a FAILURE. A plain `sys.exit(main())` therefore turns a fully successful migration
+    (schema/view/role/grants all applied) into a FAILED job run (`INTERNAL_ERROR / SystemExit: 0`),
+    which would fail the GitHub Actions pipeline (ticket 05). So on the SUCCESS path (rc == 0) we
+    return normally WITHOUT raising, and the task is marked succeeded. A real failure (non-zero rc)
+    still raises SystemExit(rc); and any uncaught exception under spark_python_task is itself a
+    failure — the correct signal. main()'s return-int contract and its argparse validation are
+    unchanged, so CLI/local `python migration_job.py` behaves as before.
+    """
+    rc = main(argv)
+    if rc != 0:
+        raise SystemExit(rc)
+    return rc
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    _run_cli()
