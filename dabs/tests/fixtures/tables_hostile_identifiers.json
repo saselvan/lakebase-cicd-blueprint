@@ -1,0 +1,11 @@
+[
+  {
+    "name": "members",
+    "synced_table_id": "my_catalog.cicd_proj.members",
+    "source_table_full_name": "my_catalog.cicd_proj.members_src",
+    "primary_key_columns": ["id"],
+    "app_schema": "cicd_proj",
+    "app_role": "members_app_ro",
+    "index_columns": ["member_id", "Plan-Code"]
+  }
+]

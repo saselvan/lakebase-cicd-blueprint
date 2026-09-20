@@ -166,6 +166,94 @@ def test_render_rejects_malformed_config(tmp_path):
         rd.render_ddl(rd.load_tables(bad))
 
 
+# --- 4b. fix D: reject UNSAFE identifiers (not just empty) at the shared seam -------------------
+#
+# Every identifier baked into DDL is interpolated straight into SQL, so a hyphenated / reserved /
+# oversized / uppercase value would break the SQL or be an injection vector. The seam accepts ONLY
+# safe unquoted Postgres identifiers (lowercase snake_case, <=63 chars) and rejects a curated set of
+# reserved words. These fixtures are the reviewer's mutations for fix D.
+
+HOSTILE_HYPHEN = "Plan-Code"          # hyphen — not a legal unquoted identifier / injection shape
+HOSTILE_RESERVED = "user"             # a reserved word that MATCHES the safe regex
+HOSTILE_RESERVED_2 = "table"          # a second reserved word
+HOSTILE_UPPER = "PlanCode"            # uppercase — violates the lowercase snake_case rule
+HOSTILE_TOOLONG = "a" * 64            # 64 chars — over the Postgres 63-char identifier limit
+
+HOSTILE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "tables_hostile_identifiers.json"
+
+
+@pytest.mark.parametrize(
+    "bad", [HOSTILE_HYPHEN, HOSTILE_RESERVED, HOSTILE_RESERVED_2, HOSTILE_UPPER, HOSTILE_TOOLONG]
+)
+def test_validate_identifier_rejects_unsafe(bad):
+    """validate_identifier rejects a hyphenated, reserved-word, uppercase, or over-63-char
+    identifier, and the error names the offending value + the kind. MUTATION GATE: loosen the seam
+    back to empty-only and every case here goes RED.
+    """
+    with pytest.raises(ValueError) as exc:
+        rd.validate_identifier(bad, "app_role")
+    msg = str(exc.value)
+    assert bad in msg, f"error must name the offending value {bad!r}: {msg}"
+    assert "app_role" in msg, f"error must name the kind: {msg}"
+
+
+def test_validate_identifier_accepts_snake_case():
+    """A normal lowercase snake_case identifier (incl. one at the 63-char boundary) passes."""
+    assert rd.validate_identifier("members_app_ro", "app_role") == "members_app_ro"
+    assert rd.validate_identifier("a" * 63, "app_role") == "a" * 63
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("app_role", HOSTILE_RESERVED),
+    ("app_schema", HOSTILE_HYPHEN),
+    ("app_schema", HOSTILE_UPPER),
+    ("app_role", HOSTILE_TOOLONG),
+])
+def test_render_rejects_hostile_scalar_identifier(field, bad, tmp_path):
+    """A hostile app_role / app_schema must fail rendering (identifier baked into the DDL)."""
+    rows = _fixture_rows()
+    rows[0][field] = bad
+    bad_file = tmp_path / "hostile.json"
+    bad_file.write_text(json.dumps(rows))
+    with pytest.raises(ValueError):
+        rd.render_ddl(rd.load_tables(bad_file))
+
+
+def test_render_rejects_hostile_index_column(tmp_path):
+    """A hostile index column (`Plan-Code`) must be rejected — EACH index column is baked into a
+    CREATE INDEX and must pass through the seam."""
+    rows = _fixture_rows()
+    rows[0]["index_columns"] = ["member_id", HOSTILE_HYPHEN]
+    bad_file = tmp_path / "hostile_idx.json"
+    bad_file.write_text(json.dumps(rows))
+    with pytest.raises(ValueError):
+        rd.render_ddl(rd.load_tables(bad_file))
+
+
+def test_render_rejects_hostile_pg_table_name(tmp_path):
+    """A hostile pg table name (last dotted part of synced_table_id) must be rejected."""
+    rows = _fixture_rows()
+    rows[0]["synced_table_id"] = "cat_a.shared_schema.Bad-Table"
+    bad_file = tmp_path / "hostile_tbl.json"
+    bad_file.write_text(json.dumps(rows))
+    with pytest.raises(ValueError):
+        rd.render_ddl(rd.load_tables(bad_file))
+
+
+def test_committed_hostile_fixture_is_rejected():
+    """The committed hostile fixture (a hyphenated `Plan-Code` index column) must be rejected by the
+    renderer — a durable hostile artifact for the fix D seam."""
+    with pytest.raises(ValueError):
+        rd.render_ddl(rd.load_tables(HOSTILE_FIXTURE))
+
+
+def test_valid_config_still_renders():
+    """The shipped valid config still renders full object DDL (the strict seam does not reject any
+    real lowercase snake_case identifier)."""
+    sql = rd.render_ddl(rd.load_tables(REPO_ROOT / "config" / "tables.json"))
+    assert "CREATE OR REPLACE VIEW" in sql and "CREATE INDEX IF NOT EXISTS" in sql
+
+
 # --- 5. the standalone CLI (`python -m dabs.render_ddl | psql`) --------------------------------
 
 def test_cli_prints_the_rendered_sql(tmp_path):

@@ -31,6 +31,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve().parent
 FIXTURE = HERE / "fixtures" / "tables.json"
 GEN_PATH = HERE.parent / "generate_changelogs.py"
@@ -288,6 +290,61 @@ def test_malformed_config_is_rejected(tmp_path):
     except (ValueError, TypeError):
         return
     raise AssertionError("generation accepted a row with an empty app_role")
+
+
+# --- 5b. fix D: the SHARED seam rejects UNSAFE identifiers in the Liquibase path too -----------
+#
+# validate_identifier is imported from dabs.render_ddl (ONE home), so tightening it there tightens
+# BOTH paths at once. These prove the Liquibase generator refuses to bake a hyphenated / reserved /
+# uppercase / over-63-char identifier into a changelog. Same reviewer mutations as the DABs suite.
+
+HOSTILE_HYPHEN = "Plan-Code"
+HOSTILE_RESERVED = "user"
+HOSTILE_UPPER = "PlanCode"
+HOSTILE_TOOLONG = "a" * 64
+
+
+@pytest.mark.parametrize("bad", [HOSTILE_HYPHEN, HOSTILE_RESERVED, HOSTILE_UPPER, HOSTILE_TOOLONG])
+def test_shared_seam_rejects_unsafe_identifier(bad):
+    """The generator's validate_identifier (imported from dabs.render_ddl) rejects unsafe values and
+    names the offending value + kind. MUTATION GATE: loosen the seam to empty-only => RED."""
+    with pytest.raises(ValueError) as exc:
+        gen.validate_identifier(bad, "app_role")
+    msg = str(exc.value)
+    assert bad in msg and "app_role" in msg, msg
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("app_role", HOSTILE_RESERVED),
+    ("app_schema", HOSTILE_HYPHEN),
+    ("name", HOSTILE_UPPER),
+    ("app_schema", HOSTILE_TOOLONG),
+])
+def test_generate_rejects_hostile_scalar_identifier(field, bad, tmp_path):
+    """A hostile app_role / app_schema / name must fail changelog generation."""
+    rows = _fixture_rows()
+    rows[0][field] = bad
+    bad_file = tmp_path / "hostile.json"
+    bad_file.write_text(json.dumps(rows))
+    with pytest.raises(ValueError):
+        gen.write_changelogs(gen.load_tables(bad_file), tmp_path / "out")
+
+
+def test_generate_rejects_hostile_index_column(tmp_path):
+    """A hostile index column (`Plan-Code`) must be rejected — EACH index column is baked into a
+    CREATE INDEX changeset and must pass through the shared seam."""
+    rows = _fixture_rows()
+    rows[0]["index_columns"] = ["member_id", HOSTILE_HYPHEN]
+    bad_file = tmp_path / "hostile_idx.json"
+    bad_file.write_text(json.dumps(rows))
+    with pytest.raises(ValueError):
+        gen.write_changelogs(gen.load_tables(bad_file), tmp_path / "out")
+
+
+def test_valid_config_still_generates(tmp_path):
+    """The shipped valid config still generates changelogs (strict seam rejects no real identifier)."""
+    written = gen.write_changelogs(gen.load_tables(REAL_CONFIG), tmp_path / "out")
+    assert written and all(p.read_text() for p in written)
 
 
 # --- 6. drift check: committed generated changelogs must match a fresh generation --------------
