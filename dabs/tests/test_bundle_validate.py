@@ -91,16 +91,16 @@ def _validate(bundle_dir: Path, host: str, target: str = "dev", strict: bool = T
 
 
 def _bundle_dir(tmp_path: Path) -> Path:
-    """Mirror the repo layout: bundle root at tmp_path/dabs, with alembic/ and config/ as siblings.
-    databricks.yml's `sync.paths` reference ../alembic and ../config (the shared migration + config
-    the job task reuses), and `bundle validate` stats those paths — so the temp bundle needs them.
+    """Mirror the repo layout: bundle root at tmp_path/dabs, with config/ as a sibling.
+    databricks.yml's `sync.paths` reference ../config (the single-source config the job task reads),
+    and `bundle validate` stats that path — so the temp bundle needs it.
     """
     bundle = tmp_path / "dabs"
     bundle.mkdir(parents=True, exist_ok=True)
     shutil.copy(REPO_ROOT / "dabs" / "databricks.yml", bundle / "databricks.yml")
     # The migration job task's python_file (./migration_job.py) must resolve for validate.
     shutil.copy(REPO_ROOT / "dabs" / "migration_job.py", bundle / "migration_job.py")
-    (tmp_path / "alembic").symlink_to(REPO_ROOT / "alembic")
+    shutil.copy(REPO_ROOT / "dabs" / "render_ddl.py", bundle / "render_ddl.py")
     (tmp_path / "config").symlink_to(REPO_ROOT / "config")
     return bundle
 

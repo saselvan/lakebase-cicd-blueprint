@@ -14,7 +14,7 @@ It is a JSON array; add one object per synced table you want the pipeline to man
 | `primary_key_columns` | Array of PK column names for the synced table. |
 | `app_schema` | Postgres/UC schema the table lands in (Liquibase `${app_schema}`). |
 | `app_role` | Read-only app role granted access (Liquibase `${app_role}`). |
-| `index_columns` | Columns to index after load. BOTH paths carry all of them, 0/1/N — no cap. The Liquibase path generates one `003-index-<col>` changeset per column (`liquibase/generate_changelogs.py`); the DABs/Alembic path emits one `_index_statements` line per column. |
+| `index_columns` | Columns to index after load. BOTH paths carry all of them, 0/1/N — no cap. The Liquibase path generates one `003-index-<col>` changeset per column (`liquibase/generate_changelogs.py`); the DABs renderer emits one `index_statements` line per column (`dabs/render_ddl.py`). Both call the same helper. |
 
 **Indexes are the one inherently table-specific spot.** Each column in `index_columns` becomes its
 own `CREATE INDEX IF NOT EXISTS` changeset (0, 1, or N — no two-column cap). A table that needs a

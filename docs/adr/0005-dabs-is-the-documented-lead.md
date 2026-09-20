@@ -12,13 +12,14 @@ matched the first adopter). Databricks Asset Bundles (DABs) now support Lakebase
 Add a **DABs-native variant in `dabs/`** and make it the **documented lead** — the recommended path a
 Databricks-first team should start from. Terraform + Liquibase is retained as a co-equal directory and
 re-framed as the **portable / tool-agnostic alternative** for teams already standardized on that stack
-or spanning multiple clouds. All three paths (`dabs/`, `terraform/`, `alembic/`) stay co-equal on disk;
-the README/DESIGN-NOTES ordering is what changes.
+or spanning multiple clouds. Both paths (`dabs/`, `terraform/`) stay co-equal on disk; the
+README/DESIGN-NOTES ordering is what changes.
 
 ## Consequences
 - README now opens with the DABs quickstart; Terraform becomes "prefer this if you're multi-cloud or
   already on Terraform."
-- The DABs path pairs with Alembic for migrations (ADR 0006); the Terraform path keeps Liquibase.
+- The DABs path renders migrations with a stdlib-only Python renderer (ADR 0006); the Terraform path
+  keeps Liquibase. Both engines share one set of SQL-building helpers.
 - Lakebase DAB support is **Beta** — pin **Databricks CLI ≥ 1.5.0** (earlier bundle-plan bug dropped
   `role_id` and recreated roles). Called out in the DABs README section.
 - One state owner per object: never manage the same Lakebase resource from both Terraform and DABs.

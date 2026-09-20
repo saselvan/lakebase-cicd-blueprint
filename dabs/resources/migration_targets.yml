@@ -4,8 +4,8 @@ variables:
   migration_targets:
     type: complex
     description: Per-table migration metadata (target schema + index columns) generated
-      from config/tables.json and consumed by the Alembic migration job. Index columns
-      have no native postgres_synced_tables field, so they are carried here.
+      from config/tables.json and consumed by the migration job. Index columns have
+      no native postgres_synced_tables field, so they are carried here.
     default:
     - name: members
       app_schema: cicd_proj

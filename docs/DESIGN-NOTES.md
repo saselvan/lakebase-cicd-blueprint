@@ -194,16 +194,28 @@ generator emits one `003-index-<col>` changeset per `index_columns` entry (0/1/N
 needing a different index shape edits its generated changelog. Everything else is data in
 `config/tables.json`.
 
-## Alembic parity (Python teams)
+## The DABs renderer (Python teams)
 
-An `alembic/` variant mirrors the Liquibase changesets from the same `config/tables.json`, so Python
-shops can adopt the pattern in their own tool. Because Alembic tracks a revision as applied-once, the
-`runAlways`-equivalent is achieved differently: the migration emits **idempotent** SQL (a `pg_roles`
-guard around `CREATE ROLE`, `CREATE INDEX IF NOT EXISTS`, `CREATE OR REPLACE VIEW`, and `GRANT`) that a
-deploy renders offline (`alembic upgrade head --sql`) and applies **on every deploy** — it is
-**not gated** by Alembic's version table. That is what lets access self-heal after a synced-table
-replace, exactly like Liquibase `runAlways:true`. Object names come from the same config; index
-columns are the one table-specific spot, as with the Liquibase path.
+The DABs path emits its migration SQL from a small Python renderer (`dabs/render_ddl.py`) that reads
+the same `config/tables.json`, so Python shops can adopt the pattern with no Java/Liquibase runtime.
+It is **not** a migration framework and keeps **no version table**: it emits **idempotent** SQL (a
+`pg_roles` guard around `CREATE ROLE`, `GRANT`, `CREATE INDEX IF NOT EXISTS`, `CREATE OR REPLACE
+VIEW`) that the Workflow job applies **on every deploy**, and that `python -m dabs.render_ddl | psql`
+applies outside the job. Because there is no version-tracking state, re-applying is a clean
+reconciling no-op — never a duplicate-key rollback on a second apply. That is what lets access
+self-heal after a synced-table replace, exactly like Liquibase `runAlways:true`.
+
+The renderer is the **single source of the idempotent SQL**: the Liquibase generator
+(`liquibase/generate_changelogs.py`) imports the same four helpers (`role_guard_sql`,
+`grant_statements`, `index_statements`, `view_statements`) and the same `validate_identifier`, then
+wraps their statements in per-table changesets. So both engines emit the same object DDL from one
+definition. Object names come from the config; index columns are the one table-specific spot, as
+with the Liquibase path.
+
+(Why no Alembic: an earlier variant rendered from Alembic. `alembic upgrade head --sql` prepends an
+unguarded `alembic_version` create + `INSERT`, and once a second revision existed the reconcile
+tripped a duplicate-key on `alembic_version` on the second apply and rolled the whole transaction
+back — the object DDL never reconciled. Removing the framework removes that class of bug.)
 
 ## Key decisions at a glance
 

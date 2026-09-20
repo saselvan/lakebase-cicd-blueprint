@@ -18,18 +18,18 @@ include:
 # STATIC resource (not table-driven), so it lives inline here rather than under resources/*.yml —
 # which is 100% codegen-owned and drift-checked; a hand-written file there would trip the guard.
 #
-# The task runs dabs/migration_job.py on SERVERLESS Python compute (no Java, so Alembic not
-# Liquibase — ADR 0006/D1). At run time it: reads config/tables.json, BLOCKS until every synced
-# table reports ONLINE (ADR 0003), then applies the SHARED alembic/ migration via a RUNTIME OAuth
-# token minted inside the workspace (no stored secret). It loops config/tables.json at run time —
-# exactly like the migration — so adding a table needs no job edit.
+# The task runs dabs/migration_job.py on SERVERLESS Python compute (no Java runtime to install —
+# ADR 0006/D1). At run time it: reads config/tables.json, BLOCKS until every synced table reports
+# ONLINE (ADR 0003), then renders the idempotent reconciling DDL via the shared Python renderer
+# (dabs/render_ddl.py) and applies it via a RUNTIME OAuth token minted inside the workspace (no
+# stored secret). It loops config/tables.json at run time, so adding a table needs no job edit.
 #
-# config/ and alembic/ live at the repo root (above this bundle root), so sync.paths pulls them
-# into the deployment alongside dabs/ (the task shells out to `alembic upgrade head --sql`).
+# config/ lives at the repo root (above this bundle root), so sync.paths pulls it into the
+# deployment alongside dabs/. The renderer (dabs/render_ddl.py) syncs as part of dabs/ — there is
+# no separate migration engine directory to sync.
 sync:
   paths:
     - .
-    - ../alembic
     - ../config
 
 resources:
@@ -37,21 +37,19 @@ resources:
     lakebase_migration:
       name: "lakebase-cicd migration (${bundle.target})"
       tasks:
-        - task_key: alembic_migrate
+        - task_key: migrate
           spark_python_task:
             # Relative to the synced bundle root; migration_job.py syncs from dabs/, i.e. the
-            # entrypoint lands at ${workspace.file_path}/dabs/migration_job.py.
+            # entrypoint lands at ${workspace.file_path}/dabs/migration_job.py (render_ddl.py beside it).
             python_file: ./migration_job.py
             # The task runs via exec(compile(...)) where __file__ is UNDEFINED, so the entrypoint
-            # can't locate config/ or alembic/ off __file__. We pass their DEPLOYED locations
-            # explicitly via bundle interpolation: sync.paths puts config/ and alembic/ at the
-            # files root (siblings of dabs/), so ${workspace.file_path}/{config,alembic} is where
-            # they land. Interpolated at deploy time — credential-free, no literal path committed.
+            # can't locate config/ off __file__. We pass its DEPLOYED location explicitly via bundle
+            # interpolation: sync.paths puts config/ at the files root (sibling of dabs/), so
+            # ${workspace.file_path}/config is where it lands. Interpolated at deploy time —
+            # credential-free, no literal path committed.
             parameters:
               - "--config"
               - "${workspace.file_path}/config/tables.json"
-              - "--alembic-dir"
-              - "${workspace.file_path}/alembic"
               - "--instance"
               - "${var.lakebase_instance}"
               # The migration connects to the TARGET BRANCH's compute-endpoint host, NOT the
@@ -64,8 +62,9 @@ resources:
         - environment_key: migration
           spec:
             client: "2"
+            # The renderer is stdlib-only (no Alembic, no SQL toolkit). The only runtime deps are
+            # the Postgres driver for the apply and the SDK for the OAuth token + branch endpoint.
             dependencies:
-              - alembic>=1.13
               - psycopg[binary]>=3.1
               - databricks-sdk>=0.133
       queue:

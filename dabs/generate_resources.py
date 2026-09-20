@@ -28,7 +28,7 @@ Schema mapping (field names verified against `databricks bundle schema`, CLI v1.
 
 Both `postgres_synced_tables` and `postgres_roles` declare `additionalProperties: false` in the
 bundle schema, so there is NO native resource field for a synced table's index columns or its
-target schema. Those are consumed by the Alembic migration job (which applies the indexes and the
+target schema. Those are consumed by the migration job (which renders + applies the indexes and the
 consumer view), so they are carried as a bundle `variables` complex default (`migration_targets`)
 — a bundle-legal location that `databricks bundle validate` accepts and the job task can read.
 This keeps index columns "carried through" in full (no fixed-count truncation) without inventing
@@ -149,7 +149,7 @@ def build_role_resource(table: dict) -> dict[str, Any]:
 
 
 def build_migration_target(table: dict) -> dict[str, Any]:
-    """Per-table migration metadata the Alembic job consumes (schema + full index column list)."""
+    """Per-table migration metadata the migration job consumes (schema + full index column list)."""
     return {
         "name": table["name"],
         "app_schema": table["app_schema"],
@@ -187,7 +187,7 @@ def build_bundle_fragments(tables: list[dict]) -> dict[str, dict]:
                 "type": "complex",
                 "description": (
                     "Per-table migration metadata (target schema + index columns) generated from "
-                    "config/tables.json and consumed by the Alembic migration job. Index columns "
+                    "config/tables.json and consumed by the migration job. Index columns "
                     "have no native postgres_synced_tables field, so they are carried here."
                 ),
                 "default": targets,

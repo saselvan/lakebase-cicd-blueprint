@@ -52,13 +52,16 @@ codegen after a config edit is a clean diff. Do not hand-edit them.
 
 ### How migrations run
 
-The migration is a bundle-managed Databricks Workflow job. It runs on serverless Python compute
-using Alembic. Python is native to job compute, so there is no Java or Liquibase runtime to install.
+The migration is a bundle-managed Databricks Workflow job. It runs on serverless Python compute. A
+small renderer (`dabs/render_ddl.py`) turns `config/tables.json` into idempotent SQL. The renderer
+is stdlib-only, so there is no Java, no Liquibase, and no migration framework to install in the job.
 
 At run time the job reads `config/tables.json`, waits for every synced table to reach `ONLINE`,
 then applies the database objects in order: the read-only role, explicit grants, indexes, and the
-consumer view. The steps are idempotent. If a synced table is replaced, the job reapplies them on
-the next run. This is reconciliation, not one-time setup.
+consumer view. Every statement is idempotent (a `pg_roles`-guarded `CREATE ROLE`, `GRANT`,
+`CREATE INDEX IF NOT EXISTS`, `CREATE OR REPLACE VIEW`), and there is no migration version table. If
+a synced table is replaced, the job reapplies the objects on the next run. This is reconciliation,
+not one-time setup — re-running is a clean no-op, never a version-bookkeeping conflict.
 
 ### Beta status and CLI pin
 
@@ -208,31 +211,32 @@ CI auth guidance, and `docs/DESIGN-NOTES.md` for the design reasoning.
 
 ---
 
-## Migration engines: Alembic and Liquibase
+## Migration engines: a Python renderer and Liquibase
 
-The two paths use different migration tools, but produce the same database objects from the same
-`config/tables.json`.
+The two paths use different tools to emit the migration SQL, but produce the same database objects
+from the same `config/tables.json`. In fact both call the SAME four SQL-building helpers, which live
+in one place (`dabs/render_ddl.py`) — "config in, idempotent SQL out" is structurally identical for
+both.
 
-- The DABs path uses Alembic (Python) inside the Workflow job. Python runs on serverless job
-  compute with no extra runtime.
-- The Terraform path uses Liquibase.
+- The DABs path uses a small Python renderer (`dabs/render_ddl.py`) inside the Workflow job. It is
+  stdlib-only, so it runs on serverless job compute with no extra runtime.
+- The Terraform path uses Liquibase. Its generator (`liquibase/generate_changelogs.py`) imports the
+  same helpers and wraps their statements in per-table changesets.
 
-The Alembic migration and the Liquibase changelog line up one to one:
+The renderer's output and the Liquibase changelog line up one to one:
 
-| Liquibase changeset (generated per table) | Alembic equivalent |
+| Liquibase changeset (generated per table) | Renderer equivalent (`dabs/render_ddl.py`) |
 |---|---|
-| `001-app-role` | `_role_guard_sql` — idempotent `CREATE ROLE` via a `pg_roles` existence guard |
-| `002-app-grants` | `_grant_statements` — `GRANT USAGE` on schema + `GRANT SELECT` on the synced table |
-| `003-indexes` (generated as one `003-index-<col>` changeset per `index_columns` entry) | `_index_statements` — `CREATE INDEX IF NOT EXISTS` per `index_columns` (handles 0/1/N) |
-| `004-app-view` | `_view_statements` — `CREATE OR REPLACE VIEW` + `GRANT SELECT` on the view |
+| `001-app-role` | `role_guard_sql` — idempotent `CREATE ROLE` via a `pg_roles` existence guard |
+| `002-app-grants` | `grant_statements` — `GRANT USAGE` on schema + `GRANT SELECT` on the synced table |
+| `003-indexes` (generated as one `003-index-<col>` changeset per `index_columns` entry) | `index_statements` — `CREATE INDEX IF NOT EXISTS` per `index_columns` (handles 0/1/N) |
+| `004-app-view` | `view_statements` — `CREATE OR REPLACE VIEW` + `GRANT SELECT` on the view |
 
-Both stay idempotent. To run the Alembic path outside the job, render the SQL offline and pipe it
-to psql on each deploy:
+Both stay idempotent. To run the DABs path's SQL outside the job, render it and pipe it to psql on
+each deploy (this is the same SQL the Workflow job applies):
 
 ```bash
-cd alembic
-pip install alembic
-LAKEBASE_TABLES_CONFIG=../config/tables.json alembic upgrade head --sql
+python -m dabs.render_ddl --config config/tables.json | psql "$LAKEBASE_CONNINFO"
 ```
 
 How each path stays idempotent (the reapply-on-every-deploy behavior) is explained in
@@ -266,11 +270,10 @@ v1.132.0, Terraform v1.16.2, Liquibase 4.33.0):
 
 ```
 config/tables.json  single source of truth: the tables to manage (read by DABs codegen, Terraform, and deploy.sh)
-dabs/               DABs variant (the recommended lead): databricks.yml, generate_resources.py (codegen), migration_job.py (Alembic job)
+dabs/               DABs variant (the recommended lead): databricks.yml, generate_resources.py (codegen), migration_job.py (Workflow job), render_ddl.py (the shared DDL renderer)
 dabs/resources/     generated bundle resources (one synced table + role per config entry) — do not hand-edit
 terraform/          databricks_postgres_synced_table (for_each over config/tables.json)
-liquibase/          changelog: 001 app role, 002 explicit grants, 003 indexes, 004 consumer view
-alembic/            Alembic migration (the DABs path's engine; also runnable offline)
+liquibase/          per-table generated changelogs: 001 app role, 002 explicit grants, 003 indexes, 004 consumer view (from the shared renderer helpers)
 scripts/            seed_source.sh, wait_for_sync.sh, deploy.sh, branch_test.sh
 .github/workflows/  ci.yml (no-cloud checks incl. offline bundle validate), deploy.yml, pr-validate.yml, pr-cleanup.yml (reference-only; see RUNBOOK CI auth)
 docs/               DESIGN-NOTES.md (design reasoning), TROUBLESHOOTING.md, pipeline + access-model diagrams

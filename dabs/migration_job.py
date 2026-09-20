@@ -1,4 +1,4 @@
-"""Migration Workflow-job task: wait-for-ONLINE gate + reuse of the shared Alembic migration.
+"""Migration Workflow-job task: wait-for-ONLINE gate + the shared Python DDL renderer.
 
 This is the entrypoint the bundle-declared Databricks Workflow job runs (see the `jobs` resource
 in dabs/databricks.yml). On a run it:
@@ -6,24 +6,26 @@ in dabs/databricks.yml). On a run it:
   1. reads the table list from the single source of truth (config/tables.json, ADR 0004),
   2. BLOCKS until every synced table reports ONLINE (the wait-for-ONLINE gate, ADR 0003) — so
      grants/indexes/view never run against a not-yet-loaded table,
-  3. renders the EXISTING alembic/ migration to idempotent DDL (`alembic upgrade head --sql`) —
-     reused, never copied — then makes that SQL fully RE-RUNNABLE (see make_rerunnable), and
+  3. renders the idempotent reconciling DDL via the shared renderer (`dabs/render_ddl.py`) — the
+     SAME "config in, idempotent SQL out" the Liquibase generator uses — and
   4. applies it to Lakebase using a RUNTIME OAuth token minted inside the workspace (no stored
      secret; consistent with the repo's no-secret posture).
 
-Re-running is a reconciling no-op: the shared migration emits guarded CREATE ROLE, CREATE INDEX
-IF NOT EXISTS, and CREATE OR REPLACE VIEW (ADR 0002) — AND make_rerunnable guards the alembic
-version bookkeeping alembic prepends (CREATE TABLE alembic_version / the version INSERT), which is
-otherwise unguarded and would error on a 2nd apply and roll the whole transaction back. So a
-synced-table replace self-heals: every run re-applies the object DDL.
+Re-running is a reconciling no-op: the renderer emits a pg_roles-guarded CREATE ROLE, idempotent
+GRANT, CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE VIEW (ADR 0002). There is NO Alembic and
+NO `alembic_version` table — so there is no version bookkeeping to collide with, and nothing to
+roll back on a 2nd apply. A synced-table replace therefore self-heals: every run re-applies the
+object DDL cleanly. (An earlier Alembic-rendered variant rolled back on the 2nd apply once a second
+revision existed, because its version-table INSERT tripped a duplicate-key on `alembic_version`;
+the renderer removes that class of bug entirely.)
 
 Design constraints that keep this OFFLINE-UNIT-TESTABLE (the live apply runs against a real
 Lakebase branch):
   * The gate (`wait_for_online`) is a pure function over an injected `get_status` callable and an
     injected `sleep` — tests mock both; nothing touches a real workspace.
+  * The render is a pure, stdlib-only function (no database, no external tools).
   * The Databricks SDK and psycopg are imported LAZILY inside the apply/status-source helpers, so
-    the unit tests (gate, single-implementation, idempotency-render) import this module without
-    those packages installed.
+    the unit tests (gate, render, conninfo) import this module without those packages installed.
 """
 
 from __future__ import annotations
@@ -31,8 +33,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -44,7 +44,7 @@ ONLINE = "ONLINE"
 _TERMINAL_FAILURES = ("FAILED", "ERROR")
 
 
-# --- Single-source-of-truth locators (shared with Terraform + the Alembic migration) --------
+# --- Single-source-of-truth locators (shared with Terraform + the DDL renderer) --------------
 
 def _entrypoint_file() -> Path:
     """Locate THIS entrypoint file WITHOUT depending on ``__file__``.
@@ -76,23 +76,17 @@ def repo_root() -> Path:
     Derived via ``_entrypoint_file()`` so it never depends on ``__file__`` (the deployed bundle
     runs the task under ``exec`` where ``__file__`` is undefined). In BOTH the local checkout and
     the deployed bundle tree the entrypoint lives at ``<root>/dabs/migration_job.py`` with
-    ``config/`` and ``alembic/`` as siblings of ``dabs/`` (verified against the deploy's sync
-    manifest: files land under ``${workspace.file_path}/{dabs,config,alembic}``), so
-    parent-of-dabs is the correct root in both. The live path ALSO passes ``--config`` and
-    ``--alembic-dir`` explicitly (see ``main`` / ``databricks.yml``), so this is a robust
-    fallback, not the sole locator.
+    ``config/`` as a sibling of ``dabs/`` (verified against the deploy's sync manifest: files land
+    under ``${workspace.file_path}/{dabs,config}``), so parent-of-dabs is the correct root in both.
+    The live path ALSO passes ``--config`` explicitly (see ``main`` / ``databricks.yml``), so this
+    is a robust fallback, not the sole locator.
     """
     return _entrypoint_file().resolve().parent.parent
 
 
-def shared_alembic_dir() -> Path:
-    """The ONE alembic/ migration directory. The task reuses it; it is never copied/forked."""
-    return repo_root() / "alembic"
-
-
 def tables_config_path(config_path: str | Path | None = None) -> Path:
-    """Path to config/tables.json: explicit arg, else LAKEBASE_TABLES_CONFIG (same env var the
-    Alembic env.py reads), else the repo default — one source of truth for both."""
+    """Path to config/tables.json: explicit arg, else LAKEBASE_TABLES_CONFIG (the same env var the
+    standalone renderer honors), else the repo default — one source of truth for all."""
     if config_path:
         return Path(config_path)
     override = os.environ.get("LAKEBASE_TABLES_CONFIG")
@@ -169,95 +163,44 @@ def run_migration_task(
     return apply_migration()
 
 
-# --- Seam C: reuse of the shared Alembic migration (rendered offline, applied at runtime) ---
+# --- Seam C: the shared Python DDL renderer (pure; applied at runtime) ----------------------
 
-# The alembic_version bookkeeping alembic emits offline. The object DDL (role guard / CREATE INDEX
-# IF NOT EXISTS / CREATE OR REPLACE VIEW) is ALREADY idempotent; only these two bookkeeping
-# statements are unguarded, so only these two are rewritten by make_rerunnable().
-_CREATE_VERSION_TABLE = re.compile(
-    r"CREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS)(alembic_version\b)", re.IGNORECASE
-)
-_INSERT_VERSION_ROW = re.compile(r"INSERT\s+INTO\s+alembic_version\b[^;]*;", re.IGNORECASE)
-_HAS_ON_CONFLICT = re.compile(r"ON\s+CONFLICT", re.IGNORECASE)
-_RETURNING = re.compile(r"(\s+)(RETURNING\b)", re.IGNORECASE)
+def _load_render_ddl():
+    """Import the shared renderer module (``dabs/render_ddl.py``), robustly.
 
-
-def make_rerunnable(sql: str) -> str:
-    """Rewrite alembic's UNGUARDED version bookkeeping so the rendered SQL is fully RE-RUNNABLE,
-    while leaving the reconciling object DDL byte-for-byte untouched.
-
-    Why this is required. `alembic upgrade head --sql` (offline, from base) always prepends its
-    bookkeeping and wraps EVERYTHING in one transaction:
-
-        BEGIN;
-        CREATE TABLE alembic_version (...);                       -- no IF NOT EXISTS
-        ... role guard / CREATE INDEX IF NOT EXISTS / CREATE OR REPLACE VIEW (idempotent) ...
-        INSERT INTO alembic_version (version_num) VALUES ('...')  -- no conflict guard
-            RETURNING alembic_version.version_num;
-        COMMIT;
-
-    apply_sql_to_lakebase() executes that blob in one shot. On a SECOND run the unguarded
-    `CREATE TABLE alembic_version` raises DuplicateTable, the BEGIN;…COMMIT; ROLLS BACK, and the
-    reconciling object DDL never re-applies. This job's whole purpose is to RECONCILE object DDL on
-    every run (e.g. after a synced-table replace, ADR 0002/0003), so alembic's run-once version
-    gating must not error on re-run and must not block the object DDL from re-applying.
-
-    Two surgical rewrites, confined to the alembic_version bookkeeping:
-      1. `CREATE TABLE alembic_version`  -> `CREATE TABLE IF NOT EXISTS alembic_version`
-         (no DuplicateTable on the 2nd apply; the negative lookahead makes it a fixpoint).
-      2. the `INSERT INTO alembic_version ...` statement gets `ON CONFLICT DO NOTHING`
-         (no PK unique-violation on the 2nd apply). The guard is injected BEFORE any RETURNING
-         clause (alembic emits one), because `ON CONFLICT` must precede `RETURNING` in Postgres.
-
-    With both guards the whole transaction is a clean no-op on re-run: IF NOT EXISTS create,
-    role guard, GRANT (no-op when held), CREATE INDEX IF NOT EXISTS, CREATE OR REPLACE VIEW, and a
-    conflict-safe version INSERT. Object DDL therefore reconciles on EVERY run. The function is
-    idempotent (safe to apply to already-guarded SQL).
+    Normal import works locally, under pytest, and via ``python migration_job.py``. On the
+    serverless ``spark_python_task`` the entrypoint is run via ``exec(compile(...))`` where
+    ``__file__`` is unbound and the repo root may not be on ``sys.path`` — so we fall back to
+    loading the module BY PATH, derived from ``repo_root()`` (which does not depend on ``__file__``).
+    ``render_ddl`` is stdlib-only, so importing it needs nothing beyond the standard library.
     """
-    sql = _CREATE_VERSION_TABLE.sub(r"CREATE TABLE IF NOT EXISTS \1", sql)
+    try:
+        from dabs import render_ddl  # normal import when the package is importable
+        return render_ddl
+    except Exception:
+        import importlib.util
 
-    def _guard_insert(match: re.Match) -> str:
-        stmt = match.group(0)
-        if _HAS_ON_CONFLICT.search(stmt):
-            return stmt  # already conflict-safe — fixpoint
-        if _RETURNING.search(stmt):
-            return _RETURNING.sub(r" ON CONFLICT DO NOTHING\1\2", stmt, count=1)
-        return re.sub(r";\s*$", " ON CONFLICT DO NOTHING;", stmt, count=1)
-
-    return _INSERT_VERSION_ROW.sub(_guard_insert, sql)
+        path = repo_root() / "dabs" / "render_ddl.py"
+        spec = importlib.util.spec_from_file_location("dabs_render_ddl", path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+        return module
 
 
-def render_migration_sql(
-    *,
-    alembic_dir: str | Path | None = None,
-    config_path: str | Path | None = None,
-) -> str:
-    """Render the SHARED alembic migration to RE-RUNNABLE DDL, ready to apply twice safely.
+def render_migration_sql(*, config_path: str | Path | None = None) -> str:
+    """Render the idempotent reconciling DDL for the configured tables via the shared renderer.
 
-    Reuses the repo's alembic/ (no copy): shells out to `python -m alembic` in that directory, with
-    LAKEBASE_TABLES_CONFIG pointed at the same tables config. The object DDL alembic emits is
-    already idempotent (IF NOT EXISTS / OR REPLACE / role guard), but alembic ALSO prepends
-    unguarded version bookkeeping that would error on a 2nd apply — so the raw render is passed
-    through make_rerunnable() before returning. The result (what --dry-run prints AND what
-    apply_sql_to_lakebase executes) is a safe reconciling no-op on re-run. Returns the SQL.
+    Delegates to ``dabs/render_ddl.py`` — the SAME "config in, idempotent SQL out" the Liquibase
+    generator consumes. The result (what ``--dry-run`` prints AND what ``apply_sql_to_lakebase``
+    executes) is a pg_roles-guarded CREATE ROLE + idempotent GRANT + CREATE INDEX IF NOT EXISTS +
+    CREATE OR REPLACE VIEW, per table. There is NO Alembic and NO ``alembic_version`` table, so
+    applying this SQL a second time — e.g. after a synced-table replace — is a clean reconciling
+    no-op, never a version-bookkeeping rollback. Returns the SQL.
     """
-    adir = Path(alembic_dir) if alembic_dir else shared_alembic_dir()
-    ini = adir / "alembic.ini"
-    env = dict(os.environ)
-    if config_path:
-        env["LAKEBASE_TABLES_CONFIG"] = str(config_path)
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "-c", str(ini), "upgrade", "head", "--sql"],
-        cwd=str(adir),
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"shared alembic render failed (exit {result.returncode}) in {adir}:\n{result.stderr}"
-        )
-    return make_rerunnable(result.stdout)
+    render = _load_render_ddl()
+    path = config_path if config_path else tables_config_path()
+    return render.render_ddl(render.load_tables(path))
 
 
 # --- Runtime OAuth + apply (live path against a real Lakebase branch; SDK/psycopg imported lazily) --
@@ -394,9 +337,10 @@ def apply_sql_to_lakebase(sql: str, *, instance_name: str, branch: str) -> None:
     endpoint host so the migration lands on that branch, not the instance default endpoint (the
     production branch); see _lakebase_conninfo for why. A missing/empty branch raises there.
 
-    `sql` is the output of render_migration_sql, which is already RE-RUNNABLE (make_rerunnable has
-    guarded the version bookkeeping), so executing this blob a second time — e.g. after a
-    synced-table replace — is a clean reconciling no-op rather than a DuplicateTable rollback.
+    `sql` is the output of render_migration_sql (the shared Python renderer), which is RE-RUNNABLE
+    by construction (guarded CREATE ROLE / idempotent GRANT / CREATE INDEX IF NOT EXISTS / CREATE
+    OR REPLACE VIEW, and no version-tracking table), so executing this blob a second time — e.g.
+    after a synced-table replace — is a clean reconciling no-op.
 
     Live path — exercised by the live apply against a real Lakebase branch, not by offline unit
     tests. psycopg is
@@ -410,7 +354,7 @@ def apply_sql_to_lakebase(sql: str, *, instance_name: str, branch: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Job-task entrypoint: read tables -> wait for ONLINE -> render shared migration -> apply.
+    """Job-task entrypoint: read tables -> wait for ONLINE -> render idempotent DDL -> apply.
 
     The Lakebase instance name comes from --instance or LAKEBASE_INSTANCE_NAME (a job parameter set
     by the deploy, not a committed value). --dry-run stops after the render (no connection), which
@@ -423,13 +367,6 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to config/tables.json. The deploy passes the DEPLOYED location "
         "(${workspace.file_path}/config/tables.json) so runtime config resolution is explicit "
         "and never depends on __file__. Default: LAKEBASE_TABLES_CONFIG env / repo default.",
-    )
-    parser.add_argument(
-        "--alembic-dir",
-        default=None,
-        help="Path to the shared alembic/ dir. The deploy passes the DEPLOYED location "
-        "(${workspace.file_path}/alembic) so the render never depends on __file__. "
-        "Default: repo-relative shared alembic/.",
     )
     parser.add_argument(
         "--instance",
@@ -454,10 +391,10 @@ def main(argv: list[str] | None = None) -> int:
     table_ids = synced_table_ids(tables)
     print(f"migration job: {len(table_ids)} synced table(s) to gate on ONLINE: {table_ids}")
 
-    sql = render_migration_sql(alembic_dir=args.alembic_dir, config_path=args.config)
+    sql = render_migration_sql(config_path=args.config)
 
     if args.dry_run:
-        print("dry-run: rendered shared alembic migration; skipping wait-gate + apply.")
+        print("dry-run: rendered idempotent reconciling DDL; skipping wait-gate + apply.")
         print(sql)
         return 0
 

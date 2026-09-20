@@ -58,16 +58,6 @@ jobs:
               validate
           done
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Alembic offline SQL — falsifiability tests (no database)
-        run: |
-          pip install "alembic==1.20.0" "pytest==9.1.1"
-          pytest alembic/tests -q
-
   secret-scan:
     runs-on: ubuntu-latest
     steps:

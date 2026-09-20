@@ -38,16 +38,16 @@ MOCK_PID=""
 cleanup() { [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true; rm -rf "$WORK" "$MOCK_LOG"; }
 trap cleanup EXIT
 
-# Mirror the repo layout in the temp tree: the bundle root is $WORK/dabs, with alembic/ and config/
-# as siblings, because databricks.yml's `sync.paths` references ../alembic and ../config (the shared
-# migration + single-source config the job task reuses) and `bundle validate` stats those paths.
+# Mirror the repo layout in the temp tree: the bundle root is $WORK/dabs, with config/ as a
+# sibling, because databricks.yml's `sync.paths` references ../config (the single-source config the
+# job task reads) and `bundle validate` stats that path.
 BUNDLE="$WORK/dabs"
 mkdir -p "$BUNDLE"
 cp "$REPO_ROOT/dabs/databricks.yml" "$BUNDLE/databricks.yml"
 # The migration Workflow job's task points at ./migration_job.py (relative to the bundle root),
-# so validate resolves the local file — copy the entrypoint into the isolated bundle too.
+# so validate resolves the local file — copy the entrypoint (and the renderer beside it) too.
 cp "$REPO_ROOT/dabs/migration_job.py" "$BUNDLE/migration_job.py"
-ln -s "$REPO_ROOT/alembic" "$WORK/alembic"
+cp "$REPO_ROOT/dabs/render_ddl.py" "$BUNDLE/render_ddl.py"
 ln -s "$REPO_ROOT/config" "$WORK/config"
 
 # --- 0) Drift check: the COMMITTED dabs/resources/*.yml must byte-match a fresh generation. ----

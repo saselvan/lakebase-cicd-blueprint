@@ -16,7 +16,7 @@ CONTEXT.md
 # Local planning (specs/tickets) — not shared
 .scratch/
 
-# Python (Alembic variant dev venv + caches)
+# Python (dev venv + caches)
 .venv*
 __pycache__/
 *.pyc
