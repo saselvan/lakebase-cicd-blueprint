@@ -406,6 +406,57 @@ def test_render_rejects_hostile_view_name_override(tmp_path):
         rd.render_ddl(rd.load_tables(cfg))
 
 
+# --- 4e. cross-entry uniqueness: two entries must not resolve to the SAME consumer view ---------
+#
+# resolve_view_name validates ONE name's shape/length, but nothing stops two config entries from
+# resolving to the SAME (app_schema, view_name) — one derives <tbl>_v, another sets view_name to
+# that same value over a DIFFERENT base table. Both would emit CREATE OR REPLACE VIEW
+# <schema>.<name>, and the last one applied silently clobbers the other (last-write-wins). A shared
+# seam, validate_view_names_unique(tables), fails loud at generation time; both generators call it.
+
+def _dup_view_rows() -> list[dict]:
+    """Two entries in one schema colliding on the consumer view name: `alpha` DERIVES `members_v`;
+    `beta` sets view_name to that same `members_v` over a DIFFERENT base table."""
+    return [
+        {"name": "alpha", "synced_table_id": "cat_a.shared_schema.members",
+         "source_table_full_name": "cat_a.raw.members_src", "primary_key_columns": ["id"],
+         "app_schema": "shared_schema", "app_role": "alpha_ro", "index_columns": []},
+        {"name": "beta", "synced_table_id": "cat_a.shared_schema.orders",
+         "source_table_full_name": "cat_a.raw.orders_src", "primary_key_columns": ["id"],
+         "app_schema": "shared_schema", "app_role": "beta_ro", "index_columns": [],
+         "view_name": "members_v"},
+    ]
+
+
+def test_validate_view_names_unique_raises_on_collision():
+    """The shared seam raises when two entries resolve to the same (app_schema, view_name) and NAMES
+    BOTH offending entries + the colliding view; distinct resolutions pass.
+
+    MUTATION GATE: turn the check into a no-op and this goes RED.
+    """
+    with pytest.raises(ValueError) as exc:
+        rd.validate_view_names_unique(_dup_view_rows())
+    msg = str(exc.value)
+    assert "alpha" in msg and "beta" in msg, f"error must name both colliding entries: {msg}"
+    assert "members_v" in msg, f"error must name the colliding view: {msg}"
+    # distinct resolved names pass (collision-only, not schema-wide)
+    ok = _dup_view_rows()
+    ok[1]["view_name"] = "orders_v"
+    rd.validate_view_names_unique(ok)
+
+
+def test_render_rejects_duplicate_resolved_view_names(tmp_path):
+    """render_ddl — the actual CREATE OR REPLACE VIEW clobber site — refuses a config where two
+    entries resolve to the same schema-qualified consumer view."""
+    rows = _fixture_rows()
+    rows[1]["view_name"] = "claims_synced_v"  # members overrides onto claims' DERIVED view name
+    cfg = tmp_path / "dup.json"
+    cfg.write_text(json.dumps(rows))
+    with pytest.raises(ValueError) as exc:
+        rd.render_ddl(rd.load_tables(cfg))
+    assert "claims_synced_v" in str(exc.value), exc.value
+
+
 # --- 5. the standalone CLI (`python -m dabs.render_ddl | psql`) --------------------------------
 
 def test_cli_prints_the_rendered_sql(tmp_path):

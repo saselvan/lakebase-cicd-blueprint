@@ -626,3 +626,34 @@ def test_module_runs_as_cli_and_writes_one_changelog_per_row(tmp_path):
     written = sorted(p.name for p in tmp_path.glob("*.changelog.sql"))
     n = len(json.loads(REAL_CONFIG.read_text()))
     assert len(written) == n, f"expected {n} changelogs from repo config, got {written}"
+
+
+# --- 5f. cross-entry view-name uniqueness (shared seam, inherited by the Liquibase path) ---------
+#
+# The Liquibase generator shares resolve_view_name + validate_view_names_unique from dabs.render_ddl,
+# so two entries resolving to the SAME (app_schema, view_name) must fail changelog generation too —
+# otherwise both changelogs would CREATE OR REPLACE VIEW the same schema.view and last-write-wins.
+
+def test_duplicate_resolved_view_names_are_rejected(tmp_path):
+    """Two entries resolving to the same (app_schema, view_name) fail changelog generation, naming
+    BOTH entries + the colliding view. `alpha` derives members_v; `beta` overrides to members_v over
+    a different base table in the same schema.
+
+    MUTATION GATE: remove validate_view_names_unique (or its call) and this goes RED.
+    """
+    rows = [
+        {"name": "alpha", "synced_table_id": "cat_a.shared_schema.members",
+         "source_table_full_name": "cat_a.raw.members_src", "primary_key_columns": ["id"],
+         "app_schema": "shared_schema", "app_role": "alpha_ro", "index_columns": []},
+        {"name": "beta", "synced_table_id": "cat_a.shared_schema.orders",
+         "source_table_full_name": "cat_a.raw.orders_src", "primary_key_columns": ["id"],
+         "app_schema": "shared_schema", "app_role": "beta_ro", "index_columns": [],
+         "view_name": "members_v"},
+    ]
+    cfg = tmp_path / "dup_view.json"
+    cfg.write_text(json.dumps(rows))
+    with pytest.raises(ValueError) as exc:
+        gen.write_changelogs(gen.load_tables(cfg), tmp_path / "out")
+    msg = str(exc.value)
+    assert "alpha" in msg and "beta" in msg, f"error must name both colliding entries: {msg}"
+    assert "members_v" in msg, f"error must name the colliding view: {msg}"

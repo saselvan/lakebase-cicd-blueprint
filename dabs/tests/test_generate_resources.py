@@ -426,3 +426,55 @@ def test_module_runs_as_cli_against_repo_config(tmp_path):
         doc = yaml.safe_load(f.read_text())
         synced += len((doc.get("resources", {}) or {}).get("postgres_synced_tables", {}) or {})
     assert synced == n, f"expected {n} synced tables from repo config, got {synced}"
+
+
+# --- cross-entry view-name uniqueness: two entries must not resolve to the SAME view ------------
+#
+# resolve_view_name validates one name in isolation; nothing stops two entries from resolving to the
+# SAME (app_schema, view_name) — one derives <tbl>_v, another overrides view_name to that value over
+# a different base table. The migration would emit CREATE OR REPLACE VIEW <schema>.<name> twice and
+# the last apply silently clobbers the other. Both generators call the shared seam
+# validate_view_names_unique(tables), so both fail loud at generation time.
+
+def _dup_view_rows() -> list:
+    """`alpha` DERIVES members_v; `beta` overrides view_name to that same members_v over a DIFFERENT
+    base table, in the SAME schema — a resolved-name collision."""
+    return [
+        {"name": "alpha", "synced_table_id": "cat_a.shared_schema.members",
+         "source_table_full_name": "cat_a.raw.members_src", "primary_key_columns": ["id"],
+         "app_schema": "shared_schema", "app_role": "alpha_ro", "index_columns": []},
+        {"name": "beta", "synced_table_id": "cat_a.shared_schema.orders",
+         "source_table_full_name": "cat_a.raw.orders_src", "primary_key_columns": ["id"],
+         "app_schema": "shared_schema", "app_role": "beta_ro", "index_columns": [],
+         "view_name": "members_v"},
+    ]
+
+
+def test_duplicate_resolved_view_names_are_rejected(tmp_path):
+    """Two config entries resolving to the same (app_schema, view_name) must fail resource
+    generation, naming BOTH entries + the colliding view.
+
+    MUTATION GATE: remove validate_view_names_unique (or its call) and this goes RED.
+    """
+    from dabs.generate_resources import load_tables, write_resources
+
+    cfg = tmp_path / "dup_view.json"
+    cfg.write_text(json.dumps(_dup_view_rows()))
+    with pytest.raises(ValueError) as exc:
+        write_resources(load_tables(cfg), tmp_path / "out")
+    msg = str(exc.value)
+    assert "alpha" in msg and "beta" in msg, f"error must name both colliding entries: {msg}"
+    assert "members_v" in msg, f"error must name the colliding view: {msg}"
+
+
+def test_distinct_view_names_in_one_schema_still_generate(tmp_path):
+    """Two entries in one schema with DISTINCT resolved view names generate fine — the guard is
+    collision-only, not a blanket same-schema rejection (guards against a false positive)."""
+    from dabs.generate_resources import load_tables, write_resources
+
+    rows = _dup_view_rows()
+    rows[1]["view_name"] = "orders_v"  # now distinct from alpha's derived members_v
+    cfg = tmp_path / "distinct_view.json"
+    cfg.write_text(json.dumps(rows))
+    written = write_resources(load_tables(cfg), tmp_path / "out")
+    assert written, "distinct view names should generate resources"
