@@ -180,12 +180,12 @@ def build_changesets(table: dict) -> list[Changeset]:
             id="002-app-grants",
             attrs="runAlways:true",
             comment=(
-                "Explicit native Postgres grants, reapplied after each synced-table create/replace.\n"
+                "Schema USAGE only (least privilege), reapplied after each synced-table create/replace.\n"
+                "No base-table SELECT: the app role reads only through the 004 consumer view.\n"
                 "runAlways (not runOnChange): GRANT is idempotent; a replace drops grants otherwise."
             ),
             sql=_joined_statements(grant_statements(schema, role, tbl)),
             rollback=[
-                f"REVOKE SELECT ON TABLE {schema}.{tbl} FROM {role};",
                 f"REVOKE USAGE ON SCHEMA {schema} FROM {role};",
             ],
         )

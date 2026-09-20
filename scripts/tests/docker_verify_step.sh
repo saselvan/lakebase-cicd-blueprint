@@ -62,10 +62,24 @@ expect() { # $1 = expected rc (0 or 'nonzero'); $2 = label; remaining = verify_t
 }
 
 echo ""; echo "===== POSITIVE: grant present + both indexes ====="
+# Least-privilege grants exactly as the migration emits them: schema USAGE + SELECT on the VIEW
+# only. The base-table SELECT is deliberately NOT granted (the role reads only through the view).
 psql -v ON_ERROR_STOP=1 -q \
   -c "GRANT USAGE ON SCHEMA $SCHEMA TO $ROLE;" \
   -c "GRANT SELECT ON $SCHEMA.$VIEW TO $ROLE;"
 expect 0 "all post-conditions met -> exit 0" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+
+echo ""; echo "===== LEAST PRIVILEGE: role reads the VIEW but is DENIED the base table ====="
+# A Postgres view checks the base-table privilege as the view OWNER, not the caller, so the app
+# role never needs SELECT on the base synced table — and must not have it (else it could bypass the
+# row-filterable consumer view). Assert the base-table SELECT is 'f' while the view SELECT is 't'.
+lp_base="$(psql -tAc "SELECT has_table_privilege('$ROLE','$SCHEMA.$TABLE','SELECT')" | tr -d '[:space:]')"
+lp_view="$(psql -tAc "SELECT has_table_privilege('$ROLE','$SCHEMA.$VIEW','SELECT')" | tr -d '[:space:]')"
+if [ "$lp_base" = "f" ] && [ "$lp_view" = "t" ]; then
+  echo "  OK   role can SELECT the view (t) but NOT the base table (f) (base=$lp_base view=$lp_view)"
+else
+  echo "  FAIL least privilege violated (base=$lp_base view=$lp_view; want base=f view=t)"; fail=1
+fi
 
 echo ""; echo "===== NEGATIVE: SELECT on the consumer view REVOKED ====="
 psql -v ON_ERROR_STOP=1 -q -c "REVOKE SELECT ON $SCHEMA.$VIEW FROM $ROLE;"

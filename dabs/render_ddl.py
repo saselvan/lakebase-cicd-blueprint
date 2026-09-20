@@ -192,11 +192,21 @@ def role_guard_sql(app_role: str) -> str:
 
 
 def grant_statements(app_schema: str, app_role: str, synced_table: str) -> list[str]:
-    """Explicit native grants on the writer-owned synced table. GRANT is idempotent (a no-op when
-    already held) so it is safe to reapply after a synced-table create/replace."""
+    """Least-privilege grant for the app role: schema USAGE ONLY — deliberately NOT SELECT on the
+    base synced table. GRANT is idempotent (a no-op when already held) so it is safe to reapply
+    after a synced-table create/replace.
+
+    Why no base-table SELECT: a Postgres view checks privileges on its underlying table as the VIEW
+    OWNER, not as the caller, so the app role never needs SELECT on the base synced table to read
+    the consumer view (see `view_statements`). Granting it anyway would let the role read the base
+    table directly and BYPASS the (row-filterable) consumer view — defeating the whole no-superuser
+    view pattern. The app role therefore ends with schema USAGE here + SELECT on the VIEW (granted
+    in `view_statements`) and nothing on the base table.
+
+    `synced_table` is unused now but kept in the signature so both migration paths call this
+    identically and a future table-scoped policy has the name to hand."""
     return [
         f"GRANT USAGE  ON SCHEMA {app_schema}                 TO {app_role}",
-        f"GRANT SELECT ON TABLE  {app_schema}.{synced_table}           TO {app_role}",
     ]
 
 

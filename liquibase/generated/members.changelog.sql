@@ -19,11 +19,10 @@ END $$;
 --rollback DROP ROLE IF EXISTS members_app_ro;
 
 --changeset cicd:002-app-grants runAlways:true
--- Explicit native Postgres grants, reapplied after each synced-table create/replace.
+-- Schema USAGE only (least privilege), reapplied after each synced-table create/replace.
+-- No base-table SELECT: the app role reads only through the 004 consumer view.
 -- runAlways (not runOnChange): GRANT is idempotent; a replace drops grants otherwise.
 GRANT USAGE  ON SCHEMA cicd_proj                 TO members_app_ro;
-GRANT SELECT ON TABLE  cicd_proj.members           TO members_app_ro;
---rollback REVOKE SELECT ON TABLE cicd_proj.members FROM members_app_ro;
 --rollback REVOKE USAGE ON SCHEMA cicd_proj FROM members_app_ro;
 
 --changeset cicd:003-index-member_id runAlways:true

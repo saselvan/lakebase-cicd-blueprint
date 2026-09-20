@@ -95,21 +95,29 @@ psql_run </tmp/lkb_render_ddl.sql
 echo "apply #2 OK — no rollback."
 
 # --- assert the wiped objects reconciled back AND the app role/grant survive --------------------
+# The LAST column is the least-privilege proof: the app role can SELECT the consumer VIEW but must
+# NOT hold SELECT on the base synced table (a Postgres view checks the base-table privilege as the
+# view OWNER, not the caller, so the role never needs it — and granting it would let the role bypass
+# the row-filterable view). So we require the base-table privilege to be 'f'.
 FIRST_ROLE="$("$PY" -c "import json;t=json.load(open('$CONFIG'))[0];print(t['app_role'])")"
-echo "--- verifying reconciled state ---"
+echo "--- verifying reconciled state (incl. least-privilege negative) ---"
 RESULT="$(psql_run <<SQL
 SELECT
   to_regclass('${FIRST_SCHEMA}.${FIRST_TBL}_v') IS NOT NULL,
   to_regclass('${FIRST_SCHEMA}.idx_${FIRST_TBL}_${FIRST_IDXCOL}') IS NOT NULL,
   EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${FIRST_ROLE}'),
-  has_table_privilege('${FIRST_ROLE}', '${FIRST_SCHEMA}.${FIRST_TBL}_v', 'SELECT');
+  has_table_privilege('${FIRST_ROLE}', '${FIRST_SCHEMA}.${FIRST_TBL}_v', 'SELECT'),
+  has_table_privilege('${FIRST_ROLE}', '${FIRST_SCHEMA}.${FIRST_TBL}', 'SELECT');
 SQL
 )"
-echo "view_present|index_present|role_present|role_can_select = $RESULT"
-if [ "$RESULT" != "t|t|t|t" ]; then
-  echo "ERROR: 2nd apply did not reconcile objects/grants (expected t|t|t|t, got $RESULT)" >&2
+echo "view_present|index_present|role_present|role_can_select_view|role_can_select_base = $RESULT"
+# view+index reconciled, role present, role CAN read the view (t), role CANNOT read the base table (f).
+if [ "$RESULT" != "t|t|t|t|f" ]; then
+  echo "ERROR: 2nd apply did not reconcile to the least-privilege state (expected t|t|t|t|f, got $RESULT)" >&2
+  echo "       (final 'f' is the base-table SELECT: it MUST be denied — the role reads only the view.)" >&2
   exit 1
 fi
 
 echo
-echo "DOUBLE-APPLY PROOF OK: 2nd apply clean (no rollback); view+index reconciled; role can SELECT."
+echo "DOUBLE-APPLY PROOF OK: 2nd apply clean (no rollback); view+index reconciled; role can SELECT"
+echo "the VIEW but is DENIED SELECT on the base table (least privilege)."

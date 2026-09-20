@@ -58,6 +58,12 @@ check "role members_app_ro exists"    "SELECT EXISTS(SELECT 1 FROM pg_roles WHER
 check "role providers_app_ro exists"  "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='providers_app_ro')"
 check "members_app_ro can read members_v"     "SELECT has_table_privilege('members_app_ro','$SCHEMA.members_v','SELECT')"
 check "providers_app_ro can read providers_v" "SELECT has_table_privilege('providers_app_ro','$SCHEMA.providers_v','SELECT')"
+# Least privilege: the app role reads ONLY the consumer view, never the base synced table. A
+# Postgres view checks the base-table privilege as the view OWNER, not the caller, so the role
+# needs no base-table SELECT — and granting it would let the role bypass the row-filterable view.
+# has_table_privilege(...,'SELECT') on the base table must be 'f'; NOT(...) == 't' proves it.
+check "members_app_ro CANNOT read base members"     "SELECT NOT has_table_privilege('members_app_ro','$SCHEMA.members','SELECT')"
+check "providers_app_ro CANNOT read base providers" "SELECT NOT has_table_privilege('providers_app_ro','$SCHEMA.providers','SELECT')"
 
 echo "-- DATABASECHANGELOG (shared in $SCHEMA): filename | id | author:"
 psql -tAF'|' -c "SELECT filename,id,author FROM $SCHEMA.databasechangelog ORDER BY orderexecuted;"
