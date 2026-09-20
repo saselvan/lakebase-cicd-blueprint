@@ -43,13 +43,20 @@ jobs:
           python3 -c "import json; json.load(open('config/tables.json'))"
           echo "config/tables.json is valid JSON"
 
-      - name: Liquibase changelog offline validate (no database)
+      - name: Liquibase changelogs — drift check + offline validate (no database)
         run: |
-          docker run --rm -v "$PWD/liquibase/changelog:/work" liquibase/liquibase:4.33 \
-            --search-path=/work \
-            --changeLogFile=db.changelog-master.xml \
-            --url="offline:postgresql?version=16" \
-            validate
+          # 1) Drift gate: the committed liquibase/generated/*.changelog.sql must byte-match a
+          #    fresh generation from config/tables.json (single source of truth). Writes nothing.
+          python3 liquibase/generate_changelogs.py --check
+          # 2) Offline-validate EACH generated per-table changelog (no database).
+          for f in liquibase/generated/*.changelog.sql; do
+            echo "--- validate $f ---"
+            docker run --rm -v "$PWD/liquibase/generated:/work" liquibase/liquibase:4.33 \
+              --search-path=/work \
+              --changeLogFile="$(basename "$f")" \
+              --url="offline:postgresql?version=16" \
+              validate
+          done
 
       - name: Set up Python
         uses: actions/setup-python@v5

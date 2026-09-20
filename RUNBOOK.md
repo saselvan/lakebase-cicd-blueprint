@@ -14,7 +14,7 @@ drop/replace still has a brief gap — it is not zero-downtime; see `docs/DESIGN
 | Tool | Job | Files |
 |---|---|---|
 | Terraform | create/own the synced table (Delta → Lakebase Postgres) | `terraform/` |
-| Liquibase | app role, explicit grants, indexes, consumer view | `liquibase/changelog/` |
+| Liquibase | app role, explicit grants, indexes, consumer view (one generated changelog per table) | `liquibase/generated/` (from `liquibase/generate_changelogs.py`) |
 | Orchestration | run them in the right order, wait for the sync | `scripts/deploy.sh` |
 | GitHub Actions | run that same sequence on push / PR | `.github/workflows/` |
 
@@ -39,9 +39,11 @@ export PGUSER=<your-databricks-username>   # your login email
    no-op because Terraform owns the state.
 2. `scripts/wait_for_sync.sh` — polls `databricks postgres get-synced-table` until `detailed_state`
    contains `ONLINE`. This is what guarantees indexes go on **after** the load, not during it.
-3. `liquibase update` — runs the changesets: create role → grant USAGE/SELECT → create indexes →
-   create the consumer view + grant. Reruns reapply the `runAlways` changesets; Liquibase tracks
-   them in `DATABASECHANGELOG`.
+3. generate per-table changelogs (`liquibase/generate_changelogs.py`), then `liquibase update`
+   against each table's OWN changelog (`generated/<name>.changelog.sql`): create role → grant
+   USAGE/SELECT → create indexes (one per `index_columns` entry) → create the consumer view + grant.
+   A distinct changelog file per table gives each changeset a distinct identity, so shared-schema
+   tables never collide in `DATABASECHANGELOG`. Reruns reapply the `runAlways` changesets.
 4. verify — `has_table_privilege(app_role, ...) = t` and the indexes exist.
 
 ## The PR flow (branching)

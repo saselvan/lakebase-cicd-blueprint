@@ -179,16 +179,20 @@ Scale to many synced tables from **one config file**, not by copy-pasting resour
 - **Terraform** does `for_each` over `jsondecode(file(".../config/tables.json"))`, so one
   `databricks_postgres_synced_table` block provisions every entry. Adding a table is a one-line
   edit to the JSON — no new resource, no new variable.
-- **The deploy loop** (`scripts/deploy.sh`) reads the same file, runs `terraform apply` once, then
-  iterates the entries: wait-for-`ONLINE` → Liquibase migrate (passing per-table `synced_table`,
-  `app_schema`, `app_role`, and index columns) → verify.
+- **The deploy loop** (`scripts/deploy.sh`) reads the same file, runs `terraform apply` once,
+  generates one Liquibase changelog per table (`liquibase/generate_changelogs.py`), then iterates
+  the entries: wait-for-`ONLINE` → `liquibase update` against that table's OWN changelog → verify.
 
-The Liquibase changesets are already parametrized (`${synced_table}`, `${app_schema}`,
-`${app_role}`), so the same changelog serves every table. **Index columns are the one inherently
-table-specific customization point** — the two-index template in `003-indexes.sql` covers the
-common case (`${index_col_1}`/`${index_col_2}` from each entry's `index_columns`), and a table
-needing a different index shape (more indexes, composite/partial, or a different type) edits that
-changeset directly. Everything else is data in `config/tables.json`.
+Each table gets its OWN generated changelog (`liquibase/generated/<name>.changelog.sql`) with
+role/schema/table and index columns BAKED in — no `${…}` property substitution. This matters:
+Liquibase keys a changeset by (FILENAME, id, author) and folds substituted property values into the
+checksum, so the earlier shared-changelog-run-per-table design collided when two tables shared one
+`app_schema` (one `DATABASECHANGELOG`, second table's `001-app-role` failed its checksum and its role
+was never created). A distinct changelog FILE per table makes each changeset identity distinct, so
+shared-schema tables coexist. **Index columns are the one inherently table-specific spot** — the
+generator emits one `003-index-<col>` changeset per `index_columns` entry (0/1/N, no cap); a table
+needing a different index shape edits its generated changelog. Everything else is data in
+`config/tables.json`.
 
 ## Alembic parity (Python teams)
 

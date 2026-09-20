@@ -131,11 +131,16 @@ The pipeline is four ordered steps, run the same way by hand (`scripts/deploy.sh
    no-op.
 2. Wait for `ONLINE` (`scripts/wait_for_sync.sh`), per table. Poll until the first snapshot has
    loaded. This is what makes indexes build after the data lands, not during the load.
-3. Liquibase applies the database objects, in order:
-   - `001-app-role.sql` — an idempotent read-only app role.
-   - `002-app-grants.sql` — explicit `GRANT USAGE` and `GRANT SELECT` on the writer-owned synced table.
-   - `003-indexes.sql` — `CREATE INDEX IF NOT EXISTS`, after the load.
-   - `004-app-view.sql` — a consumer view owned by the deploy identity, with the grant on the view.
+3. Liquibase applies the database objects. Each table runs its OWN generated changelog
+   (`liquibase/generated/<name>.changelog.sql`, produced from `config/tables.json` by
+   `liquibase/generate_changelogs.py`), in order:
+   - `001-app-role` — an idempotent read-only app role.
+   - `002-app-grants` — explicit `GRANT USAGE` and `GRANT SELECT` on the writer-owned synced table.
+   - `003-index-<col>` — `CREATE INDEX IF NOT EXISTS`, one changeset per `index_columns` entry, after the load.
+   - `004-app-view` — a consumer view owned by the deploy identity, with the grant on the view.
+
+   A distinct changelog file per table gives each changeset a distinct identity, so two tables that
+   share one `app_schema` never collide in a shared `DATABASECHANGELOG`.
 4. Verify. The app role can `SELECT`, and the indexes exist.
 
 The grant, index, and view changesets are `runAlways:true`, so they reapply on every deploy. See
@@ -146,7 +151,7 @@ the self-healing caveat above for the one case where a plain redeploy does not r
 `config/tables.json` is the single source of truth for which tables the pipeline manages. Both
 Terraform (`for_each` in `terraform/main.tf`) and the deploy loop (`scripts/deploy.sh`) read it.
 Adding a table is a one-line edit there. No Terraform or script changes are needed. Each entry
-declares the synced table id, its Delta source, primary key, app schema and role, and up to two
+declares the synced table id, its Delta source, primary key, app schema and role, and any number of
 index columns:
 
 ```json
@@ -163,10 +168,11 @@ index columns:
 ]
 ```
 
-`terraform apply` runs once and provisions all of them. The deploy loop then waits for each table's
-sync, applies the objects, and verifies access. Index columns are the one table-specific spot. A
-table that needs a different index shape customizes `liquibase/changelog/003-indexes.sql`.
-Field-by-field reference: `config/README.md`.
+`terraform apply` runs once and provisions all of them. The deploy loop then generates one
+changelog per table, waits for each table's sync, applies the objects, and verifies access. Every
+`index_columns` entry becomes its own index changeset (0/1/N — no cap). A table that needs a
+different index shape (composite, partial, a different type) edits its generated changelog or
+extends the generator. Field-by-field reference: `config/README.md`.
 
 ### Branching (test risky changes safely)
 
@@ -213,12 +219,12 @@ The two paths use different migration tools, but produce the same database objec
 
 The Alembic migration and the Liquibase changelog line up one to one:
 
-| Liquibase changeset | Alembic equivalent |
+| Liquibase changeset (generated per table) | Alembic equivalent |
 |---|---|
-| `001-app-role.sql` | `_role_guard_sql` — idempotent `CREATE ROLE` via a `pg_roles` existence guard |
-| `002-app-grants.sql` | `_grant_statements` — `GRANT USAGE` on schema + `GRANT SELECT` on the synced table |
-| `003-indexes.sql` | `_index_statements` — `CREATE INDEX IF NOT EXISTS` per `index_columns` (handles 0/1/N) |
-| `004-app-view.sql` | `_view_statements` — `CREATE OR REPLACE VIEW` + `GRANT SELECT` on the view |
+| `001-app-role` | `_role_guard_sql` — idempotent `CREATE ROLE` via a `pg_roles` existence guard |
+| `002-app-grants` | `_grant_statements` — `GRANT USAGE` on schema + `GRANT SELECT` on the synced table |
+| `003-indexes` (generated as one `003-index-<col>` changeset per `index_columns` entry) | `_index_statements` — `CREATE INDEX IF NOT EXISTS` per `index_columns` (handles 0/1/N) |
+| `004-app-view` | `_view_statements` — `CREATE OR REPLACE VIEW` + `GRANT SELECT` on the view |
 
 Both stay idempotent. To run the Alembic path outside the job, render the SQL offline and pipe it
 to psql on each deploy:

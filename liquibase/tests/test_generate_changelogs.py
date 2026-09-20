@@ -44,6 +44,9 @@ def _load_gen():
     namespace-package name and we refuse to depend on that ambiguity)."""
     spec = importlib.util.spec_from_file_location("lb_generate_changelogs", GEN_PATH)
     module = importlib.util.module_from_spec(spec)
+    # Register before exec so the module's @dataclass can resolve its own annotations
+    # (dataclasses looks the defining module up in sys.modules).
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 

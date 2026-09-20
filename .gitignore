@@ -21,3 +21,6 @@ CONTEXT.md
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Liquibase offline-validate byproduct (tracks changesets in a CSV when no DB is used)
+liquibase/databasechangelog.csv

@@ -38,6 +38,6 @@ python3 -c "import json; json.load(open('config/tables.json'))"
 |---|---|
 | Tables the pipeline manages | `config/tables.json` |
 | Shared workspace settings | `terraform/terraform.tfvars.example` (+ your own `.tfvars`) |
-| Non-standard index shape for a table | `liquibase/changelog/003-indexes.sql` |
+| Non-standard index shape for a table | its generated `liquibase/generated/<name>.changelog.sql`, or `liquibase/generate_changelogs.py` |
 | Pipeline steps / ordering | `scripts/deploy.sh` |
 | CI behavior | `.github/workflows/` |

@@ -8,7 +8,7 @@ returns *before* the table is loaded, and a sync-mode change is a full rebuild.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Indexes fail or build on an empty/partial table right after `terraform apply` | `apply` does **not** block until the initial load is `ONLINE` — it returns once the synced table is created | Run `scripts/wait_for_sync.sh <synced_table_id>` before Liquibase. `deploy.sh` already does this per table. |
-| `GRANT ... ON TABLE <synced_table>` denied, even as admin | Synced tables are owned by the internal `databricks_writer_<dbid>` role; you can't grant on what you don't own | Use the **consumer view** (`004-app-view.sql`): the deploy identity owns the view and grants on it. Keep the table creator and view owner the same identity. |
+| `GRANT ... ON TABLE <synced_table>` denied, even as admin | Synced tables are owned by the internal `databricks_writer_<dbid>` role; you can't grant on what you don't own | Use the **consumer view** (the generated `004-app-view` changeset): the deploy identity owns the view and grants on it. Keep the table creator and view owner the same identity. |
 | `ALTER DEFAULT PRIVILEGES FOR ROLE databricks_writer_<dbid>` denied | By design — you can't set defaults on the managed writer role | Don't. Use explicit grants + the consumer view. |
 | After changing a table's **sync mode**, the app lost SELECT and its indexes | A sync-mode change forces a **full replace** (destroy+recreate) → drops custom indexes and grants to pkey-only | Re-run `deploy.sh`. Because the grant/index/view changesets are `runAlways:true`, they reapply and restore access. Treat a mode change as a planned rebuild. |
 | Re-running Liquibase after a replace says "nothing to execute" and access is NOT restored | The changesets are `runOnChange` (checksum unchanged → skipped) | They must be **`runAlways:true`** (as shipped). If you edited them to `runOnChange`, switch back. |
@@ -25,9 +25,10 @@ returns *before* the table is loaded, and a sync-mode change is a full rebuild.
 - **All tables are assumed to live on one Lakebase project / branch / instance / host.** The shared
   Terraform vars and the single `INSTANCE`/`HOST` in `deploy.sh` reflect that. Tables spanning
   multiple projects or instances would need per-table `instance`/`host` — not modeled here.
-- **The `003-indexes.sql` template covers up to two index columns** (`${index_col_1}`/`${index_col_2}`).
-  A table needing more indexes, composite/partial indexes, or a different index type customizes that
-  changeset directly — it's the one inherently table-specific spot.
+- **Index columns are carried in full (0/1/N — no cap).** `liquibase/generate_changelogs.py` emits
+  one `003-index-<col>` changeset per `index_columns` entry into each table's generated changelog.
+  A table needing composite/partial indexes or a different index type edits its generated changelog
+  (`liquibase/generated/<name>.changelog.sql`) or extends the generator — the one table-specific spot.
 
 ## Quick checks
 
