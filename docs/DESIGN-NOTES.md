@@ -119,6 +119,23 @@ Verified across all three sync modes (Snapshot, Triggered, Continuous):
 Treat a sync-mode change as a planned rebuild, not a live toggle — and pick Triggered/Continuous at
 create time if row-incremental is the goal, since flipping mode on a live table forces the replace above.
 
+### Changing sync mode: prefer a blue/green swap
+
+Because a mode change forces a full replace of the *same* synced table, the safest path is to stand up
+a new table beside the old one rather than replace in place:
+
+1. Add a **new** entry to `config/tables.json` with a **new `synced_table_id`** and the target
+   `scheduling_policy` — leave the existing table running.
+2. Deploy; wait for the new table to reach `ONLINE`; run the migration so its role, grants, indexes,
+   and consumer view are in place.
+3. Cut consumers over to the new table (or its view).
+4. Remove the old entry and deploy again to drop the old table — during a maintenance window.
+
+This never deletes a live table, so there is no availability gap. If you instead replace in place,
+**drop the consumer view first**: the replace deletes the base table, and Postgres will not drop a
+table that still has a dependent view, so the view must be removed before the replace and recreated by
+the `runAlways` migration afterward. Blue/green avoids that dependency step entirely.
+
 ## Branch-per-PR (ephemeral test environments)
 
 Use copy-on-write branches to give each change its own throwaway environment: branch off production,
