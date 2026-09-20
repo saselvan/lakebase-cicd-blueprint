@@ -238,6 +238,37 @@ def test_changesets_are_idempotent_and_runalways(tmp_path):
     assert "CREATE INDEX IF NOT EXISTS" in m["text"]
 
 
+def test_grants_changeset_is_usage_only_no_base_table_select(tmp_path):
+    """Least privilege: 002-app-grants grants schema USAGE only — NO SELECT on the base synced
+    table (the app role reads only through the consumer view, whose owner holds the base-table
+    privilege). Its rollback revokes USAGE only — there is no base-table grant to revoke.
+
+    MUTATION GATE: re-add the base-table SELECT grant (and its REVOKE) and this goes RED.
+    """
+    out = _generate(tmp_path)
+    for name, entry in out["by_name"].items():
+        cs = {c["id"]: c for c in entry["changesets"]}
+        body = cs["002-app-grants"]["body"]
+        assert "GRANT USAGE" in body, f"{name}: 002 must still grant schema USAGE:\n{body}"
+        assert "GRANT SELECT ON TABLE" not in body, (
+            f"{name}: 002 must not grant SELECT on the base table (least privilege):\n{body}"
+        )
+        assert "REVOKE SELECT ON TABLE" not in body, (
+            f"{name}: 002 rollback must not revoke a base-table SELECT that is no longer granted:\n{body}"
+        )
+
+
+def test_only_view_select_is_granted_across_changelog(tmp_path):
+    """Across a table's whole changelog, every `GRANT SELECT` targets the consumer view (…_v /
+    override) — never `GRANT SELECT ON TABLE` on the base synced table. MUTATION GATE: re-add the
+    base-table SELECT grant and this goes RED."""
+    out = _generate(tmp_path)
+    for name, entry in out["by_name"].items():
+        for line in entry["text"].splitlines():
+            if line.strip().startswith("GRANT SELECT"):
+                assert "ON TABLE" not in line, f"{name}: a GRANT SELECT targets a base table:\n{line}"
+
+
 def test_role_changeset_is_runonchange(tmp_path):
     """R3: the 001-app-role changeset MUST be runOnChange:true.
 

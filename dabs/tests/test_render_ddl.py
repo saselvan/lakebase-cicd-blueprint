@@ -80,7 +80,8 @@ def test_render_emits_guarded_role_per_table():
 
 
 def test_render_emits_grants_per_table():
-    """Explicit GRANT USAGE on schema + GRANT SELECT on the synced table, per table."""
+    """Explicit GRANT USAGE on schema per table — and NO base-table SELECT (least privilege: the
+    app role reads only through the consumer view, never the base synced table)."""
     sql = _render()
     for row in _fixture_rows():
         schema, role = row["app_schema"], row["app_role"]
@@ -88,9 +89,42 @@ def test_render_emits_grants_per_table():
         assert re.search(rf"GRANT USAGE\s+ON SCHEMA {schema}\s+TO {role}", sql), (
             f"missing GRANT USAGE for {row['name']}:\n{sql}"
         )
-        assert re.search(rf"GRANT SELECT ON TABLE\s+{schema}\.{tbl}\s+TO {role}", sql), (
-            f"missing GRANT SELECT on table for {row['name']}:\n{sql}"
+        assert not re.search(rf"GRANT SELECT ON TABLE\s+{schema}\.{tbl}\s+TO {role}", sql), (
+            f"base-table SELECT grant must be dropped for {row['name']} (least privilege):\n{sql}"
         )
+
+
+def test_grant_statements_grants_usage_only_no_base_table_select():
+    """Least privilege: `grant_statements` grants schema USAGE ONLY — never SELECT on the base
+    synced table. A Postgres view checks privileges on its underlying table as the VIEW OWNER, not
+    the caller, so the app role never needs base-table SELECT to read the consumer view; keeping it
+    would let the role bypass the (row-filterable) view.
+
+    MUTATION GATE: re-add `GRANT SELECT ON TABLE ... TO <role>` to grant_statements and this goes RED.
+    """
+    stmts = rd.grant_statements("shared_schema", "claims_reader_ro", "claims_synced")
+    joined = "\n".join(stmts)
+    assert any(
+        re.search(r"GRANT USAGE\s+ON SCHEMA shared_schema\s+TO claims_reader_ro", s) for s in stmts
+    ), f"grant_statements must still grant schema USAGE:\n{joined}"
+    assert "ON TABLE" not in joined, f"grant_statements must NOT grant on the base table:\n{joined}"
+    assert "GRANT SELECT" not in joined, (
+        f"grant_statements must emit no SELECT grant at all (the view grant lives in "
+        f"view_statements):\n{joined}"
+    )
+
+
+def test_app_role_only_table_level_select_is_the_view():
+    """Across the WHOLE render, every `GRANT SELECT` targets a consumer view — never a base synced
+    table (`GRANT SELECT ON TABLE ...`). Proves the least-privilege end state: schema USAGE + SELECT
+    on the view only.
+
+    MUTATION GATE: re-introduce the base-table SELECT grant and this goes RED.
+    """
+    sql = _render()
+    for line in sql.splitlines():
+        if "GRANT SELECT" in line:
+            assert "ON TABLE" not in line, f"a GRANT SELECT targets a base table (not the view):\n{line}"
 
 
 def test_render_emits_one_index_per_column_no_cap():
