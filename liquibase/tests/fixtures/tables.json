@@ -1,0 +1,38 @@
+[
+  {
+    "name": "members",
+    "synced_table_id": "cat_a.shared_schema.members_synced",
+    "source_table_full_name": "cat_a.shared_schema.members_src",
+    "primary_key_columns": ["id"],
+    "app_schema": "shared_schema",
+    "app_role": "members_app_ro",
+    "index_columns": ["member_id", "plan_code"]
+  },
+  {
+    "name": "claims",
+    "synced_table_id": "cat_a.shared_schema.claims_synced",
+    "source_table_full_name": "cat_b.raw_landing.claims_delta_source",
+    "primary_key_columns": ["id"],
+    "app_schema": "shared_schema",
+    "app_role": "claims_app_ro",
+    "index_columns": ["member_id", "provider_id", "service_date"]
+  },
+  {
+    "name": "providers",
+    "synced_table_id": "cat_c.prov.providers_synced",
+    "source_table_full_name": "cat_c.prov.providers_src",
+    "primary_key_columns": ["id"],
+    "app_schema": "prov",
+    "app_role": "providers_app_ro",
+    "index_columns": ["provider_id"]
+  },
+  {
+    "name": "events",
+    "synced_table_id": "cat_d.ev.events_synced",
+    "source_table_full_name": "cat_d.ev.events_src",
+    "primary_key_columns": ["id"],
+    "app_schema": "ev",
+    "app_role": "events_app_ro",
+    "index_columns": []
+  }
+]
