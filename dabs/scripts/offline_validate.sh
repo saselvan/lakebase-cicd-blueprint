@@ -45,7 +45,7 @@ BUNDLE="$WORK/dabs"
 mkdir -p "$BUNDLE"
 cp "$REPO_ROOT/dabs/databricks.yml" "$BUNDLE/databricks.yml"
 # The migration Workflow job's task points at ./migration_job.py (relative to the bundle root),
-# so validate resolves the local file — copy the entrypoint into the isolated bundle too (ticket 03).
+# so validate resolves the local file — copy the entrypoint into the isolated bundle too.
 cp "$REPO_ROOT/dabs/migration_job.py" "$BUNDLE/migration_job.py"
 ln -s "$REPO_ROOT/alembic" "$WORK/alembic"
 ln -s "$REPO_ROOT/config" "$WORK/config"

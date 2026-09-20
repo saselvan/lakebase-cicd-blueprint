@@ -1,4 +1,4 @@
-"""Docs falsifiability for ticket 03: the Alembic path must be documented at parity.
+"""Docs falsifiability: the Alembic path must be documented at parity.
 
 Asserts on the shipped docs (README + DESIGN-NOTES), so a dropped parity row or a
 contradicting runAlways claim fails CI. No database, no alembic run.

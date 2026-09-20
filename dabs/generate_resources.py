@@ -1,4 +1,4 @@
-"""Codegen: config/tables.json -> Databricks Asset Bundle resource YAML (ticket 01).
+"""Codegen: config/tables.json -> Databricks Asset Bundle resource YAML.
 
 The DABs path is driven by the SAME single source of truth as Terraform's `for_each` and the
 deploy loop (ADR 0004): the repo-root `config/tables.json`. DABs YAML cannot loop a JSON list
@@ -40,7 +40,7 @@ the synced table's `postgres_database` uses `${var.lakebase_database}`, and the 
 also uses `${var.lakebase_branch}` — the SAME var the role's `parent` uses, so a target sets the branch
 once and both the synced table and its role follow it onto the same Lakebase branch (dev/prod placement
 stays separated, and an ephemeral-branch test can isolate). Those variables are declared in the bundle's
-`databricks.yml` targets (ticket 02).
+`databricks.yml` targets.
 """
 
 from __future__ import annotations

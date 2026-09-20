@@ -6,7 +6,7 @@
 # job) installs a pinned CLI and runs `bundle validate` with no secrets.
 #
 # Resources are GENERATED from the single source of truth config/tables.json by
-# `python -m dabs.generate_resources` (ticket 01) into resources/*.yml — re-run codegen after
+# `python -m dabs.generate_resources` into resources/*.yml — re-run codegen after
 # editing tables.json; do not hand-edit the generated files.
 bundle:
   name: lakebase-cicd-dabs
@@ -14,7 +14,7 @@ bundle:
 include:
   - resources/*.yml
 
-# --- Migration Workflow job (ticket 03) -------------------------------------------------------
+# --- Migration Workflow job -------------------------------------------------------
 # STATIC resource (not table-driven), so it lives inline here rather than under resources/*.yml —
 # which is 100% codegen-owned and drift-checked; a hand-written file there would trip the guard.
 #
@@ -22,7 +22,7 @@ include:
 # Liquibase — ADR 0006/D1). At run time it: reads config/tables.json, BLOCKS until every synced
 # table reports ONLINE (ADR 0003), then applies the SHARED alembic/ migration via a RUNTIME OAuth
 # token minted inside the workspace (no stored secret). It loops config/tables.json at run time —
-# exactly like the migration — so adding a table needs no job edit. The live run is ticket 04.
+# exactly like the migration — so adding a table needs no job edit.
 #
 # config/ and alembic/ live at the repo root (above this bundle root), so sync.paths pulls them
 # into the deployment alongside dabs/ (the task shells out to `alembic upgrade head --sql`).
@@ -56,7 +56,7 @@ resources:
               - "${var.lakebase_instance}"
               # The migration connects to the TARGET BRANCH's compute-endpoint host, NOT the
               # instance default endpoint (= production). Without this the job migrates the wrong
-              # branch and raises InvalidSchemaName (finding #5). Interpolated at deploy time.
+              # branch and raises InvalidSchemaName. Interpolated at deploy time.
               - "--branch"
               - "${var.lakebase_branch}"
           environment_key: migration

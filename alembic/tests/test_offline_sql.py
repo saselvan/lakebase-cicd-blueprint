@@ -1,4 +1,4 @@
-"""Offline-SQL emission tests for the Alembic variant (ticket 01 — app role only).
+"""Offline-SQL emission tests for the Alembic variant (app role only).
 
 The single seam is offline SQL generation: `alembic upgrade head --sql` runs with
 NO database connection, driven by a fixture `tables.json` pointed at via the

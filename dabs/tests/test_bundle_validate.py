@@ -1,4 +1,4 @@
-"""Falsifiability tests for ticket 02 — the offline `bundle validate` seam.
+"""Falsifiability tests — the offline `bundle validate` seam.
 
 The seam is: config/tables.json --(codegen)--> dabs/resources/*.yml --(bundle validate)--> exit code.
 These tests drive the REAL `databricks` CLI (no mock of the CLI itself) against a localhost
@@ -98,7 +98,7 @@ def _bundle_dir(tmp_path: Path) -> Path:
     bundle = tmp_path / "dabs"
     bundle.mkdir(parents=True, exist_ok=True)
     shutil.copy(REPO_ROOT / "dabs" / "databricks.yml", bundle / "databricks.yml")
-    # The migration job task's python_file (./migration_job.py) must resolve for validate (ticket 03).
+    # The migration job task's python_file (./migration_job.py) must resolve for validate.
     shutil.copy(REPO_ROOT / "dabs" / "migration_job.py", bundle / "migration_job.py")
     (tmp_path / "alembic").symlink_to(REPO_ROOT / "alembic")
     (tmp_path / "config").symlink_to(REPO_ROOT / "config")

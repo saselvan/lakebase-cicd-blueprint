@@ -1,6 +1,6 @@
-"""Offline-SQL emission tests for ticket 02 — grants, indexes, and the consumer view.
+"""Offline-SQL emission tests — grants, indexes, and the consumer view.
 
-Same single seam as ticket 01: `alembic upgrade head --sql` runs with NO database
+Same single seam: `alembic upgrade head --sql` runs with NO database
 connection, driven by the HOSTILE fixture `tables.json` (LAKEBASE_TABLES_CONFIG). We
 assert only on the emitted SQL string, never on internal function names.
 

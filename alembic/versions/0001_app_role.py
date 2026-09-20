@@ -4,10 +4,10 @@ The Alembic variant of the reference migration. For every table in config/tables
 emits the SAME four object groups as the Liquibase changelog, mirroring one changeset per
 helper inside a single upgrade():
 
-  1. app role      — Liquibase 001-app-role.sql   (ticket 01)
-  2. grants        — Liquibase 002-app-grants.sql  (ticket 02)
-  3. indexes       — Liquibase 003-indexes.sql     (ticket 02)
-  4. consumer view — Liquibase 004-app-view.sql    (ticket 02)
+  1. app role      — Liquibase 001-app-role.sql
+  2. grants        — Liquibase 002-app-grants.sql
+  3. indexes       — Liquibase 003-indexes.sql
+  4. consumer view — Liquibase 004-app-view.sql
 
 Idempotency = runAlways-equivalent (ADR 0002). Postgres has no CREATE ROLE / CREATE INDEX
 "IF NOT EXISTS ROLE", so the role is guarded by a pg_roles existence check; indexes use

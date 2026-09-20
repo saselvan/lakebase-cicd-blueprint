@@ -1,4 +1,4 @@
-"""Falsifiability tests for ticket 01 — codegen: config/tables.json -> dabs/resources YAML.
+"""Falsifiability tests — codegen: config/tables.json -> dabs/resources YAML.
 
 The single seam is the pure codegen `tables.json (list) -> bundle resource YAML`. We assert
 on the EMITTED YAML (files written to a tmp dir, then re-parsed) — never on internal function
@@ -313,7 +313,7 @@ def test_every_emitted_file_is_valid_yaml(tmp_path):
 
 
 # --------------------------------------------------------------------------------------------
-# Drift check (ticket 02 fix round): the COMMITTED dabs/resources/*.yml must byte-match a fresh
+# Drift check: the COMMITTED dabs/resources/*.yml must byte-match a fresh
 # generation from config/tables.json. Without this, committed files can silently diverge from the
 # single source of truth and neither the gate nor CI would notice.
 # --------------------------------------------------------------------------------------------
