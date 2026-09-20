@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -61,18 +62,75 @@ def load_tables(config_path: str | Path) -> list[dict]:
 
 
 # --- identifier validation (the SAME seam the Liquibase path uses) ------------------------------
+#
+# Every identifier baked into the emitted DDL (app_role, app_schema, the pg table name, and each
+# index column) is interpolated straight into SQL text, so an unsafe value — a hyphen, a space, a
+# quote, a reserved word — would either break the SQL or be an injection vector. This single seam
+# (imported by liquibase/generate_changelogs.py too) is where BOTH paths reject unsafe identifiers
+# at generation time.
+#
+# The rule is strict-reject, not quote. Config identifiers in this reference are lowercase
+# snake_case; a generated PUBLIC teaching reference should fail LOUD on a weird identifier rather
+# than silently double-quote arbitrary input (quoting would have to be threaded through every
+# emitted statement and every downstream consumer, and case-folding surprises are exactly the kind
+# of footgun a reference should not model). If a future need arises, quoting can be added behind
+# this one function.
+
+_SAFE_IDENTIFIER = re.compile(r"^[a-z_][a-z0-9_]*$")
+_MAX_IDENTIFIER_LEN = 63  # Postgres NAMEDATALEN - 1; longer names are silently truncated by PG.
+
+# Curated set of Postgres reserved words rejected even when they match the safe-identifier regex.
+# Not exhaustive — a strict, predictable guard, not a full parser. An identifier that is also a
+# reserved word (an app_role named `user`, a column named `order`) would need double-quoting
+# everywhere it appears in the emitted DDL; we fail loud at generation instead.
+_RESERVED_WORDS = frozenset({
+    "all", "analyse", "analyze", "and", "any", "array", "as", "asc", "authorization",
+    "between", "both", "by", "case", "cast", "check", "collate", "column", "constraint",
+    "create", "cross", "current_catalog", "current_date", "current_role", "current_schema",
+    "current_time", "current_timestamp", "current_user", "database", "default", "deferrable",
+    "delete", "desc", "distinct", "do", "drop", "else", "end", "except", "exists", "false",
+    "fetch", "for", "foreign", "from", "full", "grant", "group", "having", "in", "index",
+    "inner", "insert", "intersect", "into", "is", "join", "key", "leading", "left", "like",
+    "limit", "localtime", "localtimestamp", "natural", "not", "null", "offset", "on", "only",
+    "or", "order", "outer", "primary", "references", "returning", "revoke", "right", "role",
+    "schema", "select", "session_user", "similar", "some", "table", "then", "to", "trailing",
+    "true", "union", "unique", "update", "user", "using", "values", "view", "when", "where",
+    "with",
+})
+
 
 def validate_identifier(name, kind: str = "identifier") -> str:
-    """Single identifier-validation home for BOTH migration paths.
+    """Single identifier-validation home for BOTH migration paths (fix D).
 
-    For fix B it is a real, called guard that rejects an empty / non-string identifier so a
-    malformed `config/tables.json` fails loudly here instead of emitting broken DDL. Every
-    identifier baked into the rendered DDL (app_role, app_schema, pg table name, each index
-    column) passes through this function. (Fix D will tighten it — reject reserved words / enforce
-    `[a-z_][a-z0-9_]*`, or quote — for both paths at once, since both call this one function.)
+    Accepts ONLY a safe unquoted Postgres identifier: a non-empty string matching
+    ``^[a-z_][a-z0-9_]*`` of at most 63 characters, and NOT a reserved SQL word. Every identifier
+    baked into the rendered DDL (app_role, app_schema, the pg table name, and each index column)
+    passes through here, and so does the Liquibase generator (it imports this function), so a
+    malformed / hostile `config/tables.json` fails loudly at generation time in BOTH paths instead
+    of emitting broken or injectable DDL.
+
+    On rejection the error names the offending value, the `kind`, and the rule it broke (nothing
+    sensitive — an identifier is a table/role/column name). Returns the identifier unchanged when
+    valid, so callers can use it inline.
     """
     if not isinstance(name, str) or not name.strip():
         raise ValueError(f"{kind} must be a non-empty string, got {name!r}")
+    if len(name) > _MAX_IDENTIFIER_LEN:
+        raise ValueError(
+            f"{kind} {name!r} is {len(name)} characters; exceeds the Postgres identifier "
+            f"limit of {_MAX_IDENTIFIER_LEN}. Use a shorter lowercase snake_case name."
+        )
+    if not _SAFE_IDENTIFIER.match(name):
+        raise ValueError(
+            f"{kind} {name!r} is not a safe unquoted Postgres identifier: expected lowercase "
+            f"snake_case matching ^[a-z_][a-z0-9_]* (no hyphens, spaces, quotes, dots, or "
+            f"uppercase). Rename it in config/tables.json."
+        )
+    if name in _RESERVED_WORDS:
+        raise ValueError(
+            f"{kind} {name!r} is a reserved SQL word and cannot be used as an unquoted "
+            f"identifier. Rename it in config/tables.json."
+        )
     return name
 
 

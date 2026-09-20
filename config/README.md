@@ -21,4 +21,12 @@ own `CREATE INDEX IF NOT EXISTS` changeset (0, 1, or N — no two-column cap). A
 different index shape — a composite or partial index, or a different index type — edits its
 generated changelog (`liquibase/generated/<name>.changelog.sql`) or extends the generator.
 
+**Identifier rule.** Every identifier baked into the emitted DDL — `app_role`, `app_schema`, the
+Postgres table name (the last part of `synced_table_id`), and each `index_columns` entry — must be
+a safe unquoted Postgres identifier: **lowercase snake_case** matching `^[a-z_][a-z0-9_]*$`,
+**at most 63 characters**, and **not a reserved SQL word** (e.g. `user`, `table`, `order`). Both
+the DABs renderer and the Liquibase generator validate this at generation time (one shared seam,
+`validate_identifier` in `dabs/render_ddl.py`) and fail loud with a clear message rather than
+emitting broken or injectable SQL — so a value like `Plan-Code` is rejected, not silently quoted.
+
 > JSON does not support comments, which is why this note lives here rather than inline.
