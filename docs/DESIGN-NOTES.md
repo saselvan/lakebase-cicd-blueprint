@@ -1,10 +1,13 @@
 # Lakebase CI/CD — Design Notes
 
 A recommended approach to CI/CD for Lakebase synced tables, with the reasoning behind each choice.
-Verified end-to-end on the Autoscaling **projects** model (PostgreSQL 16, Databricks Terraform
-provider v1.132.0): Terraform created the synced table; the deploy polled the table's status until
-its initial load finished (`ONLINE`); Liquibase then applied the app role, grants, indexes, and a
-consumer view; the app role could read; and a copy-on-write branch test left production untouched.
+Exercised on real Lakebase synced tables on the Autoscaling **projects** model (PostgreSQL 16,
+Databricks Terraform provider v1.132.0): two tables in one shared schema were migrated through
+**both** paths — DABs and Terraform + Liquibase. Terraform (or the DABs job) created the synced
+tables; the deploy polled each table's status until its initial load finished (`ONLINE`); the
+migration then applied the app role, schema grants, indexes, and a per-table consumer view; the app
+role could read through its view (and was denied on the base table); and a copy-on-write branch test
+left production untouched.
 
 Build on the Autoscaling projects model (`databricks postgres` CLI / `databricks_postgres_*`
 Terraform); standalone database instances are legacy.
@@ -46,10 +49,15 @@ cannot be joined, and its default privileges cannot be changed — not even by a
 
 The supported path needs no superuser — use a consumer view:
 
-1. The identity that **creates** the synced table automatically owns it and is granted `SELECT`.
+1. The identity that **creates** the synced table automatically owns it and is granted `SELECT` on
+   the writer-owned base table — in fact `SELECT WITH GRANT OPTION`.
 2. That same identity runs Liquibase, so it can `CREATE OR REPLACE VIEW` over the synced table.
-3. Because it **owns the view**, it can grant consumers `SELECT` on the view. Consumers read the
-   view, never the base table.
+3. Because it **owns the view**, it can grant consumers `SELECT` on the view. The app role gets
+   **schema `USAGE` + `SELECT` on the view only** — never a grant on the base table. So "consumers
+   read the view, never the base table" is literally enforced: verified live, the app role's
+   `SELECT` on the base table is **denied** (`permission denied for table`), while
+   `SET ROLE <app_role>; SELECT ... FROM <view>` returns rows — the view resolves as its owner (the
+   deploy identity, which holds base `SELECT`), so consumers never need base access.
 
 ```sql
 CREATE OR REPLACE VIEW <schema>.<table>_v AS SELECT * FROM <schema>.<table>;
@@ -57,9 +65,12 @@ GRANT USAGE  ON SCHEMA <schema>            TO <app_role>;
 GRANT SELECT ON <schema>.<table>_v         TO <app_role>;
 ```
 
-Keep the creator and the view owner the same identity and no `databricks_superuser` is needed. (A
-direct `GRANT SELECT` on the writer-owned base table is possible, but granting it to a *different*
-identity is the superuser path — the view avoids it.)
+Keep the creator and the view owner the same identity and no `databricks_superuser` is needed.
+Because the creating identity holds `SELECT WITH GRANT OPTION` on the writer-owned base table, it
+*could* grant base-table `SELECT` onward directly — a non-superuser creating identity can do this,
+it is not a superuser-only operation. This reference deliberately does not: consumers depend only on
+the view, which the view's owner resolves against the base table it can already read. The view is
+for decoupling and row filtering, not to work around a grant limitation.
 
 ### Row-level filtering (RLS is off the table — use the view)
 
@@ -98,10 +109,12 @@ it's for isolation, keep it. The point is to choose deliberately, not by default
 Build indexes *after* the initial load, in one pipeline: Terraform creates the synced table → wait
 for `ONLINE` → Liquibase builds the indexes. One pipeline, no forgotten second PR.
 
-Make index DDL idempotent (`CREATE INDEX IF NOT EXISTS`) and use `CREATE INDEX CONCURRENTLY` on a
-large live table so reads don't block. A Liquibase changeset is tracked in `DATABASECHANGELOG` and
-runs once — but see the next section for why the index changeset should be `runAlways:true` so it
-rebuilds after a table replace.
+Make index DDL idempotent (`CREATE INDEX IF NOT EXISTS`). This reference intentionally does **not**
+use `CREATE INDEX CONCURRENTLY`: `CONCURRENTLY` cannot run inside the single-transaction reconcile
+both paths use, so both emit plain `CREATE INDEX IF NOT EXISTS`. If you need a non-blocking build on
+a large live table, run that `CREATE INDEX CONCURRENTLY` as a separate, outside-transaction step of
+your own. A Liquibase changeset is tracked in `DATABASECHANGELOG` and runs once — but see the next
+section for why the index changeset should be `runAlways:true` so it rebuilds after a table replace.
 
 ## Keeping access through refreshes and rebuilds
 
@@ -115,12 +128,16 @@ Verified across all three sync modes (Snapshot, Triggered, Continuous):
   **`runAlways:true`**. With `runOnChange`, the redeploy sees unchanged checksums, skips, and leaves
   the app without access. `runAlways` + idempotent SQL (`GRANT`, `CREATE INDEX IF NOT EXISTS`,
   `CREATE OR REPLACE VIEW`) is what keeps access intact after a rebuild.
-  - This self-heal assumes the replace itself **succeeds**. When a dependent consumer view exists,
-    an in-place replace is **blocked**: the replace drops the base table, and Postgres will not drop a
-    table that still has a dependent view (non-`CASCADE` dependency), so the drop fails, the recreate
-    never happens, and the `runAlways` migration never runs to restore access. A plain redeploy does
-    **not** self-heal in that case — the view must be dropped first, or the swap done side-by-side.
-    See "Changing sync mode: prefer a blue/green swap" below.
+  - This self-heal assumes the replace itself **succeeds** — and for a sync-mode change on a table
+    that already has a consumer view, it may not. In a live repro the in-place sync-mode change
+    **wedged** the synced table: the platform `DELETE` returned an error and left the table in
+    `SYNCED_TABLE_OFFLINE_FAILED`, a state a **redeploy cannot clear** (it matches a known platform
+    incident). The `runAlways` migration never gets a healthy table to reapply against, so a plain
+    redeploy does **not** recover it. In the repro, recovery required deleting and recreating the
+    branch; on a real project, **open a support case**. Mechanically the view dependency is what
+    blocks the base-table drop, but the operational takeaway is simple: do **not** attempt an
+    in-place sync-mode change on a table that has a consumer view. Use a **blue/green swap** instead —
+    see "Changing sync mode: prefer a blue/green swap" below.
 
 Treat a sync-mode change as a planned rebuild, not a live toggle — and pick Triggered/Continuous at
 create time if row-incremental is the goal, since flipping mode on a live table forces the replace above.
@@ -137,10 +154,20 @@ a new table beside the old one rather than replace in place:
 3. Cut consumers over to the new table (or its view).
 4. Remove the old entry and deploy again to drop the old table — during a maintenance window.
 
-This never deletes a live table, so there is no availability gap. If you instead replace in place,
-**drop the consumer view first**: the replace deletes the base table, and Postgres will not drop a
-table that still has a dependent view, so the view must be removed before the replace and recreated by
-the `runAlways` migration afterward. Blue/green avoids that dependency step entirely.
+This never deletes a live table, so there is no availability gap. Blue/green is the **only
+recommended path for a sync-mode change**: an in-place replace of a table that has a consumer view
+was observed to **wedge** the synced table (`SYNCED_TABLE_OFFLINE_FAILED`) with no redeploy recovery,
+and dropping the consumer view first is **not** a safe workaround — it destroys the view's grants,
+opens an availability gap, and still risks the wedge.
+
+Two operational notes for the swap:
+
+- The **old** config entry must be given a **different `view_name`** (or be removed) **before** the
+  new entry takes over the stable view name — otherwise both entries resolve to the same consumer
+  view name. The generator now **fails loudly** when two entries resolve to the same consumer view
+  name.
+- **Nothing in either path drops the old view.** Retiring the old synced table and its view is a
+  manual step (step 4 above), done in a maintenance window.
 
 ## Branch-per-PR (ephemeral test environments)
 
@@ -204,9 +231,10 @@ VIEW`) that the Workflow job applies **on every deploy**, and that `python -m da
 applies outside the job. Because there is no version-tracking state, re-applying is a clean
 reconciling no-op — never a duplicate-key rollback on a second apply. That is what lets access
 self-heal after a synced-table replace, exactly like Liquibase `runAlways:true`. The same caveat
-applies: this self-heal assumes the replace itself succeeds, so when a dependent consumer view
-blocks the in-place drop, drop the view first (or do a blue/green swap) — see "Changing sync mode:
-prefer a blue/green swap" above.
+applies: this self-heal assumes the replace itself succeeds — and an in-place sync-mode change on a
+table that has a consumer view can **wedge** it (see the caveat above), which a redeploy cannot
+recover. Use a **blue/green swap** for a sync-mode change — see "Changing sync mode: prefer a
+blue/green swap" above.
 
 The renderer is the **single source of the idempotent SQL**: the Liquibase generator
 (`liquibase/generate_changelogs.py`) imports the same four helpers (`role_guard_sql`,

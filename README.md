@@ -101,23 +101,31 @@ cannot join that role or change its default privileges, not even as a superuser.
 The supported path uses two facts:
 
 - The managed writer role owns the synced base table, and the deploy identity that creates it is
-  granted `SELECT` on it.
+  granted `SELECT` on it — in fact `SELECT WITH GRANT OPTION`.
 - That same identity runs the migration, so it can `CREATE OR REPLACE VIEW` over the synced table.
-  Because it owns the view, it can grant consumers `SELECT` on the view.
+  Because it owns the view, it can grant consumers `SELECT` on the view. The app role gets schema
+  `USAGE` plus `SELECT` on the view only — never a grant on the base table.
 
-Consumers read the view, not the base table. Access is granted on an object the deploy identity
-owns. It never depends on a privilege no user can hold, and no `databricks_superuser` is needed.
+Consumers read the view, not the base table — and this is literally enforced: the app role's
+`SELECT` on the base table is denied, while reads through the view succeed (the view resolves as its
+owner, the deploy identity, which holds base `SELECT`). Access is granted on an object the deploy
+identity owns. It never depends on a privilege no user can hold, and no `databricks_superuser` is
+needed. The deploy identity *could* grant base-table `SELECT` onward directly — it holds `WITH GRANT
+OPTION`, so this is not a superuser-only operation — but this reference deliberately does not: the
+view exists for decoupling and row filtering, not to work around a grant limitation.
 
 The grant, index, and view steps run on every deploy. They are reapplied after a table replace, so
 access comes back on the next run.
 
 ### One caveat about self-healing
 
-Reapply-on-every-deploy only restores access if the table replace succeeds. When a consumer view
-depends on the table, an in-place replace is blocked. Postgres will not drop a table that still has
-a dependent view. So the drop fails, the recreate never happens, and the reapply step never runs.
-A plain redeploy does not self-heal in that case. Drop the view first, or stand up the new table
-beside the old one and swap. See `docs/DESIGN-NOTES.md`, "Changing sync mode: prefer a blue/green
+Reapply-on-every-deploy only restores access if the table replace succeeds. For a **sync-mode
+change** on a table that already has a consumer view, it may not: in a live repro the in-place
+change **wedged** the synced table (`SYNCED_TABLE_OFFLINE_FAILED`), a state a redeploy could not
+clear, so the reapply step never ran. A plain redeploy does not self-heal in that case. Use a
+**blue/green swap** for a sync-mode change — stand up the new table beside the old one and cut over.
+Dropping the consumer view first is not a safe workaround: it destroys grants, opens an availability
+gap, and still risks the wedge. See `docs/DESIGN-NOTES.md`, "Changing sync mode: prefer a blue/green
 swap."
 
 ---
@@ -146,7 +154,8 @@ The pipeline is four ordered steps, run the same way by hand (`scripts/deploy.sh
    (`liquibase/generated/<name>.changelog.sql`, produced from `config/tables.json` by
    `liquibase/generate_changelogs.py`), in order:
    - `001-app-role` — an idempotent read-only app role.
-   - `002-app-grants` — explicit `GRANT USAGE` and `GRANT SELECT` on the writer-owned synced table.
+   - `002-app-grants` — `GRANT USAGE` on the schema for the app role (no base-table grant; the app
+     role's `SELECT` is on the view, granted in `004-app-view`).
    - `003-index-<col>` — `CREATE INDEX IF NOT EXISTS`, one changeset per `index_columns` entry, after the load.
    - `004-app-view` — a consumer view owned by the deploy identity, with the grant on the view.
 
@@ -194,9 +203,10 @@ extends the generator. Field-by-field reference: `config/README.md`.
 # creates an ephemeral copy-on-write branch, runs your migration against it, then you delete it
 ```
 
-Two concerns, two tools. For load speed, load first and index after (`CREATE INDEX CONCURRENTLY` so
-apps do not block). For a risky rebuild, drop, or move, test on an ephemeral branch, then promote.
-Do not use one to solve the other.
+Two concerns, two tools. For load speed, load first and index after — this reference uses
+`CREATE INDEX IF NOT EXISTS`; it does not use `CREATE INDEX CONCURRENTLY`, which cannot run inside
+the single-transaction reconcile. For a risky rebuild, drop, or move, test on an ephemeral branch,
+then promote. Do not use one to solve the other.
 
 ### How to run
 
@@ -244,7 +254,7 @@ The renderer's output and the Liquibase changelog line up one to one:
 | Liquibase changeset (generated per table) | Renderer equivalent (`dabs/render_ddl.py`) |
 |---|---|
 | `001-app-role` | `role_guard_sql` — idempotent `CREATE ROLE` via a `pg_roles` existence guard |
-| `002-app-grants` | `grant_statements` — `GRANT USAGE` on schema + `GRANT SELECT` on the synced table |
+| `002-app-grants` | `grant_statements` — `GRANT USAGE` on the schema only (no base-table SELECT; the app role reads through the view) |
 | `003-indexes` (generated as one `003-index-<col>` changeset per `index_columns` entry) | `index_statements` — `CREATE INDEX IF NOT EXISTS` per `index_columns` (handles 0/1/N) |
 | `004-app-view` | `view_statements` — `CREATE OR REPLACE VIEW` + `GRANT SELECT` on the view |
 
@@ -273,8 +283,8 @@ v1.132.0, Terraform v1.16.2, Liquibase 4.33.0):
   previous copy until the new load finishes. Indexes and grants survive.
 - A sync-mode CHANGE forces a full replace that drops indexes and grants down to the primary key.
   This is why the grant, index, and view changesets are `runAlways:true`. Treat a mode change as a
-  planned rebuild, not a routine operation. See the self-healing caveat above for the case where a
-  dependent view blocks an in-place replace.
+  planned rebuild, not a routine operation. See the self-healing caveat above for why an in-place
+  sync-mode change can wedge a table that has a dependent view.
 - `ALTER DEFAULT PRIVILEGES` on the writer role is denied by design. The explicit-grants plus
   consumer-view pattern is the supported alternative.
 - Copy-on-write branches isolate risk. A destructive migration on an ephemeral branch, such as
