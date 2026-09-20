@@ -203,7 +203,10 @@ It is **not** a migration framework and keeps **no version table**: it emits **i
 VIEW`) that the Workflow job applies **on every deploy**, and that `python -m dabs.render_ddl | psql`
 applies outside the job. Because there is no version-tracking state, re-applying is a clean
 reconciling no-op — never a duplicate-key rollback on a second apply. That is what lets access
-self-heal after a synced-table replace, exactly like Liquibase `runAlways:true`.
+self-heal after a synced-table replace, exactly like Liquibase `runAlways:true`. The same caveat
+applies: this self-heal assumes the replace itself succeeds, so when a dependent consumer view
+blocks the in-place drop, drop the view first (or do a blue/green swap) — see "Changing sync mode:
+prefer a blue/green swap" above.
 
 The renderer is the **single source of the idempotent SQL**: the Liquibase generator
 (`liquibase/generate_changelogs.py`) imports the same four helpers (`role_guard_sql`,

@@ -38,6 +38,6 @@ The DABs lead (ADR 0005) needs three mechanics settled: how migrations run, how 
   exchange, not network ingress. Fixes: IT-managed/self-hosted runner with stable egress, allowlisted
   egress, or an internally-triggered Workflow if GHA workspace access must be eliminated.
 - Adding a table stays a one-line `config/tables.json` edit; the codegen step keeps DABs in sync.
-- **Acceptance (not yet done):** must be verified end-to-end on FEVM (`lakebase-cicd-ref`) — including
+- **Acceptance (not yet done):** must be verified end-to-end against a live Lakebase instance — including
   the synced-table replace → reapply test — before the README claims "live-tested." (Status flips to
   done only with command evidence.)

@@ -8,7 +8,7 @@ once per table, passing per-table values as Liquibase properties (`-Dsynced_tabl
 folds the substituted property values into the changeset checksum. So two tables in the SAME
 `app_schema` shared ONE `DATABASECHANGELOG`, and the second table tripped
 `ValidationFailedException` on `001-app-role` (same FILENAME+id+author as the first table, but a
-different checksum) — its role and grants were never created. Proven live on FEVM.
+different checksum) — its role and grants were never created. Verified against a live Lakebase instance.
 
 That same shared changelog also forced the index step through a fixed TWO-slot template
 (`${index_col_1}`/`${index_col_2}`), silently capping `index_columns` at 2.
@@ -31,7 +31,6 @@ once per table.
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +47,7 @@ if str(_REPO_ROOT) not in sys.path:
 from dabs.render_ddl import (  # noqa: E402  (path insertion must precede this import)
     grant_statements,
     index_statements,
+    load_tables,
     pg_table_name,
     role_guard_sql,
     validate_identifier,
@@ -63,17 +63,9 @@ _GENERATED_HEADER = (
 )
 
 
-def load_tables(config_path: str | Path) -> list[dict]:
-    """Read the single-source-of-truth tables config as a list of dicts."""
-    with Path(config_path).open() as fh:
-        tables = json.load(fh)
-    if not isinstance(tables, list):
-        raise ValueError(f"{config_path}: expected a JSON array of table objects")
-    return tables
-
-
-# `validate_identifier` and `pg_table_name` are imported from dabs.render_ddl (the single home
-# shared with the DABs path); they remain part of this module's public surface via that import.
+# `load_tables`, `validate_identifier`, and `pg_table_name` are imported from dabs.render_ddl (the
+# single home shared with the DABs path); they remain part of this module's public surface via that
+# import. `load_tables` lives in one place so both engines read config identically.
 
 
 def changelog_filename(table: dict) -> str:

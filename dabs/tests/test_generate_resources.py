@@ -123,7 +123,7 @@ def test_every_synced_table_has_valid_scheduling_policy_defaulting_snapshot(tmp_
     """Every emitted synced table carries a `scheduling_policy` in the bundle-schema enum, and a
     row that OMITS the field defaults to SNAPSHOT.
 
-    `bundle deploy` against real FEVM failed with 'Unsupported scheduling policy: None' because the
+    `bundle deploy` against a live Lakebase instance failed with 'Unsupported scheduling policy: None' because the
     codegen omitted this required field (the strict schema allows omitting it; the create API
     rejects it). Enum verified against `databricks bundle schema`, CLI v1.14.1
     (postgres.SyncedTableSyncedTableSpecSyncedTableSchedulingPolicy): CONTINUOUS|TRIGGERED|SNAPSHOT.
@@ -209,7 +209,7 @@ def test_each_synced_table_carries_branch_var_reference(tmp_path):
 
     The synced table must place on the SAME Lakebase branch the target selects (the var the role's
     `parent` already uses), or dev/prod targets can't separate synced-table placement and an
-    ephemeral-branch test can't isolate. This is the load-bearing ticket-04 pre-flight finding.
+    ephemeral-branch test can't isolate. This is the load-bearing live pre-flight finding.
 
     Guards the mutation: dropping the `branch` emission from build_synced_table_resource() makes
     `branch` missing -> red. A literal branch path (e.g. "projects/…/branches/…") instead of the

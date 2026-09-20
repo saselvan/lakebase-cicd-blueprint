@@ -1,6 +1,6 @@
 """Falsifiability tests — codegen: config/tables.json -> one Liquibase changelog PER table.
 
-The bug this generator fixes (proven live on FEVM, see .scratch repro): the old path ran ONE
+The bug this generator fixes (reproduced against a live Lakebase instance): the old path ran ONE
 shared changelog (`db.changelog-master.xml`) once per table via property substitution
 (`-Dsynced_table=…`). Liquibase keys a changeset by (FILENAME, id, author) and folds the
 substituted values into the checksum, so two tables in the SAME app_schema shared one
@@ -127,7 +127,7 @@ def test_one_changelog_file_per_config_row(tmp_path):
 
 def test_shared_schema_tables_get_distinct_changeset_identities(tmp_path):
     """`members` and `claims` share app_schema 'shared_schema' but must have DISTINCT changeset
-    identities so they never collide in one DATABASECHANGELOG (the live FEVM bug).
+    identities so they never collide in one DATABASECHANGELOG (the bug reproduced against a live Lakebase instance).
 
     A lazy impl that writes both tables into ONE shared changelog file gives them the SAME FILENAME,
     so their identical (author, id) pairs (e.g. cicd:001-app-role) collide -> this goes red.

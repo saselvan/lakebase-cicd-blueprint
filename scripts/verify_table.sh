@@ -17,10 +17,10 @@
 # Sourced by scripts/deploy.sh; also runnable standalone (and by the tests):
 #   scripts/verify_table.sh ROLE SCHEMA PG_TABLE VIEW [INDEX_COL ...]
 
-# _vs QUERY -- run a single-cell psql query and print the trimmed scalar. On any psql error the
+# _scalar QUERY -- run a single-cell psql query and print the trimmed scalar. On any psql error the
 # result is the empty string (stderr suppressed), which FAILS the assertion below instead of
 # passing it: the whole point of the fix is that the result is inspected, never `|| true`-swallowed.
-_vs() {
+_scalar() {
   local out
   out="$(psql -tAqc "$1" 2>/dev/null)" || out=""
   printf '%s' "$out" | tr -d '[:space:]'
@@ -30,7 +30,7 @@ _vs() {
 # and returns non-zero on FAIL. Callers count failures; nothing is swallowed.
 _expect_t() {
   local label="$1" got
-  got="$(_vs "$2")"
+  got="$(_scalar "$2")"
   if [ "$got" = "t" ]; then
     echo "  PASS $label"
     return 0
