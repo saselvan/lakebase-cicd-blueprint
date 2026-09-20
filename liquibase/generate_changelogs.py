@@ -19,7 +19,7 @@ ADR 0004): read `config/tables.json` and write ONE Liquibase formatted-SQL chang
 
   * a per-table FILE => a UNIQUE changeset identity (distinct FILENAME) even when tables share a
     schema and one DATABASECHANGELOG => no cross-table checksum collision;
-  * N index changesets straight from `index_columns` (0/1/N) => no 2-slot cap (fixes finding E);
+  * N index changesets straight from `index_columns` (0/1/N) => no two-column cap;
   * changesets stay idempotent + runAlways, so a synced-table replace reapplies grants/indexes/view.
 
 The generated changelogs are CHECKED INTO the repo; `--check` is a byte-for-byte drift guard
@@ -151,7 +151,7 @@ def build_changesets(table: dict) -> list[Changeset]:
     changesets: list[Changeset] = []
 
     # 001 — app role. Guarded so a fresh instance rebuild is safe. splitStatements:false: the DO
-    # block has internal semicolons and must be sent as ONE statement. runOnChange:true (fix R3):
+    # block has internal semicolons and must be sent as ONE statement. runOnChange:true here:
     # Liquibase folds this formatted-SQL body — INCLUDING its `-- ` comment lines — into the
     # changeset checksum, so any future reword of role_guard_sql or these comments would flip the
     # checksum and fail validation on every EXISTING deploy under the default runOnChange:false.

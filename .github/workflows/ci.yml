@@ -106,9 +106,9 @@ jobs:
   # State-level proofs against a real Docker PostgreSQL — no cloud, no Lakebase, no secrets.
   # Each script asserts on actual database state (roles, grants, indexes, views) so the fixed
   # migration bug classes cannot silently regress:
-  #   - multi-table shared-schema changeset identity (per-table changelogs; fix A)
-  #   - renderer double-apply idempotency, no version-table rollback (fix B)
-  #   - deploy verify step actually fails on a missing grant/index (fix C)
+  #   - multi-table shared-schema changeset identity (per-table changelogs)
+  #   - renderer double-apply idempotency, no version-table rollback
+  #   - deploy verify step actually fails on a missing grant/index
   # Ubuntu runners ship Docker and Java; the proofs stay OUT of pytest so the offline suite is
   # Docker-free. Run the same scripts locally with `bash <path>`.
   docker-proofs:

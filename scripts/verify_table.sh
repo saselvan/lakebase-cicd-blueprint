@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/verify_table.sh -- step 4 of the pipeline, factored out so it is INDEPENDENTLY testable.
 #
-# The bug this fixes (finding C): scripts/deploy.sh step 4 used to run its psql checks as
+# The bug this fixes: scripts/deploy.sh step 4 used to run its psql checks as
 # `psql ... 2>&1 || true` and NEVER inspect the output. So `has_table_privilege(...)` could return
 # 'f' (or an index could be missing) and the pipeline still printed success and exited 0. The
 # README/RUNBOOK sell step 4 as THE guarantee that the app role can read and the indexes exist, but

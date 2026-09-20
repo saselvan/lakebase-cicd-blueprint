@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Docker postgres:16 DOUBLE-APPLY proof for the DABs renderer (fix B) — the exact case that failed.
+# Docker postgres:16 DOUBLE-APPLY proof for the DABs renderer — the exact case that failed.
 #
 # The bug (verified on Docker PG16): the old alembic-rendered reconcile rolled the whole transaction
 # back on the SECOND apply once a second Alembic revision existed — its unguarded `alembic_version`
@@ -72,7 +72,7 @@ render() { "$PY" -m dabs.render_ddl --config "$CONFIG"; }
 ( cd "$REPO_ROOT" && render >/tmp/lkb_render_ddl.sql )
 echo "--- rendered $(grep -c ';' /tmp/lkb_render_ddl.sql) statements (no alembic_version below) ---"
 if grep -qi "alembic_version" /tmp/lkb_render_ddl.sql; then
-  echo "ERROR: rendered SQL contains alembic_version — fix B regressed" >&2; exit 1
+  echo "ERROR: rendered SQL contains alembic_version — the version-table-free renderer regressed" >&2; exit 1
 fi
 
 echo "--- APPLY #1 ---"

@@ -1,4 +1,4 @@
-"""Single source of the idempotent reconciling DDL — the DABs migration renderer (fix B).
+"""Single source of the idempotent reconciling DDL — the DABs migration renderer.
 
 `config/tables.json` in, idempotent SQL out. For every configured table this emits the SAME four
 object groups the Liquibase changelog does — a guarded app role, explicit grants, one index per
@@ -100,7 +100,7 @@ _RESERVED_WORDS = frozenset({
 
 
 def validate_identifier(name, kind: str = "identifier") -> str:
-    """Single identifier-validation home for BOTH migration paths (fix D).
+    """Single identifier-validation home for BOTH migration paths.
 
     Accepts ONLY a safe unquoted Postgres identifier: a non-empty string matching
     ``^[a-z_][a-z0-9_]*`` of at most 63 characters, and NOT a reserved SQL word. Every identifier
@@ -135,7 +135,7 @@ def validate_identifier(name, kind: str = "identifier") -> str:
 
 
 def validate_derived_name(name: str, kind: str, source_hint: str = "") -> str:
-    """Length-check a name DERIVED from already-validated parts (fix R2).
+    """Length-check a name DERIVED from already-validated parts.
 
     ``validate_identifier`` caps each INPUT part (app_role, app_schema, pg-table name, index column)
     at 63 chars, but the builders EMIT derived names — the index name ``idx_<tbl>_<col>`` and the
@@ -214,7 +214,7 @@ def index_statements(app_schema: str, synced_table: str, index_columns: list) ->
     """One idempotent index per configured column — zero columns emit zero statements (no cap).
     CREATE INDEX IF NOT EXISTS => a no-op on a normal deploy, rebuilt after a synced-table replace.
 
-    The derived index name ``idx_<tbl>_<col>`` is length-checked (fix R2): both parts are
+    The derived index name ``idx_<tbl>_<col>`` is length-checked: both parts are
     individually legal, but their concatenation can exceed 63 chars and would be silently truncated
     by Postgres, breaking the later verify step — so we reject it here at generation time."""
     statements = []

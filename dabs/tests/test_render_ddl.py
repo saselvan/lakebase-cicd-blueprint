@@ -1,4 +1,4 @@
-"""Falsifiability tests for the DABs migration RENDERER (fix B).
+"""Falsifiability tests for the DABs migration RENDERER.
 
 The DABs migration reconcile no longer uses Alembic or an `alembic_version` table. A single
 Python renderer module (`dabs/render_ddl.py`) emits the idempotent reconciling DDL directly from
@@ -200,12 +200,12 @@ def test_render_rejects_malformed_config(tmp_path):
         rd.render_ddl(rd.load_tables(bad))
 
 
-# --- 4b. fix D: reject UNSAFE identifiers (not just empty) at the shared seam -------------------
+# --- 4b. reject UNSAFE identifiers (not just empty) at the shared seam --------------------------
 #
 # Every identifier baked into DDL is interpolated straight into SQL, so a hyphenated / reserved /
 # oversized / uppercase value would break the SQL or be an injection vector. The seam accepts ONLY
 # safe unquoted Postgres identifiers (lowercase snake_case, <=63 chars) and rejects a curated set of
-# reserved words. These fixtures are the reviewer's mutations for fix D.
+# reserved words. These fixtures are the hostile mutations for the identifier seam.
 
 HOSTILE_HYPHEN = "Plan-Code"          # hyphen — not a legal unquoted identifier / injection shape
 HOSTILE_RESERVED = "user"             # a reserved word that MATCHES the safe regex
@@ -276,7 +276,7 @@ def test_render_rejects_hostile_pg_table_name(tmp_path):
 
 def test_committed_hostile_fixture_is_rejected():
     """The committed hostile fixture (a hyphenated `Plan-Code` index column) must be rejected by the
-    renderer — a durable hostile artifact for the fix D seam."""
+    renderer — a durable hostile artifact for the identifier-validation seam."""
     with pytest.raises(ValueError):
         rd.render_ddl(rd.load_tables(HOSTILE_FIXTURE))
 

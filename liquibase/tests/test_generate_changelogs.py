@@ -333,14 +333,14 @@ def test_role_schema_table_values_are_baked_per_table(tmp_path):
         assert f"{row['app_schema']}.{pg_table}_v" in text, f"{row['name']}: consumer view missing"
 
 
-# --- 5. identifier-validation seam (fix D's future home — structural only for now) -------------
+# --- 5. identifier-validation seam (the home for the strict identifier rules) -----------------
 
 
 def test_identifier_validation_seam_exists_and_rejects_empty():
-    """A single identifier-validation home exists in the generator (the future home for fix D's
-    strict rules). For fix A it need only be a real, called seam that rejects an empty/None
+    """A single identifier-validation home exists in the generator (the home for the strict
+    identifier rules). At minimum it must be a real, called seam that rejects an empty/None
     identifier so malformed config fails loudly rather than emitting broken DDL."""
-    assert hasattr(gen, "validate_identifier"), "generator must expose validate_identifier (fix D seam)"
+    assert hasattr(gen, "validate_identifier"), "generator must expose validate_identifier (the identifier seam)"
     for bad in ["", None]:
         try:
             gen.validate_identifier(bad, "app_role")
@@ -364,7 +364,7 @@ def test_malformed_config_is_rejected(tmp_path):
     raise AssertionError("generation accepted a row with an empty app_role")
 
 
-# --- 5b. fix D: the SHARED seam rejects UNSAFE identifiers in the Liquibase path too -----------
+# --- 5b. the SHARED seam rejects UNSAFE identifiers in the Liquibase path too ------------------
 #
 # validate_identifier is imported from dabs.render_ddl (ONE home), so tightening it there tightens
 # BOTH paths at once. These prove the Liquibase generator refuses to bake a hyphenated / reserved /
