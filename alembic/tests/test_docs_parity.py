@@ -14,21 +14,21 @@ DESIGN = (REPO / "docs" / "DESIGN-NOTES.md").read_text()
 # mapped in the README parity table.
 CHANGESETS = ["001-app-role", "002-app-grants", "003-indexes", "004-app-view"]
 
-SECTION_MARKER = "## Alembic (Python) alternative"
+SECTION_MARKER = "## Migration engines: Alembic and Liquibase"
 
 
 def _alembic_section() -> str:
     """The README's Alembic section only (up to the next top-level heading), so parity
     assertions are scoped to the parity table — not to changeset names that also appear
     elsewhere in the README (e.g. the pattern section)."""
-    assert SECTION_MARKER in README, "README missing the Alembic section"
+    assert SECTION_MARKER in README, "README missing the migration engines section"
     rest = README.split(SECTION_MARKER, 1)[1]
     nxt = rest.find("\n## ")
     return rest if nxt == -1 else rest[:nxt]
 
 
 def test_readme_has_alembic_section():
-    assert SECTION_MARKER in README, "README missing the Alembic (Python) alternative section"
+    assert SECTION_MARKER in README, "README missing the migration engines (Alembic + Liquibase) section"
 
 
 def test_parity_table_maps_all_four_changesets():
