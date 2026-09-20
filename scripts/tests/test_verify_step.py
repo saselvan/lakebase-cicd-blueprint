@@ -30,12 +30,14 @@ DEPLOY_SH = REPO_ROOT / "scripts" / "deploy.sh"
 # A stub `psql` that ignores the database and returns a controlled scalar per query kind, driven by
 # STUB_* env vars (default 't'). It inspects the SQL (the last positional arg, i.e. the `-c` text).
 _STUB_PSQL = r"""#!/usr/bin/env bash
+# Default to 't' only when the STUB_* var is UNSET (`-`, not `:-`), so a test can set it to the
+# empty string to simulate a psql error whose output is empty.
 sql="${@: -1}"
 case "$sql" in
-  *pg_roles*)             printf '%s\n' "${STUB_ROLE_EXISTS:-t}" ;;
-  *pg_views*)             printf '%s\n' "${STUB_VIEW_EXISTS:-t}" ;;
-  *has_table_privilege*)  printf '%s\n' "${STUB_CAN_SELECT:-t}" ;;
-  *pg_indexes*)           printf '%s\n' "${STUB_INDEX_EXISTS:-t}" ;;
+  *pg_roles*)             printf '%s\n' "${STUB_ROLE_EXISTS-t}" ;;
+  *pg_views*)             printf '%s\n' "${STUB_VIEW_EXISTS-t}" ;;
+  *has_table_privilege*)  printf '%s\n' "${STUB_CAN_SELECT-t}" ;;
+  *pg_indexes*)           printf '%s\n' "${STUB_INDEX_EXISTS-t}" ;;
   *)                      printf '\n' ;;
 esac
 """
@@ -126,4 +128,6 @@ def test_deploy_sources_verify_and_dropped_the_swallowing_check():
     assert "has_table_privilege" not in deploy, (
         "the swallowing inline verify must be gone from deploy.sh (moved into verify_table.sh)"
     )
-    assert "|| true" not in deploy, "step 4 must no longer swallow the verify result with || true"
+    assert "2>&1 || true" not in deploy, (
+        "step 4 must no longer swallow the verify result with the old `2>&1 || true` pattern"
+    )

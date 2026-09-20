@@ -144,7 +144,9 @@ The pipeline is four ordered steps, run the same way by hand (`scripts/deploy.sh
 
    A distinct changelog file per table gives each changeset a distinct identity, so two tables that
    share one `app_schema` never collide in a shared `DATABASECHANGELOG`.
-4. Verify. The app role can `SELECT`, and the indexes exist.
+4. Verify. Asserts the app role can `SELECT` the consumer view and every expected index exists, and
+   **fails the pipeline** (non-zero exit) if any post-condition is missing. Factored into
+   `scripts/verify_table.sh` so it is independently testable (see `scripts/tests/`).
 
 The grant, index, and view changesets are `runAlways:true`, so they reapply on every deploy. See
 the self-healing caveat above for the one case where a plain redeploy does not restore access.

@@ -5,7 +5,8 @@
 #   then FOR EACH table in config/tables.json:
 #   2. wait_for_sync          -> block until the initial load is ONLINE (so indexes come after)
 #   3. liquibase update       -> that table's OWN changelog: app role + grants + indexes + view
-#   4. verify                 -> app role can SELECT, indexes exist
+#   4. verify                 -> asserts app role can SELECT the consumer view + indexes exist;
+#                                 exits NON-ZERO (fails the pipeline) if any post-condition is unmet
 #
 # Single source of truth: config/tables.json (also read by terraform/main.tf and the changelog
 # generator). Add a table there and it is provisioned AND migrated by this one script — no code
@@ -22,6 +23,11 @@ HOST="${HOST:?set HOST to your Lakebase read-write endpoint host}"
 PGUSER="${PGUSER:?set PGUSER to your Databricks username (email)}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG="$ROOT/config/tables.json"
+
+# Step 4 "verify" lives in its own file so it can assert real post-conditions and be tested against
+# a real Docker Postgres without a full terraform+liquibase run (scripts/tests/*verify*).
+# shellcheck source=scripts/verify_table.sh
+. "$ROOT/scripts/verify_table.sh"
 
 echo "== 1. terraform apply (for_each creates all tables in config/tables.json) =="
 ( cd "$ROOT/terraform" && terraform init -input=false >/dev/null && terraform apply -auto-approve -input=false )
@@ -49,6 +55,9 @@ emit("T_NAME",   t["name"])
 emit("T_STID",   t["synced_table_id"])
 emit("T_SCHEMA", t["app_schema"])
 emit("T_ROLE",   t["app_role"])
+# index columns as a shell array (0/1/N), each shlex-quoted -> read straight into T_IDX=(...)
+cols = t.get("index_columns") or []
+print("T_IDX=(" + " ".join(shlex.quote(str(c)) for c in cols) + ")")
 PY
 )"
   PG_TABLE="${T_STID##*.}"   # last part of the 3-part UC name = Postgres table name
@@ -68,9 +77,16 @@ PY
       --url="$URL" --username="$PGUSER" --password="$TOKEN" \
       --liquibase-schema-name="$T_SCHEMA" )
 
-  echo "== 4. verify =="
-  psql -tAc "SELECT has_table_privilege('$T_ROLE','$T_SCHEMA.$PG_TABLE'::regclass,'SELECT') AS app_can_select;" 2>&1 || true
-  psql -tAc "SELECT indexname FROM pg_indexes WHERE schemaname='$T_SCHEMA' AND tablename='$PG_TABLE' ORDER BY 1;" 2>&1 || true
+  # Assert the real post-conditions and FAIL the pipeline if any is unmet: the app role can SELECT
+  # its consumer view, and every expected index exists. verify_table returns non-zero on failure,
+  # so `set -e` aborts here on the first table that does not verify -- the result is no longer
+  # swallowed the way the old `2>&1`-and-ignore inline psql checks were.
+  # ${#T_IDX[@]} guards the empty-array expansion for a table with zero index_columns (bash 3.2).
+  if [ "${#T_IDX[@]}" -gt 0 ]; then
+    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "${PG_TABLE}_v" "${T_IDX[@]}"
+  else
+    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "${PG_TABLE}_v"
+  fi
 done
 
 echo ""
