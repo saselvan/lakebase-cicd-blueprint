@@ -1,0 +1,119 @@
+# Lakebase CI/CD — DABs variant (the documented lead; Terraform+Liquibase is the portable alt).
+#
+# REQUIRES Databricks CLI >= 1.5.0. The Lakebase DAB resource used here (postgres_synced_tables)
+# is BETA and older CLIs do not support it, so this pin is a correctness requirement. (No
+# postgres_roles resource is emitted — the migration owns the app role via a guarded CREATE ROLE,
+# so bundle destroy cannot drop the role out from under existing grants.) The offline PR CI
+# (ci.yml, `dabs-validate` job) installs a pinned CLI and runs `bundle validate` with no secrets.
+#
+# Resources are GENERATED from the single source of truth config/tables.json by
+# `python -m dabs.generate_resources` into resources/*.yml — re-run codegen after
+# editing tables.json; do not hand-edit the generated files.
+bundle:
+  name: lakebase-cicd-dabs
+
+include:
+  - resources/*.yml
+
+# --- Migration Workflow job -------------------------------------------------------
+# STATIC resource (not table-driven), so it lives inline here rather than under resources/*.yml —
+# which is 100% codegen-owned and drift-checked; a hand-written file there would trip the guard.
+#
+# The task runs dabs/migration_job.py on SERVERLESS Python compute (no Java runtime to install —
+# ADR 0006/D1). At run time it: reads config/tables.json, BLOCKS until every synced table reports
+# ONLINE (ADR 0003), then renders the idempotent reconciling DDL via the shared Python renderer
+# (dabs/render_ddl.py) and applies it via a RUNTIME OAuth token minted inside the workspace (no
+# stored secret). It loops config/tables.json at run time, so adding a table needs no job edit.
+#
+# config/ lives at the repo root (above this bundle root), so sync.paths pulls it into the
+# deployment alongside dabs/. The renderer (dabs/render_ddl.py) syncs as part of dabs/ — there is
+# no separate migration engine directory to sync.
+sync:
+  paths:
+    - .
+    - ../config
+
+resources:
+  jobs:
+    lakebase_migration:
+      name: "lakebase-cicd migration (${bundle.target})"
+      tasks:
+        - task_key: migrate
+          spark_python_task:
+            # Relative to the synced bundle root; migration_job.py syncs from dabs/, i.e. the
+            # entrypoint lands at ${workspace.file_path}/dabs/migration_job.py (render_ddl.py beside it).
+            python_file: ./migration_job.py
+            # The task runs via exec(compile(...)) where __file__ is UNDEFINED, so the entrypoint
+            # can't locate config/ off __file__. We pass its DEPLOYED location explicitly via bundle
+            # interpolation: sync.paths puts config/ at the files root (sibling of dabs/), so
+            # ${workspace.file_path}/config is where it lands. Interpolated at deploy time —
+            # credential-free, no literal path committed.
+            parameters:
+              - "--config"
+              - "${workspace.file_path}/config/tables.json"
+              # The migration connects to the TARGET BRANCH's READ_WRITE compute endpoint — which
+              # supplies BOTH the connection host and the runtime OAuth credential (projects API) —
+              # NOT the instance default endpoint (= production). Without this the job migrates the
+              # wrong branch and raises InvalidSchemaName. No instance name is passed: the credential
+              # is minted from the branch endpoint. Interpolated at deploy time.
+              - "--branch"
+              - "${var.lakebase_branch}"
+          environment_key: migration
+      environments:
+        - environment_key: migration
+          spec:
+            client: "2"
+            # The renderer is stdlib-only (no Alembic, no SQL toolkit). The only runtime deps are
+            # the Postgres driver for the apply and the SDK for the OAuth token + branch endpoint.
+            dependencies:
+              - psycopg[binary]>=3.1
+              - databricks-sdk>=0.133
+      queue:
+        enabled: true
+
+variables:
+  lakebase_branch:
+    description: Lakebase project branch the app roles live on.
+    default: projects/PLACEHOLDER/branches/main
+  lakebase_database:
+    description: Lakebase Postgres database that hosts the synced tables.
+    default: databricks_postgres
+  run_as_sp:
+    description: Service principal (application/client id) that BOTH deploys the prod bundle AND is
+      the prod job run_as. Overridden at deploy time — no real service principal id is committed.
+    default: PLACEHOLDER_SERVICE_PRINCIPAL_APPLICATION_ID
+
+# Environments are selected with `--target dev|prod`; switching targets changes only the
+# deployment mode, never the resources. No workspace host/URL/profile is committed here
+# (public-safe): the workspace binding is supplied at RUNTIME so adopters and forkers use their
+# own auth without editing this file. Pick one:
+#   - a CLI profile:      databricks bundle validate -p my-dev-profile   --target dev
+#   - env auth:           DATABRICKS_HOST=... DATABRICKS_TOKEN=...        databricks bundle validate --target dev
+# Offline PR CI (no secrets) points DATABRICKS_HOST at a localhost stub that answers the one
+# SCIM `Me` call validate makes (see the `dabs-validate` job in .github/workflows/ci.yml +
+# dabs/tests/mock_workspace.py).
+targets:
+  dev:
+    default: true
+    mode: development
+  prod:
+    mode: production
+    # Deploy AND run prod as a fixed service principal, not the person who runs the deploy.
+    #
+    # Two nuances that make this correct for the Lakebase synced-table + consumer-view pattern:
+    #   (i)  The SAME service principal must run the DEPLOY and be the job run_as. The identity that
+    #        creates the synced table is granted SELECT on it, and that SELECT is what lets it OWN
+    #        the consumer view; if a different identity runs the migration it cannot create the view
+    #        (view creation fails). One identity for both steps keeps view creation working.
+    #   (ii) That service principal needs Lakebase project/branch permission (create/replace the
+    #        synced table on the branch), not merely workspace access — grant it on the project.
+    #
+    # run_as is a bundle VARIABLE (${var.run_as_sp}) with a placeholder default, so no real service
+    # principal id is committed to this public reference; the deploy supplies the real id.
+    run_as:
+      service_principal_name: ${var.run_as_sp}
+    workspace:
+      # FIXED, non-user-derived deploy root (production best practice: exactly one copy, in one
+      # place, regardless of who runs the deploy). NOT /Workspace/Users/<current_user>/... — a
+      # user-derived root would scatter prod state per operator. No committed workspace value.
+      root_path: /Workspace/.bundle/${bundle.name}/prod

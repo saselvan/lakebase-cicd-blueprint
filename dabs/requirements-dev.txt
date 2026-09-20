@@ -1,0 +1,4 @@
+# Dev/test dependencies for the DABs codegen (dabs/generate_resources.py + dabs/tests).
+# Offline only — no Databricks workspace or secrets required to run the tests.
+pyyaml==6.0.2
+pytest==9.1.1

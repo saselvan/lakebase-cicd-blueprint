@@ -115,9 +115,32 @@ Verified across all three sync modes (Snapshot, Triggered, Continuous):
   **`runAlways:true`**. With `runOnChange`, the redeploy sees unchanged checksums, skips, and leaves
   the app without access. `runAlways` + idempotent SQL (`GRANT`, `CREATE INDEX IF NOT EXISTS`,
   `CREATE OR REPLACE VIEW`) is what keeps access intact after a rebuild.
+  - This self-heal assumes the replace itself **succeeds**. When a dependent consumer view exists,
+    an in-place replace is **blocked**: the replace drops the base table, and Postgres will not drop a
+    table that still has a dependent view (non-`CASCADE` dependency), so the drop fails, the recreate
+    never happens, and the `runAlways` migration never runs to restore access. A plain redeploy does
+    **not** self-heal in that case — the view must be dropped first, or the swap done side-by-side.
+    See "Changing sync mode: prefer a blue/green swap" below.
 
 Treat a sync-mode change as a planned rebuild, not a live toggle — and pick Triggered/Continuous at
 create time if row-incremental is the goal, since flipping mode on a live table forces the replace above.
+
+### Changing sync mode: prefer a blue/green swap
+
+Because a mode change forces a full replace of the *same* synced table, the safest path is to stand up
+a new table beside the old one rather than replace in place:
+
+1. Add a **new** entry to `config/tables.json` with a **new `synced_table_id`** and the target
+   `scheduling_policy` — leave the existing table running.
+2. Deploy; wait for the new table to reach `ONLINE`; run the migration so its role, grants, indexes,
+   and consumer view are in place.
+3. Cut consumers over to the new table (or its view).
+4. Remove the old entry and deploy again to drop the old table — during a maintenance window.
+
+This never deletes a live table, so there is no availability gap. If you instead replace in place,
+**drop the consumer view first**: the replace deletes the base table, and Postgres will not drop a
+table that still has a dependent view, so the view must be removed before the replace and recreated by
+the `runAlways` migration afterward. Blue/green avoids that dependency step entirely.
 
 ## Branch-per-PR (ephemeral test environments)
 
@@ -156,27 +179,46 @@ Scale to many synced tables from **one config file**, not by copy-pasting resour
 - **Terraform** does `for_each` over `jsondecode(file(".../config/tables.json"))`, so one
   `databricks_postgres_synced_table` block provisions every entry. Adding a table is a one-line
   edit to the JSON — no new resource, no new variable.
-- **The deploy loop** (`scripts/deploy.sh`) reads the same file, runs `terraform apply` once, then
-  iterates the entries: wait-for-`ONLINE` → Liquibase migrate (passing per-table `synced_table`,
-  `app_schema`, `app_role`, and index columns) → verify.
+- **The deploy loop** (`scripts/deploy.sh`) reads the same file, runs `terraform apply` once,
+  generates one Liquibase changelog per table (`liquibase/generate_changelogs.py`), then iterates
+  the entries: wait-for-`ONLINE` → `liquibase update` against that table's OWN changelog → verify.
 
-The Liquibase changesets are already parametrized (`${synced_table}`, `${app_schema}`,
-`${app_role}`), so the same changelog serves every table. **Index columns are the one inherently
-table-specific customization point** — the two-index template in `003-indexes.sql` covers the
-common case (`${index_col_1}`/`${index_col_2}` from each entry's `index_columns`), and a table
-needing a different index shape (more indexes, composite/partial, or a different type) edits that
-changeset directly. Everything else is data in `config/tables.json`.
+Each table gets its OWN generated changelog (`liquibase/generated/<name>.changelog.sql`) with
+role/schema/table and index columns BAKED in — no `${…}` property substitution. This matters:
+Liquibase keys a changeset by (FILENAME, id, author) and folds substituted property values into the
+checksum, so the earlier shared-changelog-run-per-table design collided when two tables shared one
+`app_schema` (one `DATABASECHANGELOG`, second table's `001-app-role` failed its checksum and its role
+was never created). A distinct changelog FILE per table makes each changeset identity distinct, so
+shared-schema tables coexist. **Index columns are the one inherently table-specific spot** — the
+generator emits one `003-index-<col>` changeset per `index_columns` entry (0/1/N, no cap); a table
+needing a different index shape edits its generated changelog. Everything else is data in
+`config/tables.json`.
 
-## Alembic parity (Python teams)
+## The DABs renderer (Python teams)
 
-An `alembic/` variant mirrors the Liquibase changesets from the same `config/tables.json`, so Python
-shops can adopt the pattern in their own tool. Because Alembic tracks a revision as applied-once, the
-`runAlways`-equivalent is achieved differently: the migration emits **idempotent** SQL (a `pg_roles`
-guard around `CREATE ROLE`, `CREATE INDEX IF NOT EXISTS`, `CREATE OR REPLACE VIEW`, and `GRANT`) that a
-deploy renders offline (`alembic upgrade head --sql`) and applies **on every deploy** — it is
-**not gated** by Alembic's version table. That is what lets access self-heal after a synced-table
-replace, exactly like Liquibase `runAlways:true`. Object names come from the same config; index
-columns are the one table-specific spot, as with the Liquibase path.
+The DABs path emits its migration SQL from a small Python renderer (`dabs/render_ddl.py`) that reads
+the same `config/tables.json`, so Python shops can adopt the pattern with no Java/Liquibase runtime.
+It is **not** a migration framework and keeps **no version table**: it emits **idempotent** SQL (a
+`pg_roles` guard around `CREATE ROLE`, `GRANT`, `CREATE INDEX IF NOT EXISTS`, `CREATE OR REPLACE
+VIEW`) that the Workflow job applies **on every deploy**, and that `python -m dabs.render_ddl | psql`
+applies outside the job. Because there is no version-tracking state, re-applying is a clean
+reconciling no-op — never a duplicate-key rollback on a second apply. That is what lets access
+self-heal after a synced-table replace, exactly like Liquibase `runAlways:true`. The same caveat
+applies: this self-heal assumes the replace itself succeeds, so when a dependent consumer view
+blocks the in-place drop, drop the view first (or do a blue/green swap) — see "Changing sync mode:
+prefer a blue/green swap" above.
+
+The renderer is the **single source of the idempotent SQL**: the Liquibase generator
+(`liquibase/generate_changelogs.py`) imports the same four helpers (`role_guard_sql`,
+`grant_statements`, `index_statements`, `view_statements`) and the same `validate_identifier`, then
+wraps their statements in per-table changesets. So both engines emit the same object DDL from one
+definition. Object names come from the config; index columns are the one table-specific spot, as
+with the Liquibase path.
+
+(Why no Alembic: an earlier variant rendered from Alembic. `alembic upgrade head --sql` prepends an
+unguarded `alembic_version` create + `INSERT`, and once a second revision existed the reconcile
+tripped a duplicate-key on `alembic_version` on the second apply and rolled the whole transaction
+back — the object DDL never reconciled. Removing the framework removes that class of bug.)
 
 ## Key decisions at a glance
 

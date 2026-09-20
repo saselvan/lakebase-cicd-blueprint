@@ -43,23 +43,20 @@ jobs:
           python3 -c "import json; json.load(open('config/tables.json'))"
           echo "config/tables.json is valid JSON"
 
-      - name: Liquibase changelog offline validate (no database)
+      - name: Liquibase changelogs — drift check + offline validate (no database)
         run: |
-          docker run --rm -v "$PWD/liquibase/changelog:/work" liquibase/liquibase:4.33 \
-            --search-path=/work \
-            --changeLogFile=db.changelog-master.xml \
-            --url="offline:postgresql?version=16" \
-            validate
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Alembic offline SQL — falsifiability tests (no database)
-        run: |
-          pip install "alembic==1.20.0" "pytest==9.1.1"
-          pytest alembic/tests -q
+          # 1) Drift gate: the committed liquibase/generated/*.changelog.sql must byte-match a
+          #    fresh generation from config/tables.json (single source of truth). Writes nothing.
+          python3 liquibase/generate_changelogs.py --check
+          # 2) Offline-validate EACH generated per-table changelog (no database).
+          for f in liquibase/generated/*.changelog.sql; do
+            echo "--- validate $f ---"
+            docker run --rm -v "$PWD/liquibase/generated:/work" liquibase/liquibase:4.33 \
+              --search-path=/work \
+              --changeLogFile="$(basename "$f")" \
+              --url="offline:postgresql?version=16" \
+              validate
+          done
 
   secret-scan:
     runs-on: ubuntu-latest
@@ -71,3 +68,75 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # DABs variant: offline `databricks bundle validate` — no secrets, no workspace.
+  # Runs the codegen, then validates the generated bundle (dev + prod, --strict)
+  # against a localhost workspace stub so any fork can run it without cloud access.
+  #
+  # CLI PIN: Databricks CLI >= 1.5.0 is required. Lakebase DABs resources
+  # (postgres_synced_tables / postgres_roles) are BETA; CLIs older than 1.5.0 drop the
+  # resource `role_id`, so the pin is a correctness requirement, not just hygiene.
+  dabs-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Databricks CLI (pinned v1.17.0, >= 1.5.0 — Lakebase DABs Beta)
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/v1.17.0/install.sh | sh
+          databricks version
+
+      - name: Install Python deps (codegen + tests)
+        run: pip install "pyyaml==6.0.2" "pytest==9.1.1"
+
+      - name: Verify committed dabs/resources match config (drift check — no overwrite)
+        run: python3 -m dabs.generate_resources --check
+
+      - name: Offline bundle validate gate (drift check + temp codegen -> validate --strict dev+prod -> resource count)
+        run: bash dabs/scripts/offline_validate.sh
+
+      - name: Falsifiability tests — validate passes on valid, FAILS on malformed/invalid resource
+        run: pytest dabs/tests -q
+
+  # State-level proofs against a real Docker PostgreSQL — no cloud, no Lakebase, no secrets.
+  # Each script asserts on actual database state (roles, grants, indexes, views) so the fixed
+  # migration bug classes cannot silently regress:
+  #   - multi-table shared-schema changeset identity (per-table changelogs; fix A)
+  #   - renderer double-apply idempotency, no version-table rollback (fix B)
+  #   - deploy verify step actually fails on a missing grant/index (fix C)
+  # Ubuntu runners ship Docker and Java; the proofs stay OUT of pytest so the offline suite is
+  # Docker-free. Run the same scripts locally with `bash <path>`.
+  docker-proofs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install psql client (the proofs run psql from the host)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Install Liquibase 4.33.0 (matches the offline-validate image; bundles the pg driver)
+        uses: liquibase/setup-liquibase@v3
+        with:
+          version: "4.33.0"
+          edition: "community"
+
+      - name: Proof — Liquibase multi-table shared schema, both roles/views created
+        run: bash liquibase/tests/docker_multitable_proof.sh
+
+      - name: Proof — DABs renderer double-apply is a clean reconciling no-op
+        run: bash dabs/tests/docker_double_apply_proof.sh
+
+      - name: Proof — deploy verify step exits non-zero on a missing grant or index
+        run: bash scripts/tests/docker_verify_step.sh

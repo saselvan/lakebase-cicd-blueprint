@@ -14,7 +14,7 @@ drop/replace still has a brief gap — it is not zero-downtime; see `docs/DESIGN
 | Tool | Job | Files |
 |---|---|---|
 | Terraform | create/own the synced table (Delta → Lakebase Postgres) | `terraform/` |
-| Liquibase | app role, explicit grants, indexes, consumer view | `liquibase/changelog/` |
+| Liquibase | app role, explicit grants, indexes, consumer view (one generated changelog per table) | `liquibase/generated/` (from `liquibase/generate_changelogs.py`) |
 | Orchestration | run them in the right order, wait for the sync | `scripts/deploy.sh` |
 | GitHub Actions | run that same sequence on push / PR | `.github/workflows/` |
 
@@ -24,7 +24,8 @@ drop/replace still has a brief gap — it is not zero-downtime; see `docs/DESIGN
 # authenticate the Databricks CLI to your workspace first, then:
 export PROFILE=<your-cli-profile>
 export WAREHOUSE_ID=<your-sql-warehouse-id>
-export HOST=<your-lakebase-rw-endpoint-host>
+export PROJECT=<your-lakebase-project-id>   # deploy is branch-driven; default my-lakebase-project
+export BRANCH=<branch-to-deploy-to>         # default main
 export PGUSER=<your-databricks-username>   # your login email
 
 # 0. one-time: create the demo Delta source table the sync reads from
@@ -39,10 +40,14 @@ export PGUSER=<your-databricks-username>   # your login email
    no-op because Terraform owns the state.
 2. `scripts/wait_for_sync.sh` — polls `databricks postgres get-synced-table` until `detailed_state`
    contains `ONLINE`. This is what guarantees indexes go on **after** the load, not during it.
-3. `liquibase update` — runs the changesets: create role → grant USAGE/SELECT → create indexes →
-   create the consumer view + grant. Reruns reapply the `runAlways` changesets; Liquibase tracks
-   them in `DATABASECHANGELOG`.
-4. verify — `has_table_privilege(app_role, ...) = t` and the indexes exist.
+3. generate per-table changelogs (`liquibase/generate_changelogs.py`), then `liquibase update`
+   against each table's OWN changelog (`generated/<name>.changelog.sql`): create role → grant
+   USAGE/SELECT → create indexes (one per `index_columns` entry) → create the consumer view + grant.
+   A distinct changelog file per table gives each changeset a distinct identity, so shared-schema
+   tables never collide in `DATABASECHANGELOG`. Reruns reapply the `runAlways` changesets.
+4. verify (`scripts/verify_table.sh`) — asserts `has_table_privilege(app_role, <schema>.<view>,
+   'SELECT') = t` and every `idx_<table>_<col>` exists; exits non-zero (failing the deploy) if not.
+   Extracted from `deploy.sh` so it can be tested against a real Docker Postgres.
 
 ## The PR flow (branching)
 
@@ -90,7 +95,9 @@ mints a short-lived token per run; Databricks trusts it via a federation policy 
 Databricks officially supports this for GitHub Actions.
 
 Prefer this over storing a long-lived client secret in GitHub. The database password is always
-minted at runtime (`generate-database-credential`, ~1h TTL) — never stored. Two things to plan for:
+minted at runtime (`databricks postgres generate-database-credential <endpoint>`, ~1h TTL) from the
+target branch's READ_WRITE compute endpoint — no database-instance name, never stored. Two things
+to plan for:
 
 1. **Network access:** the runner must be able to reach your workspace. If your workspace enforces
    IP access lists, use a runner inside an allowed network (self-hosted / managed) or add an

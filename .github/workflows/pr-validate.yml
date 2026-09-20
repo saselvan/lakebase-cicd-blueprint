@@ -27,14 +27,25 @@ jobs:
         run: |
           databricks postgres create-branch "projects/$PROJECT" "$BRANCH" \
             --json '{"spec":{"ttl":"7200s"}}' --replace-existing
-          HOST=$(databricks postgres list-endpoints "projects/$PROJECT/branches/$BRANCH" \
-            | python3 -c "import sys,json;print(json.load(sys.stdin)[0]['status']['hosts']['host'])")
-          TOKEN=$(databricks database generate-database-credential \
-            --json "{\"instance_names\":[\"$PROJECT\"]}" -o json \
-            | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])")
-          cd liquibase && liquibase update \
-            --changeLogFile=changelog/db.changelog-master.xml \
-            --url="jdbc:postgresql://$HOST:5432/databricks_postgres?sslmode=require" \
-            --username="${{ secrets.DATABRICKS_CLIENT_ID }}" --password="$TOKEN" \
-            --liquibase-schema-name=cicd_proj
+          # Resolve the PR branch's READ_WRITE compute endpoint and mint an OAuth token FROM it
+          # (projects/Autoscaling API) -- host and token from the SAME endpoint, no instance name.
+          # Empty profile ("") => omit -p, so CI env-var auth (DATABRICKS_HOST + CLIENT_ID/SECRET)
+          # is used instead of a config profile. Shared with scripts/deploy.sh + branch_test.sh.
+          . scripts/resolve_endpoint.sh
+          lakebase_resolve_and_mint "projects/$PROJECT/branches/$BRANCH" ""
+          HOST="$LB_HOST"
+          TOKEN="$LB_TOKEN"
+          # Generate one changelog per table from config/tables.json, then run EACH table's own
+          # changelog (distinct FILENAME => distinct changeset identity, so shared-schema tables do
+          # not collide in one DATABASECHANGELOG). Mirrors scripts/deploy.sh.
+          python3 liquibase/generate_changelogs.py
+          URL="jdbc:postgresql://$HOST:5432/databricks_postgres?sslmode=require"
+          cd liquibase
+          python3 -c "import json;[print(t['name'],t['app_schema']) for t in json.load(open('../config/tables.json'))]" | while read -r NAME SCHEMA; do
+            liquibase update \
+              --changeLogFile="generated/$NAME.changelog.sql" \
+              --url="$URL" \
+              --username="${{ secrets.DATABRICKS_CLIENT_ID }}" --password="$TOKEN" \
+              --liquibase-schema-name="$SCHEMA"
+          done
           # add pytest/psycopg validation here -- it runs against the branch, not prod

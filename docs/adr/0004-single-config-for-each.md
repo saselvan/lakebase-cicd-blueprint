@@ -13,8 +13,13 @@ one-line JSON edit — no new resource, no script change.
 
 ## Consequences
 - One place to add/remove tables; both layers stay in sync by construction.
-- Liquibase changesets are parametrized (`${synced_table}`, `${app_schema}`, `${app_role}`,
-  `${index_col_1/2}`) so one changelog serves every table.
-- **Index columns are the one inherently table-specific spot** — the two-column template in
-  `003-indexes.sql` covers the common case; unusual index shapes edit that changeset.
+- The Liquibase path generates one changelog per table from this file
+  (`liquibase/generate_changelogs.py`, mirroring `dabs/generate_resources.py`), with values baked
+  in. A distinct changelog FILE per table gives each changeset a distinct identity, so tables that
+  share one `app_schema` never collide in a shared `DATABASECHANGELOG` (property substitution into a
+  single shared changelog did collide — see DESIGN-NOTES). Generated changelogs are committed and
+  drift-checked (`--check`).
+- **Index columns are the one inherently table-specific spot** — the generator emits one index
+  changeset per `index_columns` entry (0/1/N, no cap); unusual index shapes edit the generated
+  changelog.
 - All tables are assumed to share one project/branch/instance/host (see TROUBLESHOOTING).

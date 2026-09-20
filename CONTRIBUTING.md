@@ -38,6 +38,7 @@ python3 -c "import json; json.load(open('config/tables.json'))"
 |---|---|
 | Tables the pipeline manages | `config/tables.json` |
 | Shared workspace settings | `terraform/terraform.tfvars.example` (+ your own `.tfvars`) |
-| Non-standard index shape for a table | `liquibase/changelog/003-indexes.sql` |
+| Migration SQL shape (role/grants/indexes/view) — both paths | `dabs/render_ddl.py` (the shared SQL helpers both engines use) |
+| Non-standard index shape for a table | the `index_columns` for that row in `config/tables.json`, and the shared SQL helpers in `dabs/render_ddl.py` (never the generated `liquibase/generated/*.changelog.sql` — those are regenerated and drift-checked in CI) |
 | Pipeline steps / ordering | `scripts/deploy.sh` |
 | CI behavior | `.github/workflows/` |
