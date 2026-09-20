@@ -52,6 +52,7 @@ from dabs.render_ddl import (  # noqa: E402  (path insertion must precede this i
     resolve_view_name,
     role_guard_sql,
     validate_identifier,
+    validate_view_names_unique,
     view_statements,
 )
 
@@ -249,6 +250,7 @@ def write_changelogs(tables: list[dict], out_dir: str | Path) -> list[Path]:
 
     Fully deterministic (no timestamps/ids) so re-running is a clean diff.
     """
+    validate_view_names_unique(tables)  # cross-entry: two entries must not resolve to one view
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
@@ -269,6 +271,7 @@ def check_drift(config_path: str | Path, generated_dir: str | Path) -> list[str]
       - a committed .changelog.sql that no config row generates (orphan/leftover).
     """
     tables = load_tables(config_path)
+    validate_view_names_unique(tables)  # cross-entry: two entries must not resolve to one view
     expected = {changelog_filename(t): render_changelog(t) for t in tables}
     generated = Path(generated_dir)
     committed = {p.name: p for p in generated.glob("*.changelog.sql")}

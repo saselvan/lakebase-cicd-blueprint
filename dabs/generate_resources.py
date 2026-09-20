@@ -57,6 +57,11 @@ from typing import Any
 
 import yaml
 
+# The view-name uniqueness seam lives in dabs/render_ddl.py (the single home shared with the
+# Liquibase path). This generator does not emit views, but it shares config/tables.json with the
+# migration job that DOES, so it enforces the same cross-entry constraint at generation time.
+from dabs.render_ddl import validate_view_names_unique
+
 # Bundle variable references for environment-specific values (declared in databricks.yml targets).
 # Kept as references — never literal workspace/branch values — so nothing customer-specific is committed.
 BRANCH_VAR = "${var.lakebase_branch}"
@@ -154,6 +159,7 @@ def build_bundle_fragments(tables: list[dict]) -> dict[str, dict]:
     `postgres_roles` DAB resource — the migration job owns it — so it travels only via
     `migration_targets`. Fully deterministic — no timestamps or ids — so re-running is a clean diff.
     """
+    validate_view_names_unique(tables)  # cross-entry: two entries must not resolve to one view
     fragments: dict[str, dict] = {}
     targets: list[dict] = []
     for table in tables:

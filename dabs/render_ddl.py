@@ -249,6 +249,40 @@ def resolve_view_name(table: dict, synced_table: str) -> str:
     return validate_derived_name(f"{synced_table}_v", "view name", "the synced table name")
 
 
+def validate_view_names_unique(tables: list[dict]) -> None:
+    """Fail loud when two config entries resolve to the SAME (app_schema, view_name) (shared seam).
+
+    `resolve_view_name` validates ONE name's shape/length/reserved-word, but nothing there stops two
+    DIFFERENT entries from resolving to the same schema-qualified consumer view: entry A derives
+    ``members_v`` from its base table while entry B sets ``view_name: members_v`` over a different
+    base table in the same ``app_schema``. Both would emit
+    ``CREATE OR REPLACE VIEW <schema>.members_v``, so whichever migration runs LAST silently
+    clobbers the other's consumer view (last-write-wins) — a same-schema name collision the per-name
+    check cannot see.
+
+    This is a CROSS-entry check, so it takes the whole tables list. It raises in the SAME strict,
+    name-the-culprit style as ``validate_identifier``, naming BOTH offending entries and the
+    colliding view. Both generators (``dabs/generate_resources.py``,
+    ``liquibase/generate_changelogs.py``) and ``render_ddl`` call it at generation time, so every
+    path inherits the guard. Resolving each name also runs it through the per-name identifier seam.
+    """
+    seen: dict[tuple[str, str], str] = {}
+    for table in tables:
+        schema = validate_identifier(table["app_schema"], "app_schema")
+        tbl = validate_identifier(pg_table_name(table), "synced_table")
+        view = resolve_view_name(table, tbl)
+        name = table.get("name", tbl)
+        key = (schema, view)
+        if key in seen:
+            raise ValueError(
+                f"two config entries resolve to the same consumer view {schema}.{view}: "
+                f"{seen[key]!r} and {name!r}. A consumer view name must be unique within an "
+                f"app_schema — CREATE OR REPLACE VIEW would otherwise silently clobber one with the "
+                f"other (last-write-wins). Rename one entry's view_name in config/tables.json."
+            )
+        seen[key] = name
+
+
 def view_statements(app_schema: str, app_role: str, synced_table: str, view_name: str) -> list[str]:
     """Consumer view + grant — the no-superuser access path. The managed writer role owns the
     synced base table; the deploy identity holds SELECT on that base table and OWNS this view over
@@ -297,6 +331,7 @@ def render_ddl(tables: list[dict]) -> str:
     clean no-op. Each statement is terminated with ';' so the result executes as one multi-statement
     apply (or pipes to psql). Contains NO `alembic_version` / no migration-version table of any kind.
     """
+    validate_view_names_unique(tables)  # cross-entry: two entries must not resolve to one view
     chunks: list[str] = [_HEADER]
     for table in tables:
         role = validate_identifier(table["app_role"], "app_role")
