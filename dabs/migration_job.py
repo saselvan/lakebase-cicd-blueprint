@@ -17,7 +17,8 @@ version bookkeeping alembic prepends (CREATE TABLE alembic_version / the version
 otherwise unguarded and would error on a 2nd apply and roll the whole transaction back. So a
 synced-table replace self-heals: every run re-applies the object DDL.
 
-Design constraints that keep this OFFLINE-UNIT-TESTABLE (the live apply is ticket 04):
+Design constraints that keep this OFFLINE-UNIT-TESTABLE (the live apply runs against a real
+Lakebase branch):
   * The gate (`wait_for_online`) is a pure function over an injected `get_status` callable and an
     injected `sleep` — tests mock both; nothing touches a real workspace.
   * The Databricks SDK and psycopg are imported LAZILY inside the apply/status-source helpers, so
@@ -259,7 +260,7 @@ def render_migration_sql(
     return make_rerunnable(result.stdout)
 
 
-# --- Runtime OAuth + apply (live path, exercised by ticket 04; SDK/psycopg imported lazily) --
+# --- Runtime OAuth + apply (live path against a real Lakebase branch; SDK/psycopg imported lazily) --
 
 def sdk_status_source(instance_name: str) -> Callable[[str], str]:
     """Return a `get_status(table_id)` backed by the Databricks SDK — the live wait-gate source.
@@ -356,13 +357,14 @@ def _lakebase_conninfo(
     """Build a psycopg conninfo string for Lakebase using a RUNTIME OAuth credential — no stored
     secret. Only used on the live apply path.
 
-    Finding #5 / #1: the host MUST be the TARGET BRANCH's endpoint, never the instance
-    `read_write_dns` (which is the instance DEFAULT endpoint = the production branch). `branch`
+    The host MUST be the TARGET BRANCH's endpoint, never the instance `read_write_dns` (which is
+    the instance DEFAULT endpoint = the production branch). `branch`
     (``projects/<proj>/branches/<branch>``) is therefore REQUIRED and is resolved to a host via the
     branch's compute endpoint. A missing/empty branch RAISES rather than reconnecting to the
     instance default — that fallback was dead-but-dangerous machinery (no caller omits the branch;
-    the bundle always passes ``${var.lakebase_branch}``) that latently re-armed finding #5, so it
-    was removed along with the instance-DNS seam.
+    the bundle always passes ``${var.lakebase_branch}``) that would silently route a migration at
+    the production branch, so it was removed along with the instance-DNS seam. This is the single
+    authoritative explanation of why the branch is required; the callers below just enforce it.
 
     The host resolver and the credential source are INJECTABLE pure callables (mirroring
     get_status / sdk_status_source), defaulting to SDK-backed sources — so this is
@@ -372,7 +374,7 @@ def _lakebase_conninfo(
         raise ValueError(
             "a target branch (projects/<proj>/branches/<branch>) is required to build the "
             "Lakebase conninfo; refusing to fall back to the instance default endpoint "
-            "(production) — finding #5/#1"
+            "(the production branch)"
         )
     resolve_host = resolve_host or sdk_branch_host_source()
     credential_source = credential_source or _sdk_credential_source
@@ -389,14 +391,15 @@ def apply_sql_to_lakebase(sql: str, *, instance_name: str, branch: str) -> None:
     """Apply rendered DDL to Lakebase over a runtime-OAuth psycopg connection (no stored secret).
 
     `branch` (``projects/<proj>/branches/<branch>``) is REQUIRED — it selects the TARGET branch
-    endpoint host so the migration lands on that branch, not the instance default endpoint
-    (production) — finding #5/#1. A missing/empty branch raises in _lakebase_conninfo.
+    endpoint host so the migration lands on that branch, not the instance default endpoint (the
+    production branch); see _lakebase_conninfo for why. A missing/empty branch raises there.
 
     `sql` is the output of render_migration_sql, which is already RE-RUNNABLE (make_rerunnable has
     guarded the version bookkeeping), so executing this blob a second time — e.g. after a
     synced-table replace — is a clean reconciling no-op rather than a DuplicateTable rollback.
 
-    Live path — exercised by ticket 04's FEVM acceptance, not by offline unit tests. psycopg is
+    Live path — exercised by the live apply against a real Lakebase branch, not by offline unit
+    tests. psycopg is
     imported lazily so the unit suite imports this module without it installed.
     """
     import psycopg  # lazy: only the live apply needs a driver
@@ -439,7 +442,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Target Lakebase branch (projects/<proj>/branches/<branch>) whose compute-endpoint "
         "host the migration connects to. The deploy passes ${var.lakebase_branch}. REQUIRED for a "
         "live apply (like --instance): without it the job would connect to the instance DEFAULT "
-        "endpoint = production — finding #5/#1, so it is refused rather than defaulted. "
+        "endpoint = the production branch, so it is refused rather than defaulted. "
         "Default: LAKEBASE_BRANCH env.",
     )
     parser.add_argument("--timeout", type=float, default=1800, help="Wait-for-ONLINE timeout (s).")
@@ -463,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.branch:
         parser.error(
             "--branch / LAKEBASE_BRANCH is required for a live apply — refusing to fall back to "
-            "the instance DEFAULT endpoint (production); finding #5/#1"
+            "the instance DEFAULT endpoint (the production branch)"
         )
 
     get_status = sdk_status_source(args.instance)
@@ -481,11 +484,11 @@ def main(argv: list[str] | None = None) -> int:
 def _run_cli(argv: list[str] | None = None) -> int:
     """Entrypoint wrapper: run main() and raise SystemExit ONLY on a non-zero return code.
 
-    WHY (finding #6): a bundle spark_python_task runs this file via exec(compile(src, ..., "exec")),
-    and the serverless runtime catches ANY raised SystemExit — even code 0 — and reports the task
-    as a FAILURE. A plain `sys.exit(main())` therefore turns a fully successful migration
+    WHY: a bundle spark_python_task runs this file via exec(compile(src, ..., "exec")), and the
+    serverless runtime catches ANY raised SystemExit — even code 0 — and reports the task as a
+    FAILURE. A plain `sys.exit(main())` therefore turns a fully successful migration
     (schema/view/role/grants all applied) into a FAILED job run (`INTERNAL_ERROR / SystemExit: 0`),
-    which would fail the GitHub Actions pipeline (ticket 05). So on the SUCCESS path (rc == 0) we
+    which would fail the CI pipeline that runs it. So on the SUCCESS path (rc == 0) we
     return normally WITHOUT raising, and the task is marked succeeded. A real failure (non-zero rc)
     still raises SystemExit(rc); and any uncaught exception under spark_python_task is itself a
     failure — the correct signal. main()'s return-int contract and its argparse validation are

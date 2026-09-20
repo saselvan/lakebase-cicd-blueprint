@@ -115,6 +115,12 @@ Verified across all three sync modes (Snapshot, Triggered, Continuous):
   **`runAlways:true`**. With `runOnChange`, the redeploy sees unchanged checksums, skips, and leaves
   the app without access. `runAlways` + idempotent SQL (`GRANT`, `CREATE INDEX IF NOT EXISTS`,
   `CREATE OR REPLACE VIEW`) is what keeps access intact after a rebuild.
+  - This self-heal assumes the replace itself **succeeds**. When a dependent consumer view exists,
+    an in-place replace is **blocked**: the replace drops the base table, and Postgres will not drop a
+    table that still has a dependent view (non-`CASCADE` dependency), so the drop fails, the recreate
+    never happens, and the `runAlways` migration never runs to restore access. A plain redeploy does
+    **not** self-heal in that case — the view must be dropped first, or the swap done side-by-side.
+    See "Changing sync mode: prefer a blue/green swap" below.
 
 Treat a sync-mode change as a planned rebuild, not a live toggle — and pick Triggered/Continuous at
 create time if row-incremental is the goal, since flipping mode on a live table forces the replace above.

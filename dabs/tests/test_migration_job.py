@@ -1,9 +1,9 @@
-"""Falsifiability tests for ticket 03 — the Alembic-in-a-Workflow-job migration task.
+"""Falsifiability tests for the Alembic-in-a-Workflow-job migration task.
 
-Ticket 03 adds a bundle-declared Databricks Workflow job whose task, when run: (a) reads the
+The migration job is a bundle-declared Databricks Workflow job whose task, when run: (a) reads the
 table list, (b) BLOCKS until each synced table reports ONLINE before any dependent DDL, then
 (c) runs the EXISTING `alembic/` migration (reused, not copied) against Lakebase via a runtime
-OAuth token. The live apply is ticket 04; here we prove the offline-unit seams.
+OAuth token. The live apply runs against a real Lakebase branch; here we prove the offline-unit seams.
 
 The three offline seams, each with a hostile fixture, mapped to the reviewer's named mutations:
 
@@ -103,7 +103,7 @@ _PG_BINS = _pg_binaries()
 _needs_pg = pytest.mark.skipif(
     _PG_BINS is None,
     reason="no local Postgres (initdb/pg_ctl/psql) — the hermetic double-apply skips; the true "
-    "live double-apply is ticket 04's gate",
+    "live double-apply runs against a real Lakebase branch",
 )
 
 
@@ -334,7 +334,7 @@ def test_bundle_declares_migration_job_running_the_entrypoint():
     """The bundle declares a Workflow job whose task runs the shared migration_job.py entrypoint
     (not inline-copied migration logic).
 
-    Guards mutation 2 / ticket checkbox 1: the job must reuse the entrypoint, so the migration has
+    Guards mutation 2: the job must reuse the entrypoint, so the migration has
     a single implementation on Databricks compute too.
     """
     bundle = yaml.safe_load((mj.repo_root() / "dabs" / "databricks.yml").read_text())
@@ -346,7 +346,7 @@ def test_bundle_declares_migration_job_running_the_entrypoint():
 
 # --- Seam D: config/alembic resolution survives the exec-without-__file__ runtime -------------
 #
-# THE runtime bug (ticket 06): the bundle spark_python_task runs the entrypoint via
+# THE runtime bug: the bundle spark_python_task runs the entrypoint via
 # exec(compile(src, filename, "exec")) into a namespace where __file__ is NOT bound. repo_root()
 # used Path(__file__), so a live serverless run died with
 #   NameError: name '__file__' is not defined
@@ -523,7 +523,8 @@ def test_invoked_migration_is_idempotent_reconciling():
 
     Guards mutation 3 (drop object-DDL IF NOT EXISTS / OR REPLACE) AND the new mutation (drop the
     version-bookkeeping guard) => this goes red. The TRUE live double-apply is
-    `test_rendered_migration_double_apply_reconciles` (hermetic) and ticket 04's FEVM gate.
+    `test_rendered_migration_double_apply_reconciles` (hermetic) and the live apply against a real
+    Lakebase branch.
     """
     sql = mj.render_migration_sql(config_path=ALEMBIC_FIXTURE)
     _assert_rerunnable_shape(_norm(sql))
@@ -541,7 +542,7 @@ def test_rendered_migration_double_apply_reconciles(hermetic_pg):
 
     Without the version-bookkeeping guard, the unguarded `CREATE TABLE alembic_version` raises
     DuplicateTable, the `BEGIN;…COMMIT;` rolls back, and the object DDL never re-applies — which is
-    exactly ticket 03 checkbox 3 ("re-running is a reconciling no-op") and ticket 04's replace-gate.
+    exactly the "re-running is a reconciling no-op" contract and the live replace scenario.
     """
     run = hermetic_pg
     # The synced tables the migration grants on / builds a view over exist at run time.
@@ -557,7 +558,7 @@ def test_rendered_migration_double_apply_reconciles(hermetic_pg):
     first = run(sql)
     assert first.returncode == 0, f"1st apply failed:\n{first.stderr}"
 
-    # Simulate a synced-table replace wiping the reconciled objects (ticket 04's live scenario).
+    # Simulate a synced-table replace wiping the reconciled objects (the live scenario).
     wipe = run("DROP VIEW sch_alpha.alpha_v; DROP INDEX sch_alpha.idx_alpha_region_key;")
     assert wipe.returncode == 0, f"could not wipe objects for the reconcile test:\n{wipe.stderr}"
 
@@ -578,9 +579,9 @@ def test_rendered_migration_double_apply_reconciles(hermetic_pg):
 
 # --- Seam E: the migration connects to the TARGET BRANCH endpoint, not the instance default ----
 #
-# Finding #5 (surfaced by ticket 04's live run): _lakebase_conninfo built the psycopg conninfo from
-# the Lakebase INSTANCE `read_write_dns` — which is the instance DEFAULT endpoint = the PRODUCTION
-# branch. So the migration job connected to production, not the ephemeral target branch, and raised
+# The branch-endpoint requirement: an earlier version built the psycopg conninfo from the Lakebase
+# INSTANCE `read_write_dns` — which is the instance DEFAULT endpoint = the PRODUCTION branch. So the
+# migration job connected to production, not the ephemeral target branch, and raised
 #   InvalidSchemaName: schema "cicd_dabs" does not exist
 # because the intended target branch was never migrated. The fix: resolve the host from the
 # ${var.lakebase_branch} value ("projects/<proj>/branches/<branch>") via that branch's compute
@@ -625,7 +626,7 @@ def test_conninfo_host_is_branch_endpoint_not_instance_default():
         f"(prod decoy is {_PROD_DNS!r})"
     )
     assert fields["host"] != _PROD_DNS, (
-        "conninfo used the INSTANCE DEFAULT (production) host — this is exactly finding #5"
+        "conninfo used the INSTANCE DEFAULT (production) host instead of the target branch endpoint"
     )
     assert seen_branches == [_BRANCH], f"branch not passed to the host resolver: {seen_branches}"
     # The runtime-OAuth credential path still populates user/password (no stored secret).
@@ -636,7 +637,7 @@ def test_conninfo_host_is_branch_endpoint_not_instance_default():
 @pytest.mark.parametrize("missing", [None, ""])
 def test_conninfo_missing_branch_raises(missing):
     """A missing/empty branch must RAISE — never silently fall back to the instance default
-    endpoint (production). That fallback IS the finding #5 defect; the branch is now REQUIRED, so
+    endpoint (production). That fallback was the defect; the branch is now REQUIRED, so
     the dead-but-dangerous fallback machinery is gone. Observable behavior: a ValueError is raised
     and NEITHER the host resolver NOR the credential source is ever consulted (so no accidental
     instance-default connection is even attempted).
@@ -668,7 +669,7 @@ def test_conninfo_missing_branch_raises(missing):
 def test_main_requires_branch_for_live_apply(monkeypatch, tmp_path):
     """A live apply (no --dry-run) must REQUIRE --branch / LAKEBASE_BRANCH, exactly as it already
     requires --instance — so it can never fall back to the instance default endpoint (production).
-    argparse's parser.error exits with SystemExit(2). Guards the finding #1 fix at the CLI layer.
+    argparse's parser.error exits with SystemExit(2). Guards the required-branch check at the CLI layer.
     """
     # Minimal one-row tables config so load_tables/render succeed before the branch check.
     cfg = tmp_path / "tables.json"
@@ -761,8 +762,8 @@ def test_apply_threads_branch_into_conninfo(monkeypatch):
 
 def test_bundle_task_passes_branch_variable():
     """The deploy passes the target branch to the task via ${var.lakebase_branch}, mirroring how
-    --instance / ${var.lakebase_instance} is passed — so the job migrates the TARGET branch endpoint
-    (finding #5), never the instance default. Guards a regression that drops the --branch param.
+    --instance / ${var.lakebase_instance} is passed — so the job migrates the TARGET branch endpoint,
+    never the instance default. Guards a regression that drops the --branch param.
     """
     bundle = yaml.safe_load((mj.repo_root() / "dabs" / "databricks.yml").read_text())
     params = bundle["resources"]["jobs"]["lakebase_migration"]["tasks"][0]["spark_python_task"]["parameters"]
@@ -774,24 +775,17 @@ def test_bundle_task_passes_branch_variable():
 
 # --- Seam F: the entrypoint wrapper must NOT raise SystemExit on the success path -------------
 #
-# Finding #6 (surfaced by ticket 04's live run): the migration APPLIED correctly (schema/view/role/
-# grants verified present on the target branch) but the job RUN was marked INTERNAL_ERROR / FAILED
-# with `SystemExit: 0`. Root cause: a spark_python_task runs the entrypoint via
-# exec(compile(src, filename, "exec")), and the serverless runtime catches ANY raised SystemExit —
-# even code 0 — and reports it as a task FAILURE. So `if __name__ == "__main__": sys.exit(main())`
-# turns a fully successful migration into a failed job, which would fail the GitHub Actions pipeline.
-#
-# The fix: a small, TESTABLE wrapper (`_run_cli`) that calls main() and only raises SystemExit when
-# the return code is NON-ZERO; on rc == 0 it returns normally (no SystemExit), so the serverless
-# task is marked succeeded. A real failure (non-zero rc) still raises SystemExit — and an uncaught
-# exception under spark_python_task is a failure, which is the correct signal. We test the WRAPPER,
-# never the un-observable `if __name__ == "__main__"` line.
+# See migration_job._run_cli for WHY a raised SystemExit(0) under a serverless spark_python_task is
+# reported as a task FAILURE (the authoritative explanation of the mechanism lives there). These
+# tests pin the wrapper's observable contract: on rc == 0 it returns normally (no SystemExit) so the
+# task is marked succeeded; on a non-zero rc it raises SystemExit carrying that code so a real
+# failure still surfaces. We test the WRAPPER, never the un-observable `if __name__ == "__main__"`.
 
 
 def test_run_cli_success_does_not_raise_systemexit(monkeypatch):
     """SUCCESS path: when main() returns 0, the CLI wrapper returns normally and does NOT raise
     SystemExit — so the serverless spark_python_task (which reports ANY raised SystemExit, even
-    code 0, as a task FAILURE) is marked SUCCEEDED. This is finding #6.
+    code 0, as a task FAILURE) is marked SUCCEEDED.
 
     MUTATION GATE — revert the wrapper to always `sys.exit(rc)` (raise even on rc == 0) and this
     goes RED: sys.exit(0) raises SystemExit(0), so the `does not raise` assertion fails.
