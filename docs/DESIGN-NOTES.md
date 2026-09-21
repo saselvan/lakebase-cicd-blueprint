@@ -244,10 +244,9 @@ wraps their statements in per-table changesets. So both engines emit the same ob
 definition. Object names come from the config; index columns are the one table-specific spot, as
 with the Liquibase path.
 
-(Why no Alembic: an earlier variant rendered from Alembic. `alembic upgrade head --sql` prepends an
-unguarded `alembic_version` create + `INSERT`, and once a second revision existed the reconcile
-tripped a duplicate-key on `alembic_version` on the second apply and rolled the whole transaction
-back — the object DDL never reconciled. Removing the framework removes that class of bug.)
+(Why no Alembic: an earlier variant rendered from Alembic and could roll the whole transaction back
+on a second apply because of its `alembic_version` bookkeeping, so dropping the framework removes
+that class of bug — see [ADR 0006](adr/0006-dabs-variant-mechanics.md) for the full rationale.)
 
 ## Key decisions at a glance
 

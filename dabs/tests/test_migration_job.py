@@ -14,8 +14,7 @@ The offline seams, each with a hostile fixture:
 
   Seam C — the invoked render is idempotent/reconciling (re-run == safe no-op).
     The renderer yields IF NOT EXISTS / CREATE OR REPLACE / role-guard DDL, two renders are
-    byte-identical, and there is NO `alembic_version` (or any version table) to roll back on the
-    2nd apply — the exact class of bug the old alembic-rendered path had.
+    byte-identical, and there is no version table to roll back on the 2nd apply.
 
   Seam E — the migration connects to the TARGET BRANCH endpoint, not the instance default.
   Seam F — the CLI wrapper does not raise SystemExit on the success path.
@@ -218,7 +217,7 @@ def test_gate_times_out_if_never_online():
         mj.wait_for_online(["cat.sch.stuck"], fake, sleep=lambda s: None, poll_interval=10, timeout=20)
 
 
-# --- Seam B: a single migration implementation (the shared renderer, no alembic left) -----------
+# --- Seam B: a single migration implementation (the shared renderer, no external engine) --------
 
 def test_bundle_declares_migration_job_running_the_entrypoint():
     """The bundle declares a Workflow job whose task runs the shared migration_job.py entrypoint
@@ -261,8 +260,8 @@ def test_no_alembic_machinery_remains():
     assert version_migrations == [], f"alembic version-migration still present: {version_migrations}"
 
     # The entrypoint's CODE (not its explanatory prose) must not run alembic or write a version row.
-    # Tokenize and drop STRING/COMMENT tokens so the docstring's honest "why we removed alembic"
-    # narrative does not trip this — only real identifiers (imports, calls) are inspected.
+    # Tokenize and drop STRING/COMMENT tokens so any prose mention in a docstring or comment does
+    # not trip this — only real identifiers (imports, calls) are inspected.
     import io
     import tokenize
 
@@ -356,7 +355,7 @@ def test_bundle_task_passes_deployed_config_path():
     assert _value_after("--config") == "${workspace.file_path}/config/tables.json", (
         f"--config is not the interpolated DEPLOYED config path: {params}"
     )
-    # The alembic engine is gone — the task must NOT pass an --alembic-dir any more.
+    # The task uses no external migration engine — it must NOT pass an --alembic-dir.
     assert "--alembic-dir" not in params, f"stale --alembic-dir still passed to the task: {params}"
     # Credential-free / no committed literal.
     blob = json.dumps(params)
@@ -393,11 +392,10 @@ def test_invoked_migration_is_idempotent_reconciling():
 
 @_needs_pg
 def test_rendered_migration_double_apply_reconciles(hermetic_pg):
-    """THE bug, proven on a real Postgres: apply the rendered SQL TWICE against a throwaway cluster
-    and assert the 2nd apply does NOT error AND the reconciling object DDL re-took effect after a
+    """Proven on a real Postgres: apply the rendered SQL TWICE against a throwaway cluster and
+    assert the 2nd apply does NOT error AND the reconciling object DDL re-took effect after a
     (simulated) synced-table replace wiped it.
 
-    The old alembic-rendered path rolled back on the 2nd apply (duplicate key on `alembic_version`).
     The renderer has no version table, so the 2nd apply is a clean reconciling no-op.
     """
     run = hermetic_pg

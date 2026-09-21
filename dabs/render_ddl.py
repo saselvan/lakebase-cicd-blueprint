@@ -7,28 +7,23 @@ object groups the Liquibase changelog does — a guarded app role, explicit gran
 This module is the ONE home for the SQL-building helpers. Both migration paths consume it:
 
   * the DABs Workflow-job entrypoint (`dabs/migration_job.py`) renders through `render_ddl()`
-    instead of shelling out to `alembic upgrade head --sql`, and
+    to produce the idempotent reconciling DDL directly, and
   * the Liquibase generator (`liquibase/generate_changelogs.py`) imports the same four helpers
     (`role_guard_sql` / `grant_statements` / `index_statements` / `view_statements`) and
     `validate_identifier`, so "config in, idempotent SQL out" is structurally identical for both.
 
-It is also runnable standalone:
+It is also runnable standalone, piping the idempotent reconciling DDL straight into psql:
 
     python -m dabs.render_ddl [--config config/tables.json] | psql "$LAKEBASE_CONNINFO"
 
-which REPLACES the old (broken) `alembic upgrade head --sql | psql` path.
-
-Why there is no version table. The earlier DABs reconcile rendered from Alembic, which prepends an
-UNGUARDED `alembic_version` create + INSERT and wraps everything in one transaction. With a 2nd
-Alembic revision the reconcile's regex bookkeeping-patch produced a duplicate `alembic_version`
-row on the 2nd apply → `duplicate key value violates unique constraint "alembic_version_pkc"` → the
-whole transaction rolled back and the object DDL never reconciled. This renderer emits NO version
-bookkeeping at all: every statement is idempotent (guarded CREATE ROLE, idempotent GRANT,
-CREATE INDEX IF NOT EXISTS, CREATE OR REPLACE VIEW), so re-running is a clean reconciling no-op —
-which is exactly what a synced-table replace needs. There is no revision state to collide.
+Why there is no version table. This renderer emits NO migration-version bookkeeping at all: every
+statement is idempotent (guarded CREATE ROLE, idempotent GRANT, CREATE INDEX IF NOT EXISTS,
+CREATE OR REPLACE VIEW), so re-running is a clean reconciling no-op — exactly what a synced-table
+replace needs, and there is no revision state a second apply could collide with. (The rationale for
+this design is recorded in docs/adr/0006-dabs-variant-mechanics.md.)
 
 stdlib-only and dependency-free, so the serverless job entrypoint can import it with nothing beyond
-the standard library, and the offline unit suite runs it with no database and no alembic.
+the standard library, and the offline unit suite runs it with no database.
 """
 
 from __future__ import annotations
@@ -329,7 +324,7 @@ def render_ddl(tables: list[dict]) -> str:
 
     Deterministic (no timestamps / ids), so two renders are byte-identical and re-applying is a
     clean no-op. Each statement is terminated with ';' so the result executes as one multi-statement
-    apply (or pipes to psql). Contains NO `alembic_version` / no migration-version table of any kind.
+    apply (or pipes to psql). Contains no migration-version table of any kind.
     """
     validate_view_names_unique(tables)  # cross-entry: two entries must not resolve to one view
     chunks: list[str] = [_HEADER]

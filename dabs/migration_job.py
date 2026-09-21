@@ -12,12 +12,10 @@ in dabs/databricks.yml). On a run it:
      secret; consistent with the repo's no-secret posture).
 
 Re-running is a reconciling no-op: the renderer emits a pg_roles-guarded CREATE ROLE, idempotent
-GRANT, CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE VIEW (ADR 0002). There is NO Alembic and
-NO `alembic_version` table — so there is no version bookkeeping to collide with, and nothing to
-roll back on a 2nd apply. A synced-table replace therefore self-heals: every run re-applies the
-object DDL cleanly. (An earlier Alembic-rendered variant rolled back on the 2nd apply once a second
-revision existed, because its version-table INSERT tripped a duplicate-key on `alembic_version`;
-the renderer removes that class of bug entirely.)
+GRANT, CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE VIEW (ADR 0002). There is no
+version-tracking table — so there is no version bookkeeping to collide with, and nothing to roll
+back on a 2nd apply. A synced-table replace therefore self-heals: every run re-applies the object
+DDL cleanly. (Why the version-tracking variant was dropped: docs/adr/0006-dabs-variant-mechanics.md.)
 
 Design constraints that keep this OFFLINE-UNIT-TESTABLE (the live apply runs against a real
 Lakebase branch):
@@ -194,9 +192,9 @@ def render_migration_sql(*, config_path: str | Path | None = None) -> str:
     Delegates to ``dabs/render_ddl.py`` — the SAME "config in, idempotent SQL out" the Liquibase
     generator consumes. The result (what ``--dry-run`` prints AND what ``apply_sql_to_lakebase``
     executes) is a pg_roles-guarded CREATE ROLE + idempotent GRANT + CREATE INDEX IF NOT EXISTS +
-    CREATE OR REPLACE VIEW, per table. There is NO Alembic and NO ``alembic_version`` table, so
-    applying this SQL a second time — e.g. after a synced-table replace — is a clean reconciling
-    no-op, never a version-bookkeeping rollback. Returns the SQL.
+    CREATE OR REPLACE VIEW, per table. There is no version-tracking table, so applying this SQL a
+    second time — e.g. after a synced-table replace — is a clean reconciling no-op, never a
+    version-bookkeeping rollback. Returns the SQL.
     """
     render = _load_render_ddl()
     path = config_path if config_path else tables_config_path()

@@ -1,22 +1,20 @@
 """Falsifiability tests for the DABs migration RENDERER.
 
-The DABs migration reconcile no longer uses Alembic or an `alembic_version` table. A single
-Python renderer module (`dabs/render_ddl.py`) emits the idempotent reconciling DDL directly from
-`config/tables.json` by calling the four shared SQL helpers (role guard, grants, N indexes, view)
-— the SAME helpers the Liquibase generator consumes (single source of the idempotent SQL). This
-module is exposed two ways: the DABs Workflow-job entrypoint renders through it, and
+The DABs migration reconcile uses no external migration engine and no version-tracking table. A
+single Python renderer module (`dabs/render_ddl.py`) emits the idempotent reconciling DDL directly
+from `config/tables.json` by calling the four shared SQL helpers (role guard, grants, N indexes,
+view) — the SAME helpers the Liquibase generator consumes (single source of the idempotent SQL).
+This module is exposed two ways: the DABs Workflow-job entrypoint renders through it, and
 `python -m dabs.render_ddl [--config …]` prints the SQL to stdout for `… | psql`.
 
-Why this replaces the old alembic path (the bug it fixes): `alembic upgrade head --sql` prepended
-UNGUARDED version bookkeeping (`CREATE TABLE alembic_version` + an `INSERT` with no conflict
-guard). With a 2nd Alembic revision the reconcile's regex-patch (`make_rerunnable`) created a
-duplicate `alembic_version` row on the 2nd apply → `duplicate key … alembic_version_pkc` → the
-whole transaction rolled back and the object DDL never reconciled. The renderer emits NO version
-bookkeeping at all, so there is nothing to roll back — reconcile is a clean no-op on every run.
+The renderer emits NO version bookkeeping at all: every statement is idempotent (guarded CREATE
+ROLE, idempotent GRANT, CREATE INDEX IF NOT EXISTS, CREATE OR REPLACE VIEW), so there is nothing to
+roll back and reconcile is a clean no-op on every run. (Why a version-tracking variant was dropped:
+docs/adr/0006-dabs-variant-mechanics.md.)
 
 We assert on the EMITTED SQL and the CLI's observable output — never on private helper names — so
-these survive refactors and catch real regressions. No database, no alembic, no docker: this lands
-in the no-cloud `dabs-validate` CI job.
+these survive refactors and catch real regressions. No database, no docker: this lands in the
+no-cloud `dabs-validate` CI job.
 
 The fixture (`dabs/tests/fixtures/tables.json`) is HOSTILE by construction:
   - `claims` and `members` SHARE app_schema "shared_schema" with DISTINCT roles.
@@ -48,14 +46,14 @@ def _render() -> str:
     return rd.render_ddl(rd.load_tables(FIXTURE))
 
 
-# --- 1. NO alembic version bookkeeping anywhere (the fix) --------------------------------------
+# --- 1. NO migration-version bookkeeping anywhere (the fix) ------------------------------------
 
 def test_render_has_no_alembic_version_bookkeeping():
     """The rendered SQL carries NO `alembic_version` table and NO `CREATE TABLE alembic_version`
-    — the whole class of "duplicate key on the 2nd apply → rollback" is structurally impossible.
+    — the renderer emits no migration-version bookkeeping of any kind, so a re-apply is a clean
+    reconciling no-op with nothing to roll back.
 
-    MUTATION GATE: reintroduce any `alembic_version` write (or the old make_rerunnable path) and
-    this goes RED.
+    MUTATION GATE: reintroduce any `alembic_version` write and this goes RED.
     """
     sql = _render()
     assert "alembic_version" not in sql, f"renderer emitted alembic version bookkeeping:\n{sql}"
@@ -461,8 +459,7 @@ def test_render_rejects_duplicate_resolved_view_names(tmp_path):
 
 def test_cli_prints_the_rendered_sql(tmp_path):
     """`python -m dabs.render_ddl --config <fixture>` prints exactly the SQL render_ddl() produces,
-    so `python -m dabs.render_ddl | psql` applies the same idempotent DDL — this REPLACES the old,
-    broken `alembic upgrade head --sql | psql` claim.
+    so `python -m dabs.render_ddl | psql` applies the same idempotent DDL.
     """
     result = subprocess.run(
         [sys.executable, "-m", "dabs.render_ddl", "--config", str(FIXTURE)],

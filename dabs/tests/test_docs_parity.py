@@ -1,8 +1,8 @@
 """Docs falsifiability: the DABs renderer must be documented at parity with Liquibase.
 
-Asserts on the shipped docs (README + DESIGN-NOTES), so a dropped parity row or a stale
-"Alembic engine" claim fails CI. No database, no migration run. (Replaces the old alembic-era
-docs-parity test now that the DABs path renders via dabs/render_ddl.py.)
+Asserts on the shipped docs (README + DESIGN-NOTES), so a dropped parity row or a stale claim that
+the DABs path runs an external, version-tracking migration engine fails CI. No database, no
+migration run — the DABs path renders via dabs/render_ddl.py.
 """
 
 from pathlib import Path
@@ -44,18 +44,18 @@ def test_parity_table_maps_all_four_objects():
 
 
 def test_readme_documents_the_standalone_cli():
-    """The README must document the standalone `python -m dabs.render_ddl | psql` path (which
-    REPLACED the broken `alembic upgrade head --sql | psql` claim)."""
+    """The README must document the standalone `python -m dabs.render_ddl | psql` path, and must
+    not present an external migration-engine invocation in its place."""
     section = _engines_section()
     assert "python -m dabs.render_ddl" in section, "README missing the standalone renderer CLI"
     assert "alembic upgrade head --sql" not in README, (
-        "README still shows the broken `alembic upgrade head --sql` path"
+        "README shows an external migration-engine path instead of the renderer CLI"
     )
 
 
 def test_design_notes_states_no_version_table():
     """DESIGN-NOTES must state the DABs path keeps NO version table (that is what makes re-apply a
-    clean reconciling no-op) — not that it is 'gated' or run via Alembic."""
+    clean reconciling no-op) — not that it is 'gated' or tracked by a version table."""
     text = DESIGN.lower()
     assert "no version table" in text, "DESIGN-NOTES must state the DABs renderer keeps no version table"
     assert "render_ddl" in text, "DESIGN-NOTES must name the renderer (dabs/render_ddl.py)"

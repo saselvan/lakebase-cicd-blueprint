@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Docker postgres:16 DOUBLE-APPLY proof for the DABs renderer — the exact case that failed.
+# Docker postgres:16 DOUBLE-APPLY proof for the DABs renderer.
 #
-# The bug (verified on Docker PG16): the old alembic-rendered reconcile rolled the whole transaction
-# back on the SECOND apply once a second Alembic revision existed — its unguarded `alembic_version`
-# INSERT tripped `duplicate key value violates unique constraint "alembic_version_pkc"`, so the
-# object DDL never reconciled. The Python renderer (dabs/render_ddl.py) emits NO version table, so a
-# re-apply is a clean reconciling no-op.
+# The renderer (dabs/render_ddl.py) emits NO migration-version table: every statement is idempotent
+# (guarded CREATE ROLE, idempotent GRANT, CREATE INDEX IF NOT EXISTS, CREATE OR REPLACE VIEW), so
+# applying the rendered DDL a second time is a clean reconciling no-op with nothing to roll back.
+# This proves that against a real Postgres. (Why a version-tracking variant was dropped:
+# docs/adr/0006-dabs-variant-mechanics.md.)
 #
 # This is a SCRIPT, not a pytest test, so CI/pytest stay Docker-free (the offline `dabs-validate`
 # gate needs no database). Run it locally / in a Docker-capable job:
