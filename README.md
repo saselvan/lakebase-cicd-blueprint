@@ -272,8 +272,9 @@ How each path stays idempotent (the reapply-on-every-deploy behavior) is explain
 
 ## Key findings
 
-Verified end to end on the Autoscaling projects model (PostgreSQL 16, Databricks Terraform provider
-v1.132.0, Terraform v1.16.2, Liquibase 4.33.0):
+Verified end to end on the Autoscaling projects model — two synced tables in one shared schema,
+exercised through both the DABs and the Terraform + Liquibase paths against real Lakebase synced
+tables (PostgreSQL 16, Databricks Terraform provider v1.132.0, Terraform v1.16.2, Liquibase 4.33.0):
 
 - `terraform apply` does NOT block until the sync is `ONLINE`. The resource returns once the synced
   table is created. The initial load runs in the background. Use the `wait_for_sync.sh` gate before
@@ -297,7 +298,7 @@ v1.132.0, Terraform v1.16.2, Liquibase 4.33.0):
 ```
 config/tables.json  single source of truth: the tables to manage (read by DABs codegen, Terraform, and deploy.sh)
 dabs/               DABs variant (the recommended lead): databricks.yml, generate_resources.py (codegen), migration_job.py (Workflow job), render_ddl.py (the shared DDL renderer)
-dabs/resources/     generated bundle resources (one synced table + role per config entry) — do not hand-edit
+dabs/resources/     generated bundle resources (one synced table per config entry) — do not hand-edit
 terraform/          databricks_postgres_synced_table (for_each over config/tables.json)
 liquibase/          per-table generated changelogs: 001 app role, 002 explicit grants, 003 indexes, 004 consumer view (from the shared renderer helpers)
 scripts/            seed_source.sh, wait_for_sync.sh, deploy.sh, branch_test.sh

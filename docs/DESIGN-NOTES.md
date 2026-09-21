@@ -133,8 +133,9 @@ Verified across all three sync modes (Snapshot, Triggered, Continuous):
     **wedged** the synced table: the platform `DELETE` returned an error and left the table in
     `SYNCED_TABLE_OFFLINE_FAILED`, a state a **redeploy cannot clear** (it matches a known platform
     incident). The `runAlways` migration never gets a healthy table to reapply against, so a plain
-    redeploy does **not** recover it. In the repro, recovery required deleting and recreating the
-    branch; on a real project, **open a support case**. Mechanically the view dependency is what
+    redeploy does **not** recover it — **open a support case**. (In the throwaway repro branch,
+    recovery required deleting and recreating the branch; that is not an option on a real project.)
+    Mechanically the view dependency is what
     blocks the base-table drop, but the operational takeaway is simple: do **not** attempt an
     in-place sync-mode change on a table that has a consumer view. Use a **blue/green swap** instead —
     see "Changing sync mode: prefer a blue/green swap" below.
