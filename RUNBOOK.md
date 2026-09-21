@@ -85,7 +85,7 @@ export PGUSER=<your-databricks-username>   # your login email
 
 - Lakebase here is the **Autoscaling projects** model (`databricks postgres ...`), not standalone
   database instances. Terraform resource: `databricks_postgres_synced_table`.
-- Find the writer role id (used in the writer role name) on your instance:
+- Find the writer role id (used in the writer role name) on the branch endpoint:
   `SELECT rolname FROM pg_roles WHERE rolname LIKE 'databricks_writer_%';`
 
 ## CI auth — the secure way (READ before wiring GitHub)

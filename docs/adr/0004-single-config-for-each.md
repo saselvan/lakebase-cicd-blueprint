@@ -22,4 +22,4 @@ one-line JSON edit — no new resource, no script change.
 - **Index columns are the one inherently table-specific spot** — the generator emits one index
   changeset per `index_columns` entry (0/1/N, no cap); unusual index shapes edit the generated
   changelog.
-- All tables are assumed to share one project/branch/instance/host (see TROUBLESHOOTING).
+- All tables are assumed to share one project/branch/endpoint host (see TROUBLESHOOTING).

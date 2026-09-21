@@ -1,5 +1,5 @@
 ## Lakebase CI/CD reference — one-command entrypoint.
-## Run `make help` to see targets. Set PROFILE/INSTANCE/HOST/PGUSER/WAREHOUSE_ID in your env.
+## Run `make help` to see targets. Set PROFILE/PROJECT/BRANCH/PGUSER/WAREHOUSE_ID in your env.
 
 .DEFAULT_GOAL := help
 .PHONY: help validate fmt seed deploy branch
@@ -9,7 +9,7 @@ help: ## Show this help
 		| awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "  Config:  edit config/tables.json (the tables) + terraform/terraform.tfvars"
-	@echo "  Env:     PROFILE INSTANCE HOST PGUSER  (WAREHOUSE_ID for seed)"
+	@echo "  Env:     PROFILE PROJECT BRANCH PGUSER  (WAREHOUSE_ID for seed)"
 
 validate: ## Local checks, no cloud: terraform validate/fmt, bash syntax, tables.json JSON
 	cd terraform && terraform init -backend=false >/dev/null && terraform validate && terraform fmt -check
