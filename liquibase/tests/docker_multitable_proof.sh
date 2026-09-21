@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# STATE-LEVEL proof for FIX A against a real Docker postgres:16 (no cloud, no Lakebase needed).
+# STATE-LEVEL proof of the per-table changelog design against a real Docker postgres:16
+# (no cloud, no Lakebase needed).
 #
 # Reproduces the exact live-broken case — TWO synced tables in ONE shared app_schema, one shared
 # DATABASECHANGELOG — and proves the per-table generated changelogs let BOTH tables' migrations
