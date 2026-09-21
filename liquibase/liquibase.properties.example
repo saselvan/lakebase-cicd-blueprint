@@ -1,7 +1,9 @@
 # Copy to liquibase.properties (gitignored) and fill via env. Never commit real creds.
-# host = the instance read_write DNS endpoint for your Lakebase project/branch.
+# host = the branch's READ_WRITE compute endpoint host for your Lakebase project/branch.
 url=jdbc:postgresql://your-lakebase-endpoint.database.cloud.databricks.com:5432/databricks_postgres?sslmode=require
 username=${LAKEBASE_USER}
 password=${LAKEBASE_PASSWORD}
-changelogFile=changelog/db.changelog-master.xml
+# There is no single changelog: the pipeline runs ONE generated changelog PER table
+# (liquibase/generated/<name>.changelog.sql), so scripts/deploy.sh passes --changeLogFile per
+# table instead of a fixed value here. Regenerate with `python3 liquibase/generate_changelogs.py`.
 liquibase.hub.mode=off

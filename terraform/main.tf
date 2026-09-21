@@ -15,11 +15,13 @@ resource "databricks_postgres_synced_table" "t" {
   synced_table_id = each.value.synced_table_id # catalog.schema.table (UC)
 
   spec = {
-    branch                             = var.branch
-    postgres_database                  = var.logical_database
-    source_table_full_name             = each.value.source_table_full_name
-    primary_key_columns                = each.value.primary_key_columns
-    scheduling_policy                  = "SNAPSHOT"
+    branch                 = var.branch
+    postgres_database      = var.logical_database
+    source_table_full_name = each.value.source_table_full_name
+    primary_key_columns    = each.value.primary_key_columns
+    # Per-table scheduling_policy from config/tables.json, defaulting to SNAPSHOT when the field is
+    # absent — matching the DABs generator so both paths honor the same optional config field.
+    scheduling_policy                  = try(each.value.scheduling_policy, "SNAPSHOT")
     create_database_objects_if_missing = true
 
     new_pipeline_spec = {
