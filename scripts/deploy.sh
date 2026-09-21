@@ -52,28 +52,26 @@ echo "== 1b. verify committed per-table Liquibase changelogs are in sync with co
 # Regenerate + commit is a reviewed change, done before deploy; the deploy applies exactly that.
 python3 "$ROOT/liquibase/generate_changelogs.py" --check
 
-# Resolve the branch's READ_WRITE endpoint and mint a short-lived OAuth token FROM it, once,
-# reused for every table's liquibase + psql run. Host and token both come from that one endpoint.
-echo "== resolve branch READ_WRITE endpoint + mint runtime Lakebase credential =="
-lakebase_resolve_and_mint "$LAKEBASE_BRANCH" "$PROFILE"
-HOST="$LB_HOST"
-TOKEN="$LB_TOKEN"
-echo "  branch=$LAKEBASE_BRANCH host=$HOST endpoint=$LB_ENDPOINT"
-URL="jdbc:postgresql://$HOST:5432/databricks_postgres?sslmode=require"
-export PGHOST="$HOST" PGPORT=5432 PGDATABASE=databricks_postgres PGSSLMODE=require PGUSER="$PGUSER" PGPASSWORD="$TOKEN"
-
 # Iterate every table entry in the single source of truth.
 COUNT=$(python3 -c "import json;print(len(json.load(open('$CONFIG'))))")
 for (( i = 0; i < COUNT; i++ )); do
-  # Extract this table's fields as shell-safe assignments (shlex-quoted).
-  eval "$(python3 - "$CONFIG" "$i" <<'PY'
+  # Extract this table's fields as shell-safe assignments (shlex-quoted). T_VIEW is the RESOLVED
+  # consumer-view name (config `view_name` override, else derived <pg_table>_v) — emitted via the
+  # ONE shared seam dabs.render_ddl.resolve_view_name, the exact function both generators use, so
+  # verify (step 4) looks for the SAME view the changelog created. Repo root goes on sys.path
+  # (passed as the 3rd arg) exactly as liquibase/generate_changelogs.py does; the import is stdlib-only.
+  eval "$(python3 - "$CONFIG" "$i" "$ROOT" <<'PY'
 import json, sys, shlex
+sys.path.insert(0, sys.argv[3])
+from dabs.render_ddl import resolve_view_name
 t = json.load(open(sys.argv[1]))[int(sys.argv[2])]
 def emit(k, v): print(f"{k}={shlex.quote(str(v))}")
 emit("T_NAME",   t["name"])
 emit("T_STID",   t["synced_table_id"])
 emit("T_SCHEMA", t["app_schema"])
 emit("T_ROLE",   t["app_role"])
+pg_table = str(t["synced_table_id"]).split(".")[-1]   # last part of the 3-part UC name
+emit("T_VIEW",   resolve_view_name(t, pg_table))      # override or derived <pg_table>_v (shared seam)
 # index columns as a shell array (0/1/N), each shlex-quoted -> read straight into T_IDX=(...)
 cols = t.get("index_columns") or []
 print("T_IDX=(" + " ".join(shlex.quote(str(c)) for c in cols) + ")")
@@ -85,6 +83,18 @@ PY
 
   echo "== 2. wait for initial sync =="
   "$ROOT/scripts/wait_for_sync.sh" "$T_STID" "$PROFILE"
+
+  # Resolve the branch's READ_WRITE endpoint and mint a short-lived OAuth token FROM it INSIDE the
+  # loop, AFTER the wait: each table's wait_for_sync can block for ~30 min, so a token minted once
+  # before the loop could expire mid-run. Minting per table is cheap and short-lived; host + token
+  # both come from the one resolved endpoint. Re-export PG* / URL from the fresh LB_HOST / LB_TOKEN.
+  echo "== resolve branch READ_WRITE endpoint + mint runtime Lakebase credential =="
+  lakebase_resolve_and_mint "$LAKEBASE_BRANCH" "$PROFILE"
+  HOST="$LB_HOST"
+  TOKEN="$LB_TOKEN"
+  echo "  branch=$LAKEBASE_BRANCH host=$HOST endpoint=$LB_ENDPOINT"
+  URL="jdbc:postgresql://$HOST:5432/databricks_postgres?sslmode=require"
+  export PGHOST="$HOST" PGPORT=5432 PGDATABASE=databricks_postgres PGSSLMODE=require PGUSER="$PGUSER" PGPASSWORD="$TOKEN"
 
   echo "== 3. liquibase update (this table's OWN generated changelog) =="
   # Each table runs its OWN changelog (generated/<name>.changelog.sql), with role/schema/table and
@@ -102,9 +112,9 @@ PY
   # swallowed the way the old `2>&1`-and-ignore inline psql checks were.
   # ${#T_IDX[@]} guards the empty-array expansion for a table with zero index_columns (bash 3.2).
   if [ "${#T_IDX[@]}" -gt 0 ]; then
-    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "${PG_TABLE}_v" "${T_IDX[@]}"
+    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW" "${T_IDX[@]}"
   else
-    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "${PG_TABLE}_v"
+    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW"
   fi
 done
 
