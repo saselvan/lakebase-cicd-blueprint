@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# STATE-LEVEL proof for FIX C against a real Docker postgres:16 (no cloud, no Lakebase needed).
+# STATE-LEVEL proof for the deploy verify step against a real Docker postgres:16 (no cloud, no Lakebase needed).
 #
 # scripts/deploy.sh step 4 "verify" used to run its psql checks as `... 2>&1 || true` and never
 # inspect the output, so a false post-condition (app role NOT granted SELECT on its consumer view,

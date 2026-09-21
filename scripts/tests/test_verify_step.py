@@ -1,9 +1,9 @@
 """Offline, Docker-free unit test of the extracted verify step (scripts/verify_table.sh).
 
-Fix C. scripts/deploy.sh step 4 used to run its psql checks with `2>&1 || true` and never read
-the result, so a false post-condition — the app role NOT granted SELECT on its consumer view, or a
-missing index — still printed output and exited 0. The README/RUNBOOK sell step 4 as THE guarantee
-that the app role can read and the indexes exist, but as written it could not fail.
+scripts/deploy.sh step 4 (verify) asserts the real post-conditions and fails the pipeline when any
+is unmet: the app role can SELECT its consumer view, and every expected index exists. This test
+drives `verify_table` against stubbed psql results and confirms it exits non-zero on a false
+post-condition — the app role NOT granted SELECT on its consumer view, or a missing index.
 
 The verify logic now lives in scripts/verify_table.sh's `verify_table` function, which ASSERTS
 each post-condition and returns NON-ZERO on the first table whose post-conditions are not met:
