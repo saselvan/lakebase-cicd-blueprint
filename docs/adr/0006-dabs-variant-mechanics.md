@@ -38,6 +38,11 @@ The DABs lead (ADR 0005) needs three mechanics settled: how migrations run, how 
   exchange, not network ingress. Fixes: IT-managed/self-hosted runner with stable egress, allowlisted
   egress, or an internally-triggered Workflow if GHA workspace access must be eliminated.
 - Adding a table stays a one-line `config/tables.json` edit; the codegen step keeps DABs in sync.
-- **Acceptance (not yet done):** must be verified end-to-end against a live Lakebase instance — including
-  the synced-table replace → reapply test — before the README claims "live-tested." (Status flips to
-  done only with command evidence.)
+- **Acceptance (done):** verified end-to-end against real Lakebase synced tables on the Autoscaling
+  projects model — two tables in one shared schema, through both paths. The DABs path (`bundle deploy`
+  + the migration job) and the Terraform + Liquibase path (`deploy.sh`) each brought both tables to
+  `ONLINE`, applied the app role, schema grants, indexes, and per-table consumer view, and left the
+  app role able to read its view but denied on the base table. The per-table `view_name` override was
+  exercised on both paths (the overridden view is created; the derived name is absent). The
+  synced-table replace → reapply behavior is covered by the double-apply Docker proof and the
+  sync-mode-change findings in DESIGN-NOTES/TROUBLESHOOTING.
