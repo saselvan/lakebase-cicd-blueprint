@@ -73,8 +73,8 @@ the view, which the view's owner resolves against the base table it can already 
 for decoupling and row filtering, not to work around a grant limitation.
 
 **App roles need `CREATEROLE` once.** Every other step above runs as a deploy identity with no
-superuser and no `CREATEROLE` (tested live). Changeset `001` (`CREATE ROLE`) does not: create app
-roles once as an admin, or grant the deploy identity `CREATEROLE`. Keep one deploy identity for the
+superuser and no `CREATEROLE` (tested live). See README "Who does what". Changeset `001` (`CREATE ROLE`) does not: an admin
+creates each app role once, so the deploy identity never needs `CREATEROLE`. Keep one deploy identity for the
 life of the tables: it owns the view and schema it creates, and no other identity can drop them.
 
 ### Row-level filtering (RLS is off the table — use the view)

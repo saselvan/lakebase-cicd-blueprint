@@ -19,7 +19,7 @@ Liquibase, so it `CREATE OR REPLACE VIEW`s over the synced table and grants cons
 - Consumers read the view, never the base table — a clean indirection for future row filtering (see
   RLS note in DESIGN-NOTES).
 - Requires discipline: the synced-table creator and the view owner must be the same principal.
-- `CREATE ROLE` (changeset `001`) needs the `CREATEROLE` attribute. Create app roles once as an admin, or
-  grant the deploy identity `CREATEROLE`. Every other step runs without it (tested live).
+- `CREATE ROLE` (changeset `001`) needs the `CREATEROLE` attribute. An admin creates each app role once;
+  the deploy identity never holds `CREATEROLE`. Every other step runs without it (tested live).
 - Objects the deploy identity creates (view, schema) can only be dropped by that identity, so keep one
   deploy identity for the life of the tables.
