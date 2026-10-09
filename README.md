@@ -138,8 +138,11 @@ creates; another identity, even the project owner, cannot.
 - **A branch holds a copy of its parent's rows.** Every PR branch made from production holds
   production data. For regulated data, make PR branches from a branch that holds masked or synthetic
   data, and limit who can connect to them.
-- **Can Manage can delete branches.** Make the production branch protected, so the PR service
-  principal cannot delete or reset it. (This repo does not test protection.)
+- **Can Manage can delete branches.** Make the production branch protected: a delete then fails with
+  `cannot delete protected branch` (tested live). Protection stops accidents and buggy scripts, not
+  a bad actor: the same Can Manage identity can turn protection off and then delete (also tested).
+  So keep the PR service principal's secret tightly scoped, and watch the audit log for
+  protection changes.
 - **The deploy service principal can read all synced data and grant it onward.** Use it only in the
   production deploy job, and do not reuse it for anything else.
 - **The workflows here use one set of secrets for PR and deploy jobs, for brevity.** Give each job
