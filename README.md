@@ -114,8 +114,40 @@ needed. The deploy identity *could* grant base-table `SELECT` onward directly â€
 OPTION`, so this is not a superuser-only operation â€” but this reference deliberately does not: the
 view exists for decoupling and row filtering, not to work around a grant limitation.
 
-The grant, index, and view steps run on every deploy. They are reapplied after a table replace, so
-access comes back on the next run.
+### Who does what
+
+Split the work across four identities. Each one gets only what its job needs.
+
+| Identity | Job | What it can do |
+|---|---|---|
+| Admin (a person, once per app role) | Creates each app role before the first deploy | `CREATEROLE`. Not used by any pipeline. |
+| Deploy service principal (production deploys only) | Creates the synced tables; runs Liquibase (grants, indexes, view) | Owns the view and the Postgres schema it creates. As the synced table's creator it holds `SELECT`, `DELETE` and `TRUNCATE` on it, with grant option. This is automatic and cannot be turned off. |
+| PR service principal (pull requests only) | Creates and deletes the per-PR branch; runs migrations there | Creating a branch needs **Can Manage** on the project. |
+| App role (`NOLOGIN`) | What the application reads as | `USAGE` on the schema and `SELECT` on the view. Denied the base table. |
+
+Tested live: a deploy service principal with no superuser and no `CREATEROLE` created the synced
+table, the index, the view and the view grant, and re-ran all of it cleanly. Only changeset `001`
+(`CREATE ROLE`) failed, because Postgres needs `CREATEROLE` to create a role. The changeset skips a
+role that already exists, so an admin creates it once and the pipeline never needs that attribute.
+
+Keep one deploy identity for the life of the tables. Only it can drop the view and schema it
+creates; another identity, even the project owner, cannot.
+
+### Before you point this at sensitive data
+
+- **A branch holds a copy of its parent's rows.** Every PR branch made from production holds
+  production data. For regulated data, make PR branches from a branch that holds masked or synthetic
+  data, and limit who can connect to them.
+- **Can Manage can delete branches.** Make the production branch protected: a delete then fails with
+  `cannot delete protected branch` (tested live). Protection stops accidents and buggy scripts, not
+  a bad actor: the same Can Manage identity can turn protection off and then delete (also tested).
+  So keep the PR service principal's secret tightly scoped, and watch the audit log for
+  protection changes.
+- **The deploy service principal can read all synced data and grant it onward.** Use it only in the
+  production deploy job, and do not reuse it for anything else.
+- **The workflows here use one set of secrets for PR and deploy jobs, for brevity.** Give each job
+  its own service principal (for example with GitHub environments), and prefer workload identity
+  federation (OIDC) over long-lived client secrets (see `deploy.yml`).
 
 ### One caveat about self-healing
 
