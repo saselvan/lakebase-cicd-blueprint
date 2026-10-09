@@ -114,6 +114,21 @@ needed. The deploy identity *could* grant base-table `SELECT` onward directly â€
 OPTION`, so this is not a superuser-only operation â€” but this reference deliberately does not: the
 view exists for decoupling and row filtering, not to work around a grant limitation.
 
+### What still needs an admin, once
+
+Tested live with a deploy service principal that is not a superuser (`rolsuper` false, no
+`CREATEROLE`, not a member of `databricks_superuser`) and that created the synced table itself: it
+created the index on the synced table, created the view, granted the app role `SELECT` on the view,
+and re-ran all of it cleanly. The app role then read the view and was denied the base table.
+
+One step failed: changeset `001` (`CREATE ROLE`). Postgres requires the `CREATEROLE` attribute to
+create a role. So either create each app role once as an admin before the first deploy (the
+changeset is guarded and skips a role that exists), or give the deploy identity `CREATEROLE`. The
+first keeps the deploy identity smaller.
+
+Also keep one deploy identity for the life of the tables. It owns the view and the Postgres schema
+it creates, and another identity, even the project owner, cannot drop those objects.
+
 The grant, index, and view steps run on every deploy. They are reapplied after a table replace, so
 access comes back on the next run.
 
