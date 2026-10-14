@@ -7,7 +7,7 @@ A step-by-step walkthrough of the reference pipeline, so you can run it and expl
 **Terraform builds the infrastructure (the synced table), we wait for the first load to finish, then
 Liquibase applies the database objects (role, grants, indexes, consumer view) — and it's all
 idempotent, so grants are reapplied every run and access is restored after a table replace.** (A
-drop/replace still has a brief gap — it is not zero-downtime; see `docs/DESIGN-NOTES.md` → "Keeping access through refreshes and rebuilds".)
+drop/replace still has a gap — it is not zero-downtime: measured live at about 50 s of app read outage on a 3-row table, mostly the initial sync, so it grows with table size; see `docs/DESIGN-NOTES.md` → "Keeping access through refreshes and rebuilds".)
 
 ## Who does what
 
@@ -26,7 +26,7 @@ export PROFILE=<your-cli-profile>
 export WAREHOUSE_ID=<your-sql-warehouse-id>
 export PROJECT=<your-lakebase-project-id>   # deploy is branch-driven; default my-lakebase-project
 export BRANCH=<branch-to-deploy-to>         # default main
-export PGUSER=<your-databricks-username>   # your login email
+export PGUSER=<your-databricks-username>   # your login email; for a service principal, its application id
 
 # 0. one-time: create the demo Delta source table the sync reads from
 ./scripts/seed_source.sh
@@ -80,6 +80,49 @@ export PGUSER=<your-databricks-username>   # your login email
 6. **Branches need an expiry** (`ttl` / `no_expiry`) at create time, and auto-get a `primary` endpoint.
 7. **Sync-ready signal** = `databricks postgres get-synced-table synced_tables/<cat.schema.table>`
    → `status.detailed_state` contains `ONLINE` (used by `wait_for_sync.sh`).
+
+## Testing drift (break and heal)
+
+To prove verify catches drift, remove one grant **as the deploy service principal** (the identity
+that made it):
+
+```sql
+REVOKE SELECT ON <schema>.<view> FROM <app_role>;
+```
+
+Verify then fails on one line (the app role's `SELECT` on the view), and a plain `deploy.sh` re-runs
+the `runAlways` changesets and verify passes again. Run as the **project owner**, the same statement
+returns `REVOKE` and changes nothing, with no warning: Postgres removes only grants the caller made,
+and the deploy SP made this one.
+
+## Rotating the deploy service principal
+
+Plan it like a table replace: the app cannot read between steps 2 and 4, and the initial sync makes
+that gap grow with table size. Do it **before** you delete the old SP.
+
+`REASSIGN OWNED` alone is not enough. It moves the view, schema and Liquibase tables, but the new SP
+still gets `[Databricks SyncedTable] permission denied for synced table operation` on the index
+changeset (`CREATE INDEX IF NOT EXISTS`), so every deploy fails; and the app gets
+`permission denied for table <table>` through the view until the new SP holds `SELECT` on the base
+table. The synced table has to be re-created by the new SP so it holds the creator's grants.
+
+What worked (tested live):
+
+1. The project owner grants itself both SP roles, moves ownership, then revokes both memberships:
+   ```sql
+   GRANT "<old-sp>" TO CURRENT_USER WITH INHERIT TRUE, SET TRUE;
+   GRANT "<new-sp>" TO CURRENT_USER WITH INHERIT TRUE, SET TRUE;
+   REASSIGN OWNED BY "<old-sp>" TO "<new-sp>";
+   REVOKE "<old-sp>" FROM CURRENT_USER;
+   REVOKE "<new-sp>" FROM CURRENT_USER;
+   ```
+2. The new SP drops the view (it owns it now): `DROP VIEW <schema>.<view>;`
+3. An admin deletes the old synced table and removes it from Terraform state:
+   `databricks postgres delete-synced-table synced_tables/<catalog.schema.table>` and
+   `terraform state rm 'databricks_postgres_synced_table.t["<table>"]'`.
+4. Run `deploy.sh` as the new SP (`PGUSER=<new-sp application id>`, profile/tfvars for the new SP).
+   Observed: `Resources: 1 added`, ONLINE in about 30 s, Liquibase `Previously run: 1` (the changelog
+   history carried over), verify 5/5.
 
 ## Project facts
 

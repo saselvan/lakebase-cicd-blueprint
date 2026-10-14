@@ -145,7 +145,13 @@ Verified across all three sync modes (Snapshot, Triggered, Continuous):
     in-place sync-mode change on a table that has a consumer view. Use a **blue/green swap** instead —
     see "Changing sync mode: prefer a blue/green swap" below.
 
-Treat a sync-mode change as a planned rebuild, not a live toggle — and pick Triggered/Continuous at
+- **A replace is not zero-downtime.** Measured live (one 3-row table: drop view, `terraform apply
+  -replace`, `deploy.sh`): the app could not read for about 50 s, from the view drop until the
+  redeploy put it back. Terraform destroy + create took about 15 s; the initial sync plus Liquibase
+  took the rest, so the gap grows with table size.
+
+A sync-mode change is a delete + recreate: the platform cannot change a synced table's sync mode in
+place through any interface, so Terraform plans a replace. Treat a sync-mode change as a planned rebuild, not a live toggle — and pick Triggered/Continuous at
 create time if row-incremental is the goal, since flipping mode on a live table forces the replace above.
 
 ### Changing sync mode: prefer a blue/green swap
@@ -252,6 +258,16 @@ with the Liquibase path.
 (Why no Alembic: an earlier variant rendered from Alembic and could roll the whole transaction back
 on a second apply because of its `alembic_version` bookkeeping, so dropping the framework removes
 that class of bug — see [ADR 0006](adr/0006-dabs-variant-mechanics.md) for the full rationale.)
+
+## Validated live 2026-10-14 (deploy as a service principal)
+
+Run on a throwaway branch with a non-superuser deploy SP (no `CREATEROLE`), one 3-row SNAPSHOT table.
+
+- S1, full flow as the deploy SP: PASS. 1 added, ONLINE in about 20 s, Liquibase ran 5, verify 5/5; the SP owns the schema, view and Liquibase tables.
+- S2, break and heal: PASS when the deploy SP revokes; the project owner's identical `REVOKE` changed nothing (see RUNBOOK → "Testing drift").
+- S3, second deploy identity: PASS (fails loudly). Another SP and the project owner get `permission denied` / `must be owner`; its deploy fails at Terraform and Liquibase.
+- S4, rotating the deploy SP: `REASSIGN OWNED` alone fails on the index changeset; rebuilding the synced table as the new SP works (see RUNBOOK → "Rotating the deploy service principal").
+- S5, app role: PASS. Reads 3 rows through the view, denied the base table.
 
 ## Key decisions at a glance
 

@@ -18,7 +18,8 @@
 #   PROFILE  Databricks CLI profile                              (default DEFAULT)
 #   PROJECT  Lakebase project id                                 (default my-lakebase-project)
 #   BRANCH   branch to deploy to, within that project            (default main)
-#   PGUSER   your Databricks username (email)                    (required)
+#   PGUSER   your Databricks username (email); when deploying as a service
+#            principal, the SP's application id                 (required)
 # The deploy is BRANCH-DRIVEN: it resolves projects/$PROJECT/branches/$BRANCH to that branch's
 # READ_WRITE compute endpoint and mints a runtime OAuth token FROM that endpoint (projects /
 # Autoscaling API). There is no database-instance name and no manual HOST -- the host is derived
@@ -28,7 +29,7 @@ set -euo pipefail
 PROFILE="${PROFILE:-DEFAULT}"
 PROJECT="${PROJECT:-my-lakebase-project}"
 BRANCH="${BRANCH:-main}"
-PGUSER="${PGUSER:?set PGUSER to your Databricks username (email)}"
+PGUSER="${PGUSER:?set PGUSER to your Databricks username (email), or the service principal application id when deploying as an SP}"
 LAKEBASE_BRANCH="projects/$PROJECT/branches/$BRANCH"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG="$ROOT/config/tables.json"
