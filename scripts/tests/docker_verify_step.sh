@@ -91,6 +91,31 @@ psql -v ON_ERROR_STOP=1 -q \
   -c "DROP INDEX IF EXISTS $SCHEMA.idx_${TABLE}_plan_code;"
 expect nonzero "missing index -> non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
 
+echo ""; echo "===== NEGATIVE: schema USAGE REVOKED (index restored) ====="
+psql -v ON_ERROR_STOP=1 -q \
+  -c "CREATE INDEX IF NOT EXISTS idx_${TABLE}_plan_code ON $SCHEMA.$TABLE (plan_code);" \
+  -c "REVOKE USAGE ON SCHEMA $SCHEMA FROM $ROLE;"
+expect nonzero "missing schema USAGE -> non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+
+echo ""; echo "===== NEGATIVE: view owner lost SELECT on the base table (rotation shape) ====="
+# The live rotation spike (2026-10-14): after REASSIGN OWNED, the new owner of the view did not hold
+# SELECT on the synced table. Every catalog check stayed 't', but a real read through the view
+# failed with "permission denied for table members". Postgres checks the base table as the VIEW
+# OWNER, so a view owned by a role without base SELECT reproduces it, even for a superuser caller.
+psql -v ON_ERROR_STOP=1 -q \
+  -c "GRANT USAGE ON SCHEMA $SCHEMA TO $ROLE;" \
+  -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='new_view_owner') THEN CREATE ROLE new_view_owner NOLOGIN; END IF; END \$\$;" \
+  -c "GRANT USAGE ON SCHEMA $SCHEMA TO new_view_owner;" \
+  -c "ALTER VIEW $SCHEMA.$VIEW OWNER TO new_view_owner;" \
+  -c "GRANT SELECT ON $SCHEMA.$VIEW TO $ROLE;"
+catalog_ok="$(psql -tAc "SELECT has_table_privilege('$ROLE','$SCHEMA.$VIEW','SELECT')" | tr -d '[:space:]')"
+if [ "$catalog_ok" = "t" ]; then
+  echo "  OK   catalog check alone still says the app role can SELECT the view (t)"
+else
+  echo "  FAIL setup: expected the catalog check to stay t, got '$catalog_ok'"; fail=1
+fi
+expect nonzero "view owner without base SELECT -> non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+
 echo ""
 if [ "$fail" = 0 ]; then
   echo "VERDICT: PASS — verify exits 0 only when the app role can read the view AND all indexes exist."

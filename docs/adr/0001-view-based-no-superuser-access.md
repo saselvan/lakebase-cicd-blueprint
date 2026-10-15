@@ -5,8 +5,7 @@
 ## Context
 Synced tables are owned by an internal managed role (`databricks_writer_<dbid>`). You cannot join
 that role or change its default privileges — not even as a superuser — so `ALTER DEFAULT PRIVILEGES`
-can't grant app access to future synced objects. Granting a *different* identity direct access to the
-base table requires `databricks_superuser`, which is `NOLOGIN` and not meant for automation.
+can't grant app access to future synced objects. A view needs only `SELECT` on the synced table, which its creator is granted. Granting the table itself to the app would also need the grant option.
 
 ## Decision
 Grant app access through a **consumer view owned by the deploy identity**, not the base table.
