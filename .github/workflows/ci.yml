@@ -135,6 +135,9 @@ jobs:
       - name: Proof — Liquibase multi-table shared schema, both roles/views created
         run: bash liquibase/tests/docker_multitable_proof.sh
 
+      - name: Proof — a changed consumer view applies on the next deploy (runAlways reruns, no checksum error)
+        run: bash liquibase/tests/docker_view_edit_proof.sh
+
       - name: Proof — DABs renderer double-apply is a clean reconciling no-op
         run: bash dabs/tests/docker_double_apply_proof.sh
 

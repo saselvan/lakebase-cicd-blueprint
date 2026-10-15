@@ -14,9 +14,10 @@ while (( elapsed < TIMEOUT )); do
   state=$(databricks postgres get-synced-table "synced_tables/$TABLE" -p "$PROFILE" -o json 2>/dev/null \
     | python3 -c "import sys,json;print(json.load(sys.stdin).get('status',{}).get('detailed_state','?'))")
   echo "synced_table=$TABLE state=$state (${elapsed}s)"
+  # FAILED/ERROR first: SYNCED_TABLE_ONLINE_PIPELINE_FAILED contains ONLINE too, and must fail.
   case "$state" in
-    *ONLINE*)         echo "sync online"; exit 0 ;;
     *FAILED*|*ERROR*) echo "sync FAILED"; exit 1 ;;
+    *ONLINE*)         echo "sync online"; exit 0 ;;
   esac
   sleep "$interval"
   elapsed=$(( elapsed + interval ))
