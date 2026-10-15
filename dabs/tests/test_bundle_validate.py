@@ -173,3 +173,61 @@ def test_injected_bad_resource_field_fails_strict_validate(tmp_path):
         "strict validate accepted an unknown resource field:\n"
         f"STDOUT:{res.stdout}\nSTDERR:{res.stderr}"
     )
+
+
+def _job_tasks(bundle: Path, host: str, target: str) -> dict[str, dict]:
+    """The MERGED migration job tasks for a target, keyed by task_key (read from validate -o json,
+    so a target override that merges wrongly shows here, not only in the exit code)."""
+    res = _validate(bundle, host, target=target, json_out=True)
+    assert res.returncode == 0, f"validate -o json failed for {target}:\n{res.stderr}"
+    job = json.loads(res.stdout)["resources"]["jobs"]["lakebase_migration"]
+    return {t["task_key"]: t for t in job["tasks"]}
+
+
+def _deps(task: dict) -> list[str]:
+    return sorted(d["task_key"] for d in (task.get("depends_on") or []))
+
+
+def _params(task: dict) -> list[str]:
+    return task["spark_python_task"]["parameters"]
+
+
+def test_prod_job_runs_the_identity_policy_before_migrate_and_verify_after(tmp_path):
+    """Prod: verify_identity_policy -> migrate -> verify. The guard is a gate (migrate depends on
+    it) and has no off switch in its parameters; verify runs after migrate.
+
+    Mutations: drop migrate's prod depends_on -> red; move the guard into the base job (so dev gets
+    it) -> the dev test is red; remove the verify task -> red; give the guard a skip parameter -> red.
+    """
+    bundle = _bundle_dir(tmp_path)
+    assert _codegen(REAL_CONFIG, bundle / "resources").returncode == 0
+    shutil.copy(REPO_ROOT / "dabs" / "checks.py", bundle / "checks.py")
+    with _Mock() as host:
+        tasks = _job_tasks(bundle, host, "prod")
+    assert sorted(tasks) == ["migrate", "verify", "verify_identity_policy"], sorted(tasks)
+    assert _deps(tasks["migrate"]) == ["verify_identity_policy"], tasks["migrate"]
+    assert _deps(tasks["verify"]) == ["migrate"], tasks["verify"]
+    assert _deps(tasks["verify_identity_policy"]) == [], tasks["verify_identity_policy"]
+    guard = _params(tasks["verify_identity_policy"])
+    assert guard[guard.index("--step") + 1] == "policy", guard
+    assert "--expected-identity" in guard, guard
+    assert not [p for p in guard if "skip" in p.lower() or "disable" in p.lower()], guard
+    # The override must MERGE into migrate, not replace it: migrate still runs the migrate step.
+    assert "migration_job.py" in tasks["migrate"]["spark_python_task"]["python_file"], tasks["migrate"]
+    assert "--step" not in _params(tasks["migrate"]) or \
+        _params(tasks["migrate"])[_params(tasks["migrate"]).index("--step") + 1] == "migrate"
+    verify = _params(tasks["verify"])
+    assert verify[verify.index("--step") + 1] == "verify", verify
+
+
+def test_dev_job_has_no_identity_policy_and_migrate_runs_first(tmp_path):
+    """Dev runs as the person who deploys (often the project owner, a databricks_superuser member),
+    so the guard is defined in prod only. Dev keeps migrate -> verify."""
+    bundle = _bundle_dir(tmp_path)
+    assert _codegen(REAL_CONFIG, bundle / "resources").returncode == 0
+    shutil.copy(REPO_ROOT / "dabs" / "checks.py", bundle / "checks.py")
+    with _Mock() as host:
+        tasks = _job_tasks(bundle, host, "dev")
+    assert sorted(tasks) == ["migrate", "verify"], sorted(tasks)
+    assert _deps(tasks["migrate"]) == [], tasks["migrate"]
+    assert _deps(tasks["verify"]) == ["migrate"], tasks["verify"]
