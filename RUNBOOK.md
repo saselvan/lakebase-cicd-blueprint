@@ -116,13 +116,19 @@ What worked (tested live):
    REVOKE "<old-sp>" FROM CURRENT_USER;
    REVOKE "<new-sp>" FROM CURRENT_USER;
    ```
-2. The new SP drops the view (it owns it now): `DROP VIEW <schema>.<view>;`
-3. An admin deletes the old synced table and removes it from Terraform state:
-   `databricks postgres delete-synced-table synced_tables/<catalog.schema.table>` and
-   `terraform state rm 'databricks_postgres_synced_table.t["<table>"]'`.
+Run steps 2 and 3 **once for each entry in `config/tables.json`** (the shipped config has two:
+`members` and `providers`). A table you skip keeps the old SP's creator grants, so the new SP's
+deploy still fails on that table's index changeset.
+
+2. The new SP drops each consumer view (it owns them now): `DROP VIEW <app_schema>.<view_name>;`
+   (`view_name` defaults to `<synced table>_v`, see `config/README.md`).
+3. An admin deletes each old synced table and removes it from Terraform state:
+   `databricks postgres delete-synced-table synced_tables/<synced_table_id>` and
+   `terraform state rm 'databricks_postgres_synced_table.t["<name>"]'`.
 4. Run `deploy.sh` as the new SP (`PGUSER=<new-sp application id>`, profile/tfvars for the new SP).
-   Observed: `Resources: 1 added`, ONLINE in about 30 s, Liquibase `Previously run: 1` (the changelog
-   history carried over), verify 5/5.
+   Observed live with one table: `Resources: 1 added`, ONLINE in about 30 s, Liquibase
+   `Previously run: 1` (the changelog history carried over), verify 5/5. With N tables, expect
+   `Resources: N added`.
 
 ## Project facts
 
