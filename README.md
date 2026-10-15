@@ -77,7 +77,11 @@ when any check fails. Per table it checks that the app role exists and can read 
 that a real read through the view works, that each index exists, and that the app role is denied on
 the base synced table by every route: a table grant, a column grant, a grant to `PUBLIC`, or a grant
 it inherits from another role. Migrate never revokes anything, so a direct grant an admin added
-stays until someone removes it, and verify fails until then.
+stays until someone removes it, and verify fails until then. On serverless, a failed task can run a
+second time before the run fails, because serverless auto-optimization retries failed tasks by
+default ([docs](https://docs.databricks.com/aws/en/jobs/run-serverless-jobs)). The checks only read,
+so the second run is safe; expect two sets of FAIL lines and about 20 more seconds. The migrate log
+prints one `wait:` line per table per poll, so the wait shows in the run output.
 
 In the `prod` target a third task, `verify_identity_policy`, runs **before** migrate. It fails unless
 the job runs as the deploy service principal (`${var.run_as_sp}`) and that identity cannot read or

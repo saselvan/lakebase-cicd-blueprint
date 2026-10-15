@@ -113,10 +113,13 @@ def wait_for_online(
     sleep: Callable[[float], None] = time.sleep,
     poll_interval: float = 10,
     timeout: float = 1800,
+    out: Callable[[str], None] = print,
 ) -> dict[str, str]:
     """Block until EVERY table id reports a status containing ONLINE, then return
     {table_id: final_status}. Polls `get_status(table_id)` on a `poll_interval`, sleeping between
     rounds. Raises RuntimeError on a terminal FAILED/ERROR status and TimeoutError past `timeout`.
+    Prints one line per table per poll round, and one when all are ONLINE, so the run log shows
+    the wait.
 
     This is the contract that must run BEFORE any dependent DDL (ADR 0003): dependent DDL running
     against a still-PROVISIONING table is exactly the failure this prevents.
@@ -128,6 +131,7 @@ def wait_for_online(
         still_pending: list[str] = []
         for tid in pending:
             status = get_status(tid)
+            out(f"  wait: {tid} {status} ({elapsed:g}s)")
             upper = str(status).upper()
             if any(marker in upper for marker in _TERMINAL_FAILURES):
                 raise RuntimeError(f"synced table {tid} reached a terminal failure state: {status}")
@@ -137,6 +141,7 @@ def wait_for_online(
                 still_pending.append(tid)
         pending = still_pending
         if not pending:
+            out(f"  wait: {len(table_ids)} synced table(s) ONLINE after {elapsed:g}s")
             break
         if elapsed >= timeout:
             raise TimeoutError(f"timed out after {timeout}s waiting for ONLINE; still pending: {pending}")
