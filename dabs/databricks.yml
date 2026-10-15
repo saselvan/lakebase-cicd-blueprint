@@ -59,6 +59,22 @@ resources:
               - "--branch"
               - "${var.lakebase_branch}"
           environment_key: migration
+        # verify: the post-migration checks (dabs/checks.py). It runs after migrate on every target,
+        # and fails the run (so `bundle run` exits non-zero) when the app role cannot read its view,
+        # can reach the base synced table by any grant, or an index is missing.
+        - task_key: verify
+          depends_on:
+            - task_key: migrate
+          spark_python_task:
+            python_file: ./migration_job.py
+            parameters:
+              - "--step"
+              - "verify"
+              - "--config"
+              - "${workspace.file_path}/config/tables.json"
+              - "--branch"
+              - "${var.lakebase_branch}"
+          environment_key: migration
       environments:
         - environment_key: migration
           spec:
@@ -112,6 +128,34 @@ targets:
     # principal id is committed to this public reference; the deploy supplies the real id.
     run_as:
       service_principal_name: ${var.run_as_sp}
+    # The deploy identity policy guard, prod only, and BEFORE migrate: the job changes nothing in
+    # Postgres under an identity that fails it. It fails unless the job runs as ${var.run_as_sp}
+    # and that identity cannot read or write every table or create roles (no databricks_superuser,
+    # pg_read_all_data or pg_write_all_data membership, directly or inherited; no CREATEROLE or
+    # SUPERUSER). Dev runs as the person who deploys, often a databricks_superuser member, so dev
+    # has no guard; keep dev on branches made from a masked parent (README, "Running this under
+    # HIPAA"). There is no run-time switch: turning it off is a change to this file, through review.
+    # It is a policy check: a team that chose databricks_superuser for its deploy identity deletes
+    # this task and migrate's depends_on below.
+    resources:
+      jobs:
+        lakebase_migration:
+          tasks:
+            - task_key: verify_identity_policy
+              spark_python_task:
+                python_file: ./migration_job.py
+                parameters:
+                  - "--step"
+                  - "policy"
+                  - "--expected-identity"
+                  - "${var.run_as_sp}"
+                  - "--branch"
+                  - "${var.lakebase_branch}"
+              environment_key: migration
+            # Merged into the base migrate task by task_key: only depends_on is added.
+            - task_key: migrate
+              depends_on:
+                - task_key: verify_identity_policy
     workspace:
       # FIXED, non-user-derived deploy root (production best practice: exactly one copy, in one
       # place, regardless of who runs the deploy). NOT /Workspace/Users/<current_user>/... — a
