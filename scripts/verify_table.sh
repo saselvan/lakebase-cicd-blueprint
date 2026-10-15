@@ -58,8 +58,14 @@ _expect_t() {
 # verify_table ROLE SCHEMA PG_TABLE VIEW [INDEX_COL ...]
 # Asserts the post-conditions README/RUNBOOK step 4 promises, and RETURNS NON-ZERO if any fails:
 #   (c) the app role exists and the consumer view exists,
-#   (a) the app role can SELECT the consumer VIEW (the no-superuser read path), and
+#   (a) the app role can SELECT the consumer VIEW (the no-superuser read path),
+#   (d) the app role has USAGE on the schema, and a real read through the view succeeds, and
 #   (b) every expected index idx_<pg_table>_<col> exists.
+# (d) closes a gap the catalog check (a) cannot see. Postgres checks the base table as the VIEW
+# OWNER, so if the owner loses SELECT on the synced table (live rotation spike, 2026-10-14, after
+# REASSIGN OWNED), (a) stays 't' while every app read fails with "permission denied for table".
+# The deploy identity usually cannot SET ROLE to an app role an admin created, so (d) reads as
+# itself: that still exercises the owner's base-table privilege, and (a) + USAGE cover the rest.
 # All checks run so the operator sees the full picture, then the function returns non-zero if any
 # failed (so deploy.sh's `set -e` aborts the pipeline on the first failing table).
 verify_table() {
@@ -80,6 +86,11 @@ verify_table() {
     || failures=$((failures + 1))
   _expect_t "role $role can SELECT $schema.$view" \
     "SELECT has_table_privilege('$role','$schema.$view','SELECT')" || failures=$((failures + 1))
+  _expect_t "role $role has USAGE on schema $schema" \
+    "SELECT has_schema_privilege('$role','$schema','USAGE')" || failures=$((failures + 1))
+  _expect_t "a real read through $schema.$view succeeds" \
+    "SELECT count(*) >= 0 FROM (SELECT 1 FROM $schema.$view LIMIT 1) AS read_check" \
+    || failures=$((failures + 1))
 
   # One assertion per expected index. Zero index columns => this loop is a no-op (still asserts
   # role + view above), matching index_statements() which emits zero statements for zero columns.
