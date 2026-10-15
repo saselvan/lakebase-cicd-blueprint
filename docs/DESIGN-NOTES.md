@@ -66,6 +66,7 @@ GRANT SELECT ON <schema>.<table>_v         TO <app_role>;
 ```
 
 Keep the creator and the view owner the same identity and no `databricks_superuser` is needed.
+A view needs only `SELECT` on the synced table, which its creator is granted. Granting the table itself to the app would also need the grant option.
 
 **App roles need `CREATEROLE` once.** Every other step above runs as a deploy identity with no
 superuser and no `CREATEROLE` (tested live). See README "Who does what". Changeset `001` (`CREATE ROLE`) does not: an admin

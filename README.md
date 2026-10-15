@@ -110,7 +110,7 @@ Consumers read the view, not the base table — and this is literally enforced: 
 `SELECT` on the base table is denied, while reads through the view succeed (the view resolves as its
 owner, the deploy identity, which holds base `SELECT`). Access is granted on an object the deploy
 identity owns. It never depends on a privilege no user can hold, and no `databricks_superuser` is
-needed.
+needed. A view needs only `SELECT` on the synced table, which its creator is granted. Granting the table itself to the app would also need the grant option.
 
 ### Who does what
 
