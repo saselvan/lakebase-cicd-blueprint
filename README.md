@@ -6,7 +6,8 @@ pipeline creates a synced table, waits for its first load to finish, then applie
 grants, indexes, and a read-only consumer view. It is for data and platform engineers who want a
 working blueprint to copy and adapt.
 
-There are two paths in this repo. Databricks Asset Bundles (DABs) is the recommended path if you
+There are two paths in this repo. Declarative Automation Bundles (DABs, formerly Databricks Asset
+Bundles) is the recommended path if you
 are all-in on Databricks. Terraform plus Liquibase is the portable path if you are multi-cloud or
 already standardized on Terraform. Both produce the same database objects from the same config file.
 
@@ -15,9 +16,10 @@ already standardized on Terraform. Both produce the same database objects from t
 
 ---
 
-## Recommended path: Databricks Asset Bundles (DABs)
+## Recommended path: Declarative Automation Bundles (DABs)
 
-DABs (Databricks Asset Bundles) support Lakebase resources directly. That keeps the whole pipeline
+Declarative Automation Bundles (DABs; formerly Databricks Asset Bundles,
+[docs](https://docs.databricks.com/aws/en/dev-tools/bundles/)) support Lakebase resources directly. That keeps the whole pipeline
 on one platform, with fewer outside tools. This is the path a Databricks-first team should start
 from.
 
@@ -265,6 +267,9 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit for yo
 `PGUSER` is your Databricks username (email). When you deploy as a service principal, set it to the
 SP's **application id** instead.
 
+`BRANCH` must match the `branch` in `terraform/terraform.tfvars` (the example sets `production`).
+Terraform creates the synced tables on the tfvars branch, and `deploy.sh` runs Liquibase on `$BRANCH`.
+
 The Terraform provider takes its CLI profile from `databricks_profile` in `terraform/terraform.tfvars`
 (`provider "databricks" { profile = var.databricks_profile }` in `terraform/versions.tf`). A
 `TF_VAR_databricks_profile` environment variable does **not** override a value set in the tfvars file,
@@ -371,6 +376,9 @@ Shared:
 For the DABs path:
 
 - Databricks CLI 1.5.0 or newer (Lakebase DAB support is Beta).
+- The bundle uses the Autoscaling resource `postgres_synced_tables`. If your existing bundle still
+  declares the Provisioned resources (`database_instances`, `synced_database_tables`), move it first
+  with [Update your bundle to use Autoscaling resources](https://docs.databricks.com/aws/en/oltp/update-to-autoscaling-dabs).
 
 For the Terraform path:
 
