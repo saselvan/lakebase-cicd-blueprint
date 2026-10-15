@@ -201,9 +201,14 @@ identity out of it and checks that on every prod run (`verify_identity_policy`, 
   its SQL audit events (all statement classes except miscellaneous) to `system.access.audit` under the
   service name `lakebase`, kept 365 days. Export them first if your retention policy is longer.
 - **When the guard fails.** The deploy service principal cannot change its own roles. An admin (the
-  same person who creates the app roles) removes the extra membership or attribute, for example
-  `REVOKE databricks_superuser FROM "<sp-application-id>";`, then reruns the job. Until then the job
-  changes nothing, so after a replace the app stays locked out: the replace gap gets longer.
+  same person who creates the app roles) removes the extra membership, then reruns the job. Remove it
+  where it was set: a `membership_roles` entry in a bundle `postgres_roles` resource, or the Lakebase
+  roles API, `databricks postgres update-role <role-name> spec.membership_roles --json
+  '{"spec":{"membership_roles":[]}}'` (`list-roles <branch>` gives the role name). SQL does not work
+  here: tested live, `REVOKE databricks_superuser FROM ...` as the project owner fails with
+  `Only roles with the ADMIN option on role "databricks_superuser" may revoke this role`. Until the
+  rerun, the job changes nothing, so after a replace the app stays locked out: the replace gap gets
+  longer.
 
 ### One caveat about self-healing
 
