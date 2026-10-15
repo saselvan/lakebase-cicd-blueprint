@@ -66,11 +66,6 @@ GRANT SELECT ON <schema>.<table>_v         TO <app_role>;
 ```
 
 Keep the creator and the view owner the same identity and no `databricks_superuser` is needed.
-Because the creating identity holds `SELECT WITH GRANT OPTION` on the writer-owned base table, it
-*could* grant base-table `SELECT` onward directly — a non-superuser creating identity can do this,
-it is not a superuser-only operation. This reference deliberately does not: consumers depend only on
-the view, which the view's owner resolves against the base table it can already read. The view is
-for decoupling and row filtering, not to work around a grant limitation.
 
 **App roles need `CREATEROLE` once.** Every other step above runs as a deploy identity with no
 superuser and no `CREATEROLE` (tested live). See README "Who does what". Changeset `001` (`CREATE ROLE`) does not: an admin

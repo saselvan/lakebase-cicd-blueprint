@@ -110,9 +110,7 @@ Consumers read the view, not the base table — and this is literally enforced: 
 `SELECT` on the base table is denied, while reads through the view succeed (the view resolves as its
 owner, the deploy identity, which holds base `SELECT`). Access is granted on an object the deploy
 identity owns. It never depends on a privilege no user can hold, and no `databricks_superuser` is
-needed. The deploy identity *could* grant base-table `SELECT` onward directly — it holds `WITH GRANT
-OPTION`, so this is not a superuser-only operation — but this reference deliberately does not: the
-view exists for decoupling and row filtering, not to work around a grant limitation.
+needed.
 
 ### Who does what
 

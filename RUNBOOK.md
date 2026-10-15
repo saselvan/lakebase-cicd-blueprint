@@ -45,8 +45,9 @@ export PGUSER=<your-databricks-username>   # your login email; for a service pri
    USAGE/SELECT → create indexes (one per `index_columns` entry) → create the consumer view + grant.
    A distinct changelog file per table gives each changeset a distinct identity, so shared-schema
    tables never collide in `DATABASECHANGELOG`. Reruns reapply the `runAlways` changesets.
-4. verify (`scripts/verify_table.sh`) — asserts `has_table_privilege(app_role, <schema>.<view>,
-   'SELECT') = t` and every `idx_<table>_<col>` exists; exits non-zero (failing the deploy) if not.
+4. verify (`scripts/verify_table.sh`) — asserts the role and view exist, the app role has `SELECT`
+   on the view and `USAGE` on the schema, a real read through the view works, and every
+   `idx_<table>_<col>` exists; exits non-zero (failing the deploy) if not.
    Extracted from `deploy.sh` so it can be tested against a real Docker Postgres.
 
 ## The PR flow (branching)
