@@ -9,7 +9,7 @@ load is `ONLINE` — verified live, the apply returned in ~12s while the table w
 build on an empty or partial table.
 
 ## Decision
-The pipeline **polls the synced-table status until it reports `ONLINE`** (`scripts/wait_for_sync.sh`)
+The pipeline **polls the synced-table status until it reports `ONLINE`** with no `FAILED` or `ERROR` in the state (`scripts/wait_for_sync.sh`)
 before running Liquibase. `deploy.sh` does this per table.
 
 ## Consequences

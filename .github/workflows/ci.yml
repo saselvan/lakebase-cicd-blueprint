@@ -103,6 +103,9 @@ jobs:
       - name: Falsifiability tests — validate passes on valid, FAILS on malformed/invalid resource
         run: pytest dabs/tests -q
 
+      - name: Offline tests — deploy scripts and Liquibase codegen (stub CLI and psql, no cloud)
+        run: pytest scripts/tests liquibase/tests -q
+
   # State-level proofs against a real Docker PostgreSQL — no cloud, no Lakebase, no secrets.
   # Each script asserts on actual database state (roles, grants, indexes, views) so the fixed
   # migration bug classes cannot silently regress:
@@ -134,6 +137,9 @@ jobs:
 
       - name: Proof — Liquibase multi-table shared schema, both roles/views created
         run: bash liquibase/tests/docker_multitable_proof.sh
+
+      - name: Proof — a changed consumer view applies on the next deploy (runAlways reruns, no checksum error)
+        run: bash liquibase/tests/docker_view_edit_proof.sh
 
       - name: Proof — DABs renderer double-apply is a clean reconciling no-op
         run: bash dabs/tests/docker_double_apply_proof.sh

@@ -39,7 +39,7 @@ export PGUSER=<your-databricks-username>   # your login email; for a service pri
 1. `terraform apply` — creates the synced table via `databricks_postgres_synced_table`. Reruns are a
    no-op because Terraform owns the state.
 2. `scripts/wait_for_sync.sh` — polls `databricks postgres get-synced-table` until `detailed_state`
-   contains `ONLINE`. This is what guarantees indexes go on **after** the load, not during it.
+   contains `ONLINE` and not `FAILED` or `ERROR` (failure is checked first). This is what guarantees indexes go on **after** the load, not during it.
 3. generate per-table changelogs (`liquibase/generate_changelogs.py`), then `liquibase update`
    against each table's OWN changelog (`generated/<name>.changelog.sql`): create role → grant
    USAGE/SELECT → create indexes (one per `index_columns` entry) → create the consumer view + grant.
@@ -80,7 +80,12 @@ export PGUSER=<your-databricks-username>   # your login email; for a service pri
    → Postgres `cicd_proj.members`).
 6. **Branches need an expiry** (`ttl` / `no_expiry`) at create time, and auto-get a `primary` endpoint.
 7. **Sync-ready signal** = `databricks postgres get-synced-table synced_tables/<cat.schema.table>`
-   → `status.detailed_state` contains `ONLINE` (used by `wait_for_sync.sh`).
+   → `status.detailed_state` contains `ONLINE` and not `FAILED` or `ERROR` (used by `wait_for_sync.sh`;
+   `SYNCED_TABLE_ONLINE_PIPELINE_FAILED` fails the gate).
+   A table in a failed state stays failed: a redeploy with no Terraform change starts no new sync,
+   so every deploy fails at the gate until someone acts. Fix the cause, start a full refresh of the
+   table's sync pipeline (`databricks pipelines start-update <pipeline_id> --full-refresh -p <profile>`;
+   the pipeline id is in the synced table's status), then redeploy. Not tested in this repo.
 
 ## Testing drift (break and heal)
 
