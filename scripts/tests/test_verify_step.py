@@ -37,6 +37,14 @@ case "$sql" in
   *pg_roles*)             printf '%s\n' "${STUB_ROLE_EXISTS-t}" ;;
   *pg_views*)             printf '%s\n' "${STUB_VIEW_EXISTS-t}" ;;
   *has_table_privilege*)  printf '%s\n' "${STUB_CAN_SELECT-t}" ;;
+  *has_schema_privilege*) printf '%s\n' "${STUB_SCHEMA_USAGE-t}" ;;
+  *read_check*)
+    # The real read through the view. STUB_VIEW_READ=deny fails the way Postgres does when the
+    # view's OWNER has lost SELECT on the base table: a stderr ERROR and a non-zero exit.
+    if [ "${STUB_VIEW_READ-t}" = "deny" ]; then
+      printf '%s\n' "ERROR:  permission denied for table members" >&2; exit 1
+    fi
+    printf '%s\n' "${STUB_VIEW_READ-t}" ;;
   *pg_indexes*)           printf '%s\n' "${STUB_INDEX_EXISTS-t}" ;;
   *)                      printf '\n' ;;
 esac
@@ -173,3 +181,29 @@ def test_deploy_sources_verify_and_dropped_the_swallowing_check():
     assert "2>&1 || true" not in deploy, (
         "step 4 must no longer swallow the verify result with the old `2>&1 || true` pattern"
     )
+
+
+def test_happy_path_runs_the_schema_and_real_read_checks(tmp_path):
+    # Both new checks must actually run and PASS on a healthy table, not be skipped.
+    r = _run_verify(tmp_path, {}, _OK_ARGS)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS role members_app_ro has USAGE on schema cicd_proj" in r.stdout
+    assert "PASS a real read through cicd_proj.members_v succeeds" in r.stdout
+
+
+def test_missing_schema_usage_exits_nonzero(tmp_path):
+    # Hostile row: the view grant is present (has_table_privilege = t) but the app role has no
+    # USAGE on the schema, so a real app read fails. The old verify passed this.
+    r = _run_verify(tmp_path, {"STUB_SCHEMA_USAGE": "f"}, _OK_ARGS)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "FAIL role members_app_ro has USAGE on schema cicd_proj" in r.stdout
+
+
+def test_view_owner_cannot_read_base_exits_nonzero_with_cause(tmp_path):
+    # Hostile row from the live rotation spike (2026-10-14): every catalog check is 't' (the app
+    # role holds SELECT on the view), but the view's new owner lacks SELECT on the base table, so a
+    # real read fails with "permission denied for table members". The old verify passed 5/5 here.
+    r = _run_verify(tmp_path, {"STUB_VIEW_READ": "deny"}, _OK_ARGS)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "FAIL a real read through cicd_proj.members_v succeeds" in r.stdout
+    assert "permission denied for table members" in (r.stdout + r.stderr)
