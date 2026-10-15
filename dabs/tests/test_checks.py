@@ -156,7 +156,7 @@ CREATE ROLE {DEPLOY} LOGIN;
 CREATE ROLE members_app_ro NOLOGIN;
 CREATE ROLE providers_app_ro NOLOGIN;
 CREATE SCHEMA cicd_proj AUTHORIZATION {DEPLOY};
-GRANT CREATE ON SCHEMA cicd_proj TO writer;
+GRANT USAGE, CREATE ON SCHEMA cicd_proj TO writer;
 SET ROLE writer;
 CREATE TABLE cicd_proj.members (id int PRIMARY KEY, member_id text, plan_code text);
 CREATE TABLE cicd_proj.providers (id int PRIMARY KEY, provider_id text, specialty_code text);
@@ -189,7 +189,13 @@ def deployed(hermetic_pg):  # noqa: F811
     res = run(_SETUP)
     assert res.returncode == 0, res.stderr
     from dabs import render_ddl
-    res = run(f"SET ROLE {DEPLOY};\n" + render_ddl.render_ddl(TABLES))
+    # Plain Postgres lets only a table's OWNER create an index; Lakebase also lets the synced
+    # table's creator do it. So apply the DDL as the admin, then hand the views to the deploy
+    # identity: the same end state the job leaves (deploy identity owns the views and holds SELECT
+    # on the base tables; the app roles hold SELECT on the views only).
+    res = run(render_ddl.render_ddl(TABLES)
+              + f"ALTER VIEW cicd_proj.members_v OWNER TO {DEPLOY};\n"
+              + f"ALTER VIEW cicd_proj.providers_v OWNER TO {DEPLOY};\n")
     assert res.returncode == 0, res.stderr
     return run
 
@@ -223,8 +229,8 @@ def test_verify_passes_on_a_clean_deploy(deployed):
 ])
 def test_verify_fails_when_the_app_role_can_reach_the_synced_table(deployed, fault):
     """Each route that gives the app role access to the base table fails exactly the members
-    denied-on-table check. Faults are applied as the table owner (an admin's direct grant)."""
-    res = deployed(f"SET ROLE writer;\n{fault};")
+    denied-on-table check. Faults are applied as the admin (a direct grant migrate never revokes)."""
+    res = deployed(f"{fault};")
     assert res.returncode == 0, res.stderr
     fails = _verify_failures(deployed)
     assert len(fails) == 1, fails
@@ -246,21 +252,26 @@ def test_policy_passes_for_the_deploy_identity(deployed):
 
 
 @_needs_pg
-@pytest.mark.parametrize("fault", [
-    f"GRANT databricks_superuser TO {DEPLOY}",                                       # P-direct
-    f"CREATE ROLE mid NOLOGIN; GRANT databricks_superuser TO mid; GRANT mid TO {DEPLOY}",   # P-chain
-    f"CREATE ROLE mid NOLOGIN NOINHERIT; GRANT databricks_superuser TO mid; GRANT mid TO {DEPLOY}",  # P-noinh
-    f"GRANT pg_read_all_data TO {DEPLOY}",                                           # P-read
-    f"GRANT pg_write_all_data TO {DEPLOY}",                                          # P-write
-    f"ALTER ROLE {DEPLOY} CREATEROLE",                                               # P-cr
-    f"CREATE ROLE roler NOLOGIN CREATEROLE; GRANT roler TO {DEPLOY}",                # P-cr-via
-    f"ALTER ROLE {DEPLOY} SUPERUSER",                                                # P-super
+@pytest.mark.parametrize("fault,named", [
+    (f"GRANT databricks_superuser TO {DEPLOY}", "databricks_superuser"),                      # P-direct
+    (f"CREATE ROLE mid NOLOGIN; GRANT databricks_superuser TO mid; GRANT mid TO {DEPLOY}",
+     "databricks_superuser"),                                                               # P-chain
+    (f"CREATE ROLE mid NOLOGIN NOINHERIT; GRANT databricks_superuser TO mid; GRANT mid TO {DEPLOY}",
+     "databricks_superuser"),                                                               # P-noinh
+    (f"GRANT pg_read_all_data TO {DEPLOY}", "pg_read_all_data"),                              # P-read
+    (f"GRANT pg_write_all_data TO {DEPLOY}", "pg_write_all_data"),                            # P-write
+    (f"ALTER ROLE {DEPLOY} CREATEROLE", "CREATEROLE"),                                        # P-cr
+    (f"CREATE ROLE roler NOLOGIN CREATEROLE; GRANT roler TO {DEPLOY}", "CREATEROLE"),         # P-cr-via
+    (f"ALTER ROLE {DEPLOY} SUPERUSER", "SUPERUSER"),                                          # P-super
 ])
-def test_policy_fails_on_every_route_to_wide_rights(deployed, fault):
-    """Each route to read-all, write-all or create-role rights fails the guard."""
+def test_policy_fails_on_every_route_to_wide_rights(deployed, fault, named):
+    """Each route to read-all, write-all or create-role rights fails the guard, on the check that
+    names that right (a superuser also fails the membership checks, so 'any failure' would let the
+    SUPERUSER check be deleted unnoticed)."""
     res = deployed(fault + ";")
     assert res.returncode == 0, res.stderr
-    assert _policy_failures(deployed), f"guard passed after: {fault}"
+    fails = _policy_failures(deployed)
+    assert any(named in f for f in fails), f"no failing check names {named} after: {fault}\n{fails}"
 
 
 @_needs_pg

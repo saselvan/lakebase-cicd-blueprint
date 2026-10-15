@@ -163,27 +163,33 @@ def run_migration_task(
 
 # --- Seam C: the shared Python DDL renderer (pure; applied at runtime) ----------------------
 
-def _load_render_ddl():
-    """Import the shared renderer module (``dabs/render_ddl.py``), robustly.
+def _load_sibling(name: str):
+    """Import a sibling module of this entrypoint (``dabs/<name>.py``), robustly.
 
     Normal import works locally, under pytest, and via ``python migration_job.py``. On the
     serverless ``spark_python_task`` the entrypoint is run via ``exec(compile(...))`` where
     ``__file__`` is unbound and the repo root may not be on ``sys.path`` — so we fall back to
     loading the module BY PATH, derived from ``repo_root()`` (which does not depend on ``__file__``).
-    ``render_ddl`` is stdlib-only, so importing it needs nothing beyond the standard library.
+    The siblings (``render_ddl``, ``checks``) are stdlib-only, so this needs nothing extra.
     """
     try:
-        from dabs import render_ddl  # normal import when the package is importable
-        return render_ddl
+        import importlib
+
+        return importlib.import_module(f"dabs.{name}")  # normal import when the package is importable
     except Exception:
         import importlib.util
 
-        path = repo_root() / "dabs" / "render_ddl.py"
-        spec = importlib.util.spec_from_file_location("dabs_render_ddl", path)
+        path = repo_root() / "dabs" / f"{name}.py"
+        spec = importlib.util.spec_from_file_location(f"dabs_{name}", path)
         module = importlib.util.module_from_spec(spec)
         assert spec and spec.loader
         spec.loader.exec_module(module)
         return module
+
+
+def _load_render_ddl():
+    """The shared renderer module (``dabs/render_ddl.py``)."""
+    return _load_sibling("render_ddl")
 
 
 def render_migration_sql(*, config_path: str | Path | None = None) -> str:
@@ -406,16 +412,63 @@ def apply_sql_to_lakebase(sql: str, *, branch: str) -> None:
             cur.execute(sql)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Job-task entrypoint: read tables -> wait for ONLINE -> render idempotent DDL -> apply.
-
-    The live apply standardizes on the projects (Autoscaling) API: the wait-gate status, the branch
-    endpoint, and the runtime OAuth credential all come from ``workspace.postgres.*``, keyed off the
-    target ``--branch`` (``projects/<proj>/branches/<branch>``, a deploy-set job parameter). There is
-    NO database-instance name anywhere — the credential is minted from the branch's compute endpoint.
-    --dry-run stops after the render (no connection), which is what the offline gate exercises.
+def _live_execute(branch: str) -> Callable[[str], object]:
+    """Return ``execute(sql) -> first column of the first row (or None)`` over ONE runtime-OAuth
+    psycopg connection to the target branch (autocommit, so a failed check never poisons the next).
+    Live path only; tests replace this seam. The connection closes when the process ends.
     """
+    import psycopg  # lazy: only the live checks need a driver
+
+    conn = psycopg.connect(_lakebase_conninfo(branch=branch), autocommit=True)
+
+    def execute(sql: str) -> object:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    return execute
+
+
+def run_check_step(step: str, *, branch: str, config: str | None = None,
+                   expected_identity: str | None = None) -> int:
+    """Run the `verify` or `policy` check step and return 0 only if every check passed.
+
+    The policy step builds its checks BEFORE connecting, so an unusable expected identity fails
+    the task without touching Postgres.
+    """
+    checks = _load_sibling("checks")
+    if step == "policy":
+        to_run = checks.policy_checks(expected_identity or "")
+        title = "identity policy guard"
+    else:
+        to_run = checks.verify_checks(load_tables(config))
+        title = "verify"
+    print(f"== {title}: {len(to_run)} check(s) on {branch} ==")
+    failures = checks.run_checks(to_run, _live_execute(branch))
+    if failures:
+        print(f"  {title.upper()} FAILED: {failures} check(s) not met")
+        return 1
+    print(f"  {title.upper()} OK")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The entrypoint's arguments. There is deliberately no option that skips a step: in the prod
+    target the guard runs because the task exists, and removing it takes a reviewed bundle change."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--step",
+        choices=["migrate", "verify", "policy"],
+        default="migrate",
+        help="migrate (wait for ONLINE, then apply the DDL), verify (post-migration checks), or "
+        "policy (the prod-only deploy identity guard, run before migrate).",
+    )
+    parser.add_argument(
+        "--expected-identity",
+        default=None,
+        help="policy step: the deploy service principal's application id (${var.run_as_sp}).",
+    )
     parser.add_argument(
         "--config",
         default=None,
@@ -435,7 +488,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=float, default=1800, help="Wait-for-ONLINE timeout (s).")
     parser.add_argument("--poll-interval", type=float, default=10, help="Wait-for-ONLINE poll interval (s).")
     parser.add_argument("--dry-run", action="store_true", help="Render only; do not connect/apply (offline).")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Job-task entrypoint: read tables -> wait for ONLINE -> render idempotent DDL -> apply.
+
+    The live apply standardizes on the projects (Autoscaling) API: the wait-gate status, the branch
+    endpoint, and the runtime OAuth credential all come from ``workspace.postgres.*``, keyed off the
+    target ``--branch`` (``projects/<proj>/branches/<branch>``, a deploy-set job parameter). There is
+    NO database-instance name anywhere — the credential is minted from the branch's compute endpoint.
+    --dry-run stops after the render (no connection), which is what the offline gate exercises.
+    """
+    parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.step in ("verify", "policy"):
+        if not args.branch:
+            parser.error("--branch / LAKEBASE_BRANCH is required for the verify and policy steps")
+        return run_check_step(args.step, branch=args.branch, config=args.config,
+                              expected_identity=args.expected_identity)
 
     tables = load_tables(args.config)
     table_ids = synced_table_ids(tables)

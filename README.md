@@ -72,6 +72,24 @@ consumer view. Every statement is idempotent (a `pg_roles`-guarded `CREATE ROLE`
 a synced table is replaced, the job reapplies the objects on the next run. This is reconciliation,
 not one-time setup — re-running is a clean no-op, never a version-bookkeeping conflict.
 
+After migrate, a `verify` task checks the result and fails the run, so `bundle run` exits non-zero,
+when any check fails. Per table it checks that the app role exists and can read its consumer view,
+that a real read through the view works, that each index exists, and that the app role is denied on
+the base synced table by every route: a table grant, a column grant, a grant to `PUBLIC`, or a grant
+it inherits from another role. Migrate never revokes anything, so a direct grant an admin added
+stays until someone removes it, and verify fails until then.
+
+In the `prod` target a third task, `verify_identity_policy`, runs **before** migrate. It fails unless
+the job runs as the deploy service principal (`${var.run_as_sp}`) and that identity cannot read or
+write every table or create roles: no membership in `databricks_superuser`, `pg_read_all_data` or
+`pg_write_all_data`, directly or through another role, and no `CREATEROLE` or `SUPERUSER` on itself
+or on a role it belongs to. So the job changes nothing in Postgres under an identity that fails the
+policy. The task is defined only in the `prod` target, with no run-time switch: turning it off is a
+change to `dabs/databricks.yml`, through review. It reads only Postgres rights, so it protects the
+job's steps, not `bundle deploy`, which runs as whatever identity CI signs in as. This is a policy
+choice, not a platform rule: a team that gives its deploy identity `databricks_superuser` deletes the
+task and migrate's `depends_on` in the `prod` target. The checks are in `dabs/checks.py`.
+
 ### Beta status and CLI pin
 
 Lakebase DAB support is Beta. Pin the Databricks CLI to version 1.5.0 or newer. Older CLIs do not
@@ -120,7 +138,7 @@ Split the work across four identities. Each one gets only what its job needs.
 
 | Identity | Job | What it can do |
 |---|---|---|
-| Admin (a person, once per app role) | Creates each app role before the first deploy | `CREATEROLE`. Not used by any pipeline. |
+| Admin (a person, once per app role) | Creates each app role before the first deploy; removes extra rights from the deploy SP if the policy guard fails | `CREATEROLE`. Not used by any pipeline. |
 | Deploy service principal (production deploys only) | Creates the synced tables; runs Liquibase (grants, indexes, view) | Owns the view and the Postgres schema it creates. As the synced table's creator it holds `SELECT`, `DELETE` and `TRUNCATE` on it, with grant option. This is automatic and cannot be turned off. |
 | PR service principal (pull requests only) | Creates and deletes the per-PR branch; runs migrations there | Creating a branch needs **Can Manage** on the project. |
 | App role (`NOLOGIN`) | What the application reads as | `USAGE` on the schema and `SELECT` on the view. Denied the base table. |
@@ -153,6 +171,39 @@ and at Liquibase (`permission denied for schema`). To change the deploy SP, see 
 - **The workflows here use one set of secrets for PR and deploy jobs, for brevity.** Give each job
   its own service principal (for example with GitHub environments), and prefer workload identity
   federation (OIDC) over long-lived client secrets (see `deploy.yml`).
+
+### Running this under HIPAA
+
+Under HIPAA, a reviewer reads the deploy identity's rights against access authorization and access
+control (45 CFR 164.308(a)(4) and 164.312(a)(1)), and against the Privacy Rule's minimum necessary
+standard (164.502(b) and 164.514(d)). A CI identity that can read and write every table is hard to
+defend there. `databricks_superuser` gives that reach, which is why this repo keeps the deploy
+identity out of it and checks that on every prod run (`verify_identity_policy`, above).
+
+- **Sign CI in with workload identity federation (OIDC).** There is no stored secret, so keeping one
+  deploy service principal for the life of the tables costs little: there is nothing to rotate.
+- **Use one deploy service principal per environment.** PR branches deploy too; give them their own.
+- **Make PR and dev branches from a masked parent.** A branch is an instant copy of its parent, so a
+  branch of production holds production PHI whatever the PR syncs afterwards. The masked parent's
+  synced tables sync from de-identified tables or views in Unity Catalog. Never point them at a
+  source with a row filter or column mask: tested live, a filter or mask on the source blocks the
+  synced table (`cannot have both row/column security and online materialized views`), and one added
+  later makes the next refresh fail while Postgres keeps the old, unmasked rows.
+- **De-identified view sources sync in Snapshot mode.** Check the Automatic change data feed docs
+  before relying on Triggered or Continuous. Snapshot reloads the whole table on every sync.
+- **Select only the columns the app needs in the consumer view.** The view is where minimum necessary
+  is enforced, and it is the only place to limit rows: row-level security needs the table owner, and
+  the managed writer role owns the synced table.
+- **Dev skips the guard only because dev branches come from the masked parent.** Dev runs as the
+  person who deploys, often the project owner, who is a `databricks_superuser` member. If your dev
+  target can reach PHI, give dev its own service principal and the same guard.
+- **Audit.** In workspaces with the compliance security profile and the HIPAA standard, Lakebase sends
+  its SQL audit events (all statement classes except miscellaneous) to `system.access.audit` under the
+  service name `lakebase`, kept 365 days. Export them first if your retention policy is longer.
+- **When the guard fails.** The deploy service principal cannot change its own roles. An admin (the
+  same person who creates the app roles) removes the extra membership or attribute, for example
+  `REVOKE databricks_superuser FROM "<sp-application-id>";`, then reruns the job. Until then the job
+  changes nothing, so after a replace the app stays locked out: the replace gap gets longer.
 
 ### One caveat about self-healing
 
