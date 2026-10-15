@@ -130,8 +130,13 @@ table, the index, the view and the view grant, and re-ran all of it cleanly. Onl
 (`CREATE ROLE`) failed, because Postgres needs `CREATEROLE` to create a role. The changeset skips a
 role that already exists, so an admin creates it once and the pipeline never needs that attribute.
 
-Keep one deploy identity for the life of the tables. Only it can drop the view and schema it
-creates; another identity, even the project owner, cannot.
+Keep one deploy service principal for the life of the tables. It owns the Postgres schema, the
+view and the Liquibase tables (`databasechangelog`, `databasechangeloglock`); the writer role owns
+the synced table. Only the deploy SP can drop or replace the view and schema: another identity,
+another SP or the project owner, gets `must be owner` or `permission denied`. A second deploy SP does
+not take over quietly: its deploy fails at Terraform (`does not have View permissions on pipeline`)
+and at Liquibase (`permission denied for schema`). To change the deploy SP, see RUNBOOK →
+"Rotating the deploy service principal".
 
 ### Before you point this at sensitive data
 
@@ -247,7 +252,7 @@ export PROFILE=<your-cli-profile>
 export WAREHOUSE_ID=<your-sql-warehouse-id>
 export PROJECT=<your-lakebase-project-id>   # deploy is branch-driven; default my-lakebase-project
 export BRANCH=<branch-to-deploy-to>         # default main
-export PGUSER=<your-databricks-username>
+export PGUSER=<your-databricks-username>   # email; for a service principal, its application id
 
 # 1. list your tables (the ONE file most users edit):
 $EDITOR config/tables.json
@@ -258,6 +263,15 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit for yo
 ./scripts/seed_source.sh   # one-time: demo Delta source table + UC schemas
 ./scripts/deploy.sh        # the pipeline: terraform apply -> resolve branch endpoint + mint -> per table wait sync -> liquibase -> verify
 ```
+
+`PGUSER` is your Databricks username (email). When you deploy as a service principal, set it to the
+SP's **application id** instead.
+
+The Terraform provider takes its CLI profile from `databricks_profile` in `terraform/terraform.tfvars`
+(`provider "databricks" { profile = var.databricks_profile }` in `terraform/versions.tf`). A
+`TF_VAR_databricks_profile` environment variable does **not** override a value set in the tfvars file,
+so a CI job must either write `terraform.tfvars` with the SP's profile, or use SP environment auth
+(`DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`).
 
 `deploy.sh` is branch-driven: it resolves `projects/$PROJECT/branches/$BRANCH` to that branch's
 READ_WRITE compute endpoint, derives the connection host from it, and mints a runtime OAuth token
