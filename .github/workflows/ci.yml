@@ -103,6 +103,9 @@ jobs:
       - name: Falsifiability tests — validate passes on valid, FAILS on malformed/invalid resource
         run: pytest dabs/tests -q
 
+      - name: Offline tests — deploy scripts and Liquibase codegen (stub CLI and psql, no cloud)
+        run: pytest scripts/tests liquibase/tests -q
+
   # State-level proofs against a real Docker PostgreSQL — no cloud, no Lakebase, no secrets.
   # Each script asserts on actual database state (roles, grants, indexes, views) so the fixed
   # migration bug classes cannot silently regress:

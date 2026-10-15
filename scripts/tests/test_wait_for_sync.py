@@ -18,21 +18,24 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WAIT_SH = REPO_ROOT / "scripts" / "wait_for_sync.sh"
 
 STUB = """#!/usr/bin/env bash
-# stub: databricks postgres get-synced-table ... -o json -> a fixed detailed_state
-printf '{"status":{"detailed_state":"%s"}}\\n' "$STUB_STATE"
+# stub: records its args, prints STUB_OUT (default: a fixed detailed_state), exits STUB_RC
+printf '%s\\n' "$*" >> "$STUB_ARGS"
+if [ -n "${STUB_OUT:-}" ]; then printf '%s\\n' "$STUB_OUT"; else printf '{"status":{"detailed_state":"%s"}}\\n' "$STUB_STATE"; fi
+exit "${STUB_RC:-0}"
 """
 
-
-def _run(tmp_path: Path, state: str) -> subprocess.CompletedProcess:
+def _run(tmp_path: Path, state: str = "", timeout_sec: str = "5", **extra: str) -> subprocess.CompletedProcess:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     stub = bindir / "databricks"
     stub.write_text(STUB)
     stub.chmod(0o755)
-    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "STUB_STATE": state}
-    # timeout 5 s: a state the gate does not decide on would sleep 10 s, so the test fails fast
+    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "STUB_STATE": state,
+           "STUB_ARGS": str(tmp_path / "args.txt"), **extra}
+    # a state the gate does not decide on sleeps 10 s once, then times out (timeout_sec < 10);
+    # the 30 s subprocess limit catches a loop that never ends
     return subprocess.run(
-        ["bash", str(WAIT_SH), "cat.schema.members", "DEFAULT", "5"],
+        ["bash", str(WAIT_SH), "cat.schema.members", "DEFAULT", timeout_sec],
         env=env, capture_output=True, text=True, timeout=30,
     )
 
@@ -64,3 +67,37 @@ def test_online_states_exit_0(tmp_path, state):
     r = _run(tmp_path, state)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "sync online" in r.stdout
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"STUB_STATE": "SYNCED_TABLE_PROVISIONING_INITIAL_SNAPSHOT"},  # still loading at the timeout
+        {"STUB_OUT": '{"status":{}}'},                                 # no detailed_state -> '?'
+    ],
+)
+def test_undecided_state_times_out_with_exit_1(tmp_path, extra):
+    r = _run(tmp_path, **extra)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "timeout after 5s" in r.stdout
+    assert "sync online" not in r.stdout
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"STUB_OUT": "Error: synced table not found", "STUB_RC": "1"},          # CLI error, non-JSON
+        {"STUB_STATE": "SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE", "STUB_RC": "1"},  # ONLINE text, CLI failed
+    ],
+)
+def test_cli_failure_never_passes_the_gate(tmp_path, extra):
+    r = _run(tmp_path, **extra)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "sync online" not in r.stdout
+
+
+def test_polls_the_synced_table_by_its_resource_name(tmp_path):
+    r = _run(tmp_path, "SYNCED_TABLE_ONLINE")
+    assert r.returncode == 0
+    args = (tmp_path / "args.txt").read_text()
+    assert "postgres get-synced-table synced_tables/cat.schema.members -p DEFAULT -o json" in args
