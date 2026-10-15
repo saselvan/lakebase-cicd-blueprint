@@ -24,20 +24,29 @@ if [ -n "${STUB_OUT:-}" ]; then printf '%s\\n' "$STUB_OUT"; else printf '{"statu
 exit "${STUB_RC:-0}"
 """
 
-def _run(tmp_path: Path, state: str = "", timeout_sec: str = "5", **extra: str) -> subprocess.CompletedProcess:
+STUB_KEYS = ("STUB_OUT", "STUB_RC", "STUB_STATE", "STUB_ARGS", "WAIT_INTERVAL")
+
+
+def _run(tmp_path: Path, state: str = "", timeout_sec: str = "3", **extra: str) -> subprocess.CompletedProcess:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     stub = bindir / "databricks"
     stub.write_text(STUB)
     stub.chmod(0o755)
-    env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "STUB_STATE": state,
-           "STUB_ARGS": str(tmp_path / "args.txt"), **extra}
-    # a state the gate does not decide on sleeps 10 s once, then times out (timeout_sec < 10);
-    # the 30 s subprocess limit catches a loop that never ends
+    # drop stub and interval keys from the caller's shell, so only the test's values reach the stub
+    base = {k: v for k, v in os.environ.items() if k not in STUB_KEYS}
+    env = {**base, "PATH": f"{bindir}:{os.environ['PATH']}", "STUB_STATE": state,
+           "STUB_ARGS": str(tmp_path / "args.txt"), "WAIT_INTERVAL": "1", **extra}
+    # a state the gate does not decide on polls once a second until timeout_sec;
+    # the 15 s subprocess limit catches a loop that never ends
     return subprocess.run(
         ["bash", str(WAIT_SH), "cat.schema.members", "DEFAULT", timeout_sec],
-        env=env, capture_output=True, text=True, timeout=30,
+        env=env, capture_output=True, text=True, timeout=15,
     )
+
+
+def _polls(tmp_path: Path) -> int:
+    return len((tmp_path / "args.txt").read_text().splitlines())
 
 
 @pytest.mark.parametrize(
@@ -79,8 +88,9 @@ def test_online_states_exit_0(tmp_path, state):
 def test_undecided_state_times_out_with_exit_1(tmp_path, extra):
     r = _run(tmp_path, **extra)
     assert r.returncode == 1, r.stdout + r.stderr
-    assert "timeout after 5s" in r.stdout
+    assert "timeout after 3s" in r.stdout
     assert "sync online" not in r.stdout
+    assert _polls(tmp_path) == 3  # polled at 0, 1 and 2 s: the interval comes from WAIT_INTERVAL
 
 
 @pytest.mark.parametrize(
@@ -94,6 +104,9 @@ def test_cli_failure_never_passes_the_gate(tmp_path, extra):
     r = _run(tmp_path, **extra)
     assert r.returncode != 0, r.stdout + r.stderr
     assert "sync online" not in r.stdout
+    # the CLI error stops the gate at once: one poll, no timeout
+    assert "timeout" not in r.stdout
+    assert _polls(tmp_path) == 1
 
 
 def test_polls_the_synced_table_by_its_resource_name(tmp_path):
@@ -101,3 +114,26 @@ def test_polls_the_synced_table_by_its_resource_name(tmp_path):
     assert r.returncode == 0
     args = (tmp_path / "args.txt").read_text()
     assert "postgres get-synced-table synced_tables/cat.schema.members -p DEFAULT -o json" in args
+
+
+@pytest.mark.parametrize("interval", ["0", "-5", "ten", ""])
+def test_bad_interval_exits_2_before_any_poll(tmp_path, interval):
+    # hostile: 0 would never advance elapsed and loop forever
+    r = _run(tmp_path, "SYNCED_TABLE_PROVISIONING_INITIAL_SNAPSHOT", WAIT_INTERVAL=interval)
+    if interval == "":
+        # empty means unset in bash's ${VAR:-10}: the default 10 s applies, one poll, then timeout
+        assert r.returncode == 1 and "timeout after 3s" in r.stdout
+        return
+    assert r.returncode == 2, r.stdout + r.stderr
+    assert "WAIT_INTERVAL must be" in r.stdout
+    assert not (tmp_path / "args.txt").exists()
+
+
+def test_ambient_stub_values_do_not_reach_the_test(tmp_path, monkeypatch):
+    # hostile: a caller's shell with STUB_OUT / STUB_RC / WAIT_INTERVAL set would override the state
+    monkeypatch.setenv("STUB_OUT", '{"status":{"detailed_state":"SYNCED_TABLE_OFFLINE_FAILED"}}')
+    monkeypatch.setenv("STUB_RC", "1")
+    monkeypatch.setenv("WAIT_INTERVAL", "0")
+    r = _run(tmp_path, "SYNCED_TABLE_ONLINE")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "sync online" in r.stdout
