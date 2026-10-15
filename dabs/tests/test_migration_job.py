@@ -217,6 +217,28 @@ def test_gate_times_out_if_never_online():
         mj.wait_for_online(["cat.sch.stuck"], fake, sleep=lambda s: None, poll_interval=10, timeout=20)
 
 
+def test_gate_prints_every_poll_so_the_wait_is_visible_in_the_run_log():
+    """The job log shows the wait: one line per table per poll round, naming the table and the
+    status it reported, then one line when all are ONLINE. Hostile: two tables (a gate that logs only
+    the first is caught), and the slow one is pending twice (a gate that logs only the last round is
+    caught)."""
+    seqs = {
+        "cat.sch.slow": ["PROVISIONING_INITIAL_SNAPSHOT", "PROVISIONING_INITIAL_SNAPSHOT",
+                         "ONLINE_NO_PENDING_UPDATE"],
+        "cat.sch.fast": ["ONLINE_NO_PENDING_UPDATE"],
+    }
+    lines: list[str] = []
+    mj.wait_for_online(list(seqs), SequenceStatus(seqs), sleep=lambda s: None, poll_interval=5,
+                       timeout=100, out=lines.append)
+
+    slow = [ln for ln in lines if "cat.sch.slow" in ln]
+    assert len(slow) == 3, lines
+    assert sum("PROVISIONING_INITIAL_SNAPSHOT" in ln for ln in slow) == 2, lines
+    assert "ONLINE_NO_PENDING_UPDATE" in slow[-1], lines
+    assert any("cat.sch.fast" in ln and "ONLINE_NO_PENDING_UPDATE" in ln for ln in lines), lines
+    assert "2 synced table(s) ONLINE" in lines[-1] and "10s" in lines[-1], lines
+
+
 # --- Seam B: a single migration implementation (the shared renderer, no external engine) --------
 
 def test_bundle_declares_migration_job_running_the_entrypoint():
