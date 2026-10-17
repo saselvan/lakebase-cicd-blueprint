@@ -56,8 +56,11 @@ mistake.
 resources, so `python -m dabs.generate_resources` reads that file and writes one synced table per
 entry into `dabs/resources/*.yml`. The app role is not written as a `postgres_roles` resource — the
 migration job creates it with a guarded `CREATE ROLE`, so a single owner keeps `bundle destroy` from
-dropping the role out from under grants that consumers still hold. The generated files are diffable,
-so re-running codegen after a config edit is a clean diff. Do not hand-edit them.
+dropping the role out from under grants that consumers still hold. The guarded statement skips a
+role that already exists. In the `prod` target an admin creates each app role first, because the
+deploy service principal has no `CREATEROLE` (see "Run the prod target as a deploy service
+principal"). The generated files are diffable, so re-running codegen after a config edit is a
+clean diff. Do not hand-edit them.
 
 ### How migrations run
 
@@ -93,6 +96,116 @@ change to `dabs/databricks.yml`, through review. It reads only Postgres rights, 
 job's steps, not `bundle deploy`, which runs as whatever identity CI signs in as. This is a policy
 choice, not a platform rule: a team that gives its deploy identity `databricks_superuser` deletes the
 task and migrate's `depends_on` in the `prod` target. The checks are in `dabs/checks.py`.
+
+### Run the prod target as a deploy service principal
+
+The commands above use `--target dev`, which runs as you. The `prod` target runs the job as a
+fixed deploy service principal (`${var.run_as_sp}`), and its first task, the identity policy guard,
+fails unless that identity is outside `databricks_superuser` and has no `CREATEROLE`. So an admin
+sets the identity up once, and the service principal runs every deploy after that.
+
+| Who | Does what | How often |
+|---|---|---|
+| Admin (a workspace admin or the project owner) | Unity Catalog grants, project permission, the service principal's Postgres login role, each app role | Once |
+| Deploy service principal | `bundle deploy` and `bundle run` with `--target prod` | Every deploy |
+
+```bash
+export ADMIN_PROFILE=<admin-cli-profile>
+export SP_PROFILE=<cli-profile-that-signs-in-as-the-deploy-sp>   # OAuth M2M locally; in CI, OIDC (RUNBOOK.md, "CI auth")
+export SP=<deploy-sp-application-id>
+export PROJECT=<lakebase-project-id>
+export BRANCH=projects/$PROJECT/branches/production
+export WAREHOUSE_ID=<sql-warehouse-id>
+
+# 0. demo only: create the source Delta tables (in real use, your data pipeline makes them)
+PROFILE=$ADMIN_PROFILE ./scripts/seed_source.sh
+```
+
+**1. Admin, once.** Unity Catalog grants, in a SQL warehouse or a notebook. The example config keeps
+the source and the synced tables in one schema; if yours differ, give `SELECT` on the source schema
+and `CREATE TABLE` on the synced one.
+
+```sql
+GRANT USE CATALOG ON CATALOG my_catalog TO `<sp-application-id>`;
+GRANT USE SCHEMA, SELECT, CREATE TABLE ON SCHEMA my_catalog.cicd_proj TO `<sp-application-id>`;
+```
+
+Project permission. `CAN_USE` is enough: in the live test, a service principal with only `CAN_USE`
+created the synced table with `bundle deploy`.
+
+```bash
+databricks api patch /api/2.0/permissions/database-projects/$PROJECT -p $ADMIN_PROFILE \
+  --json "{\"access_control_list\":[{\"service_principal_name\":\"$SP\",\"permission_level\":\"CAN_USE\"}]}"
+```
+
+Postgres, on the target branch, connected as the admin (`scripts/resolve_endpoint.sh` resolves the
+host and mints the token). One `CREATE ROLE` per `app_role` in `config/tables.json`:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS databricks_auth;
+SELECT databricks_create_role('<sp-application-id>', 'service_principal');
+CREATE ROLE members_app_ro NOLOGIN;
+CREATE ROLE providers_app_ro NOLOGIN;
+```
+
+**2. Deploy service principal, every deploy.** The same principal runs both commands: the identity
+that creates a synced table is the one that can build the view on it.
+
+```bash
+python -m dabs.generate_resources
+cd dabs
+databricks bundle deploy --target prod -p $SP_PROFILE \
+  --var run_as_sp=$SP --var lakebase_branch=$BRANCH
+databricks bundle run lakebase_migration --target prod -p $SP_PROFILE \
+  --var run_as_sp=$SP --var lakebase_branch=$BRANCH
+```
+
+The `prod` target deploys to `/Workspace/.bundle/lakebase-cicd-dabs/prod`. The service principal
+needs write access to that folder, or set `workspace.root_path` in `dabs/databricks.yml` to a folder
+it owns. The live test used a folder in the service principal's home.
+
+A good run prints the guard, then migrate, then verify (live output, one table, renamed to the
+example names):
+
+```text
+== identity policy guard: 6 check(s) on projects/<project>/branches/<branch> ==
+  PASS the job runs as the expected deploy identity <deploy-sp>
+  PASS current_user is not a member of databricks_superuser (directly or through another role)
+  PASS current_user is not a member of pg_read_all_data (directly or through another role)
+  PASS current_user is not a member of pg_write_all_data (directly or through another role)
+  PASS neither current_user nor a role it belongs to has CREATEROLE
+  PASS neither current_user nor a role it belongs to has SUPERUSER
+  IDENTITY POLICY GUARD OK
+migration applied: all synced tables ONLINE, grants/indexes/view reconciled.
+== verify: 8 check(s) on projects/<project>/branches/<branch> ==
+  PASS role members_app_ro exists
+  PASS consumer view cicd_proj.members_v exists
+  PASS role members_app_ro can SELECT cicd_proj.members_v
+  PASS role members_app_ro has USAGE on schema cicd_proj
+  PASS a real read through cicd_proj.members_v succeeds
+  PASS role members_app_ro is denied on synced table cicd_proj.members
+  PASS index idx_members_member_id exists
+  PASS index idx_members_plan_code exists
+  VERIFY OK
+```
+
+When it fails:
+
+- **The guard prints `FAIL current_user is not a member of databricks_superuser`.** The service
+  principal is in `databricks_superuser`. Remove it with the roles API:
+  `databricks postgres update-role <role> spec.membership_roles --json '{"spec":{"membership_roles":[]}}'`.
+  The job changed nothing in Postgres.
+- **`permission denied for schema`.** A different identity is running the job than the one that
+  created the tables. Keep one deploy service principal for the life of the tables ("Who does
+  what", below).
+- **migrate fails at `CREATE ROLE`.** The admin step for that app role was skipped. The deploy
+  service principal cannot create roles, by design (`Only roles with the CREATEROLE attribute may
+  create roles`, seen live on the Terraform path). Run the admin's `CREATE ROLE` and rerun.
+- **A replace (a primary key change) stops `bundle deploy` with `dependent objects exist`.** The
+  consumer view blocks the delete, so the old table and its grants stay. After reading `bundle plan`,
+  drop the view as the deploy service principal, which owns it (another identity gets
+  `must be owner of view`): `DROP VIEW cicd_proj.members_v;`. Then deploy and run again; migrate
+  puts the view, its grant and the indexes back.
 
 ### Beta status and CLI pin
 
