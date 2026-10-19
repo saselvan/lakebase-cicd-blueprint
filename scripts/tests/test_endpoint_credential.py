@@ -400,16 +400,50 @@ def test_read_via_view_uses_pgdatabase_and_rejects_hostile_database_name(monkeyp
             mod.main()
 
 
-def test_resolve_database_fails_closed_on_var_files_when_terraform_unavailable(tmp_path):
-    """When terraform is unavailable or fails, lakebase_resolve_database fails closed if any
-    terraform.tfvars, terraform.tfvars.json, or *.auto.tfvars(.json) file exists in terraform/."""
-    fake_bin = tmp_path / "fake_bin"
-    fake_bin.mkdir()
-    # Stub terraform that fails (simulating no working terraform binary)
-    tf_stub = fake_bin / "terraform"
-    tf_stub.write_text("#!/usr/bin/env bash\nexit 127\n")
-    tf_stub.chmod(0o755)
+def test_resolve_database_no_terraform_binary_and_failing_terraform_console(tmp_path):
+    """When terraform is not on PATH:
+      - fails closed if any terraform.tfvars, terraform.tfvars.json, or *.auto.tfvars(.json) exists;
+      - returns TF_VAR_logical_database (or 'databricks_postgres' if unset) when no var files exist.
+    When terraform IS on PATH and `terraform console` fails (or outputs non-JSON), exits non-zero
+    immediately instead of silently falling back."""
+    import shutil
 
+    # Build a PATH that has bash + python3 (and basic utils) but NO `terraform` binary.
+    no_tf_bin = tmp_path / "no_tf_bin"
+    no_tf_bin.mkdir()
+    for tool in ("bash", "python3", "dirname", "pwd"):
+        real = shutil.which(tool)
+        if real:
+            (no_tf_bin / tool).symlink_to(real)
+
+    # 1) No terraform binary + no var files -> default 'databricks_postgres', or TF_VAR_logical_database
+    clean_root = tmp_path / "clean_root"
+    clean_tf = clean_root / "terraform"
+    clean_tf.mkdir(parents=True)
+    (clean_tf / "variables.tf").write_text((REPO_ROOT / "terraform" / "variables.tf").read_text())
+
+    env_no_tf = dict(os.environ, PATH=str(no_tf_bin))
+    env_no_tf.pop("TF_VAR_logical_database", None)
+    r_def = subprocess.run(
+        [str(no_tf_bin / "bash"), "-c", f'set -euo pipefail; . "{RESOLVE_HELPER}"; lakebase_resolve_database "{clean_root}"'],
+        env=env_no_tf,
+        capture_output=True,
+        text=True,
+    )
+    assert r_def.returncode == 0, r_def.stderr
+    assert r_def.stdout.strip() == "databricks_postgres"
+
+    env_with_var = dict(env_no_tf, TF_VAR_logical_database="env_db")
+    r_env = subprocess.run(
+        [str(no_tf_bin / "bash"), "-c", f'set -euo pipefail; . "{RESOLVE_HELPER}"; lakebase_resolve_database "{clean_root}"'],
+        env=env_with_var,
+        capture_output=True,
+        text=True,
+    )
+    assert r_env.returncode == 0, r_env.stderr
+    assert r_env.stdout.strip() == "env_db"
+
+    # 2) No terraform binary + any var file -> fails closed with "unsupported var file: <name>"
     for var_file, content in [
         ("prod.auto.tfvars", 'logical_database = "prod_db"\n'),
         ("terraform.tfvars.json", '{"logical_database": "json_db"}\n'),
@@ -421,16 +455,31 @@ def test_resolve_database_fails_closed_on_var_files_when_terraform_unavailable(t
         tf_dir.mkdir(parents=True)
         (tf_dir / "variables.tf").write_text((REPO_ROOT / "terraform" / "variables.tf").read_text())
         (tf_dir / var_file).write_text(content)
-        env = dict(os.environ)
-        env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
-        env.pop("TF_VAR_logical_database", None)
         res = subprocess.run(
-            ["bash", "-c", f'set -euo pipefail; . "{RESOLVE_HELPER}"; lakebase_resolve_database "{root}"'],
-            env=env,
+            [str(no_tf_bin / "bash"), "-c", f'set -euo pipefail; . "{RESOLVE_HELPER}"; lakebase_resolve_database "{root}"'],
+            env=env_no_tf,
             capture_output=True,
             text=True,
         )
         assert res.returncode != 0, f"expected fail-closed on {var_file}"
         assert f"unsupported var file: {var_file}; set TF_VAR_logical_database" in res.stderr
+
+    # 3) Terraform IS on PATH, no var files, but `terraform console` fails -> exits non-zero (no silent fallback)
+    failing_tf_bin = tmp_path / "failing_tf_bin"
+    failing_tf_bin.mkdir()
+    tf_stub = failing_tf_bin / "terraform"
+    tf_stub.write_text("#!/usr/bin/env bash\necho 'console boom' >&2\nexit 1\n")
+    tf_stub.chmod(0o755)
+    env_fail_tf = dict(os.environ, PATH=f"{failing_tf_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    env_fail_tf.pop("TF_VAR_logical_database", None)
+    r_fail = subprocess.run(
+        ["bash", "-c", f'set -euo pipefail; . "{RESOLVE_HELPER}"; lakebase_resolve_database "{clean_root}"'],
+        env=env_fail_tf,
+        capture_output=True,
+        text=True,
+    )
+    assert r_fail.returncode != 0, "expected non-zero exit when terraform console fails"
+    assert "console boom" in r_fail.stderr
+
 
 

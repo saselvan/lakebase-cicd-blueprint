@@ -159,15 +159,21 @@ def ask_terraform_console() -> str | None:
             text=True,
         )
         if res.returncode != 0:
-            return None
+            sys.stderr.write(res.stderr or f"terraform console exited {res.returncode}\n")
+            sys.exit(1)
         lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
         if not lines:
-            return None
+            sys.stderr.write("terraform console returned empty output for var.logical_database\n")
+            sys.exit(1)
         try:
             val = json.loads(lines[-1])
-            return val if isinstance(val, str) else None
-        except Exception:
-            return None
+        except Exception as exc:
+            sys.stderr.write(f"terraform console returned invalid JSON {lines[-1]!r}: {exc}\n")
+            sys.exit(1)
+        if not isinstance(val, str):
+            sys.stderr.write(f"terraform console returned non-string {val!r} for var.logical_database\n")
+            sys.exit(1)
+        return val
 
 
 val = ask_terraform_console()
