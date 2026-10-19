@@ -44,6 +44,8 @@ CONFIG="$ROOT/config/tables.json"
 . "$ROOT/scripts/verify_table.sh"
 
 echo "== 1. terraform apply (for_each creates all tables in config/tables.json) =="
+DB="$(lakebase_resolve_database "$ROOT")"
+lakebase_validate_database "$DB"
 ( cd "$ROOT/terraform" && terraform init -input=false >/dev/null && terraform apply -auto-approve -input=false )
 
 echo "== 1b. verify committed per-table Liquibase changelogs are in sync with config/tables.json =="
@@ -93,9 +95,9 @@ PY
   lakebase_resolve_and_mint "$LAKEBASE_BRANCH" "$PROFILE"
   HOST="$LB_HOST"
   TOKEN="$LB_TOKEN"
-  echo "  branch=$LAKEBASE_BRANCH host=$HOST endpoint=$LB_ENDPOINT"
-  URL="jdbc:postgresql://$HOST:5432/databricks_postgres?sslmode=require"
-  export PGHOST="$HOST" PGPORT=5432 PGDATABASE=databricks_postgres PGSSLMODE=require PGUSER="$PGUSER" PGPASSWORD="$TOKEN"
+  echo "  branch=$LAKEBASE_BRANCH host=$HOST endpoint=$LB_ENDPOINT database=$DB"
+  URL="jdbc:postgresql://$HOST:5432/$DB?sslmode=require"
+  export PGHOST="$HOST" PGPORT=5432 PGDATABASE="$DB" PGSSLMODE=require PGUSER="$PGUSER" PGPASSWORD="$TOKEN"
 
   echo "== 3. liquibase update (this table's OWN generated changelog) =="
   # Each table runs its OWN changelog (generated/<name>.changelog.sql), with role/schema/table and
@@ -105,7 +107,7 @@ PY
   ( cd "$ROOT/liquibase" && liquibase update \
       --changeLogFile="generated/$T_NAME.changelog.sql" \
       --url="$URL" --username="$PGUSER" --password="$TOKEN" \
-      --liquibase-schema-name="$T_SCHEMA" )
+      --liquibase-schema-name="$T_SCHEMA" ) </dev/null || exit 1
 
   # Assert the real post-conditions and FAIL the pipeline if any is unmet: the app role can SELECT
   # its consumer view, and every expected index exists. verify_table returns non-zero on failure,

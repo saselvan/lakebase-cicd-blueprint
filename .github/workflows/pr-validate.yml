@@ -25,13 +25,16 @@ jobs:
         run: echo "BRANCH=pr-${{ github.event.number }}" >> "$GITHUB_ENV"
       - name: Create ephemeral CoW branch + run migrations on it
         run: |
+          set -euo pipefail
+          . scripts/resolve_endpoint.sh
+          DB="$(lakebase_resolve_database "$PWD")"
+          lakebase_validate_database "$DB"
           databricks postgres create-branch "projects/$PROJECT" "$BRANCH" \
             --json '{"spec":{"ttl":"7200s"}}' --replace-existing
           # Resolve the PR branch's READ_WRITE compute endpoint and mint an OAuth token FROM it
           # (projects/Autoscaling API) -- host and token from the SAME endpoint, no instance name.
           # Empty profile ("") => omit -p, so CI env-var auth (DATABRICKS_HOST + CLIENT_ID/SECRET)
           # is used instead of a config profile. Shared with scripts/deploy.sh + branch_test.sh.
-          . scripts/resolve_endpoint.sh
           lakebase_resolve_and_mint "projects/$PROJECT/branches/$BRANCH" ""
           HOST="$LB_HOST"
           TOKEN="$LB_TOKEN"
@@ -39,13 +42,15 @@ jobs:
           # changelog (distinct FILENAME => distinct changeset identity, so shared-schema tables do
           # not collide in one DATABASECHANGELOG). Mirrors scripts/deploy.sh.
           python3 liquibase/generate_changelogs.py
-          URL="jdbc:postgresql://$HOST:5432/databricks_postgres?sslmode=require"
+          URL="jdbc:postgresql://$HOST:5432/$DB?sslmode=require"
           cd liquibase
-          python3 -c "import json;[print(t['name'],t['app_schema']) for t in json.load(open('../config/tables.json'))]" | while read -r NAME SCHEMA; do
+          TABLES="$(python3 -c "import json;[print(t['name'],t['app_schema']) for t in json.load(open('../config/tables.json'))]")"
+          while read -r NAME SCHEMA; do
+            [ -z "$NAME" ] && continue
             liquibase update \
               --changeLogFile="generated/$NAME.changelog.sql" \
               --url="$URL" \
               --username="${{ secrets.DATABRICKS_CLIENT_ID }}" --password="$TOKEN" \
-              --liquibase-schema-name="$SCHEMA"
-          done
+              --liquibase-schema-name="$SCHEMA" </dev/null || exit 1
+          done <<< "$TABLES"
           # add pytest/psycopg validation here -- it runs against the branch, not prod

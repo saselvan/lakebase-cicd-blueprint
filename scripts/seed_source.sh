@@ -13,16 +13,13 @@ CONFIG="${CONFIG:-$ROOT/config/tables.json}"
 
 run() {
   databricks api post /api/2.0/sql/statements -p "$PROFILE" \
-    --json "{\"warehouse_id\":\"$WH\",\"wait_timeout\":\"30s\",\"statement\":\"$1\"}" \
-    | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('status',{}).get('state'),d.get('status',{}).get('error',{}).get('message',''))"
+    --json "{\"warehouse_id\":\"$WH\",\"wait_timeout\":\"30s\",\"statement\":\"$1\"}" </dev/null \
+    | python3 -c "import sys,json;d=json.load(sys.stdin);st=d.get('status',{});state=st.get('state');msg=(st.get('error') or {}).get('message','');print(state,msg);sys.exit(0 if state=='SUCCEEDED' else 1)"
 }
 
-# Generate the SQL (one statement per line) from the config, then run each.
-while IFS= read -r stmt; do
-  [ -z "$stmt" ] && continue
-  echo "-> $stmt"
-  run "$stmt"
-done < <(python3 - "$CONFIG" <<'PY'
+# Generate the SQL (one statement per line) from the config first so a broken config aborts
+# immediately under `set -e`, then run each statement with isolated stdin.
+STMTS="$(python3 - "$CONFIG" <<'PY'
 import json, sys
 tables = json.load(open(sys.argv[1]))
 stmts, schemas = [], set()
@@ -50,6 +47,12 @@ for t in tables:
     stmts.append(f"SELECT count(*) FROM {src}")
 print("\n".join(stmts))
 PY
-)
+)"
+
+while IFS= read -r stmt; do
+  [ -z "$stmt" ] && continue
+  echo "-> $stmt"
+  run "$stmt" || exit 1
+done <<< "$STMTS"
 
 echo "seeded all demo sources from $CONFIG"
