@@ -115,6 +115,9 @@ def test_helper_selects_read_write_and_mints_from_endpoint(tmp_path):
 def test_branch_test_script_resolves_via_endpoint(tmp_path):
     """branch_test.sh (no terraform/liquibase — safe to run fully) mints via the endpoint form."""
     env, call_log = _stub_env(tmp_path)
+    # This test is about the endpoint, not the database name: pin the name so the result does
+    # not depend on a terraform binary on PATH (CI's dabs-validate job had none).
+    env["TF_VAR_logical_database"] = "databricks_postgres"
     result = subprocess.run(
         ["bash", str(BRANCH_TEST_SH), "my-lakebase-project", "pr-123", "DEFAULT"],
         env=env,
@@ -211,6 +214,8 @@ def test_resolve_database_matches_real_terraform_oracle(tmp_path):
     import pytest
 
     if shutil.which("terraform") is None:
+        if os.environ.get("CI"):
+            pytest.fail("no terraform binary on PATH in CI; the real-Terraform differential test must run")
         pytest.skip("no terraform binary on PATH; cannot run real-Terraform differential test")
 
     base_env = dict(os.environ)

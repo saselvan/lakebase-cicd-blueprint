@@ -103,6 +103,13 @@ jobs:
       - name: Falsifiability tests — validate passes on valid, FAILS on malformed/invalid resource
         run: pytest dabs/tests -q
 
+      # The database resolver asks `terraform console`; the differential test runs it for real.
+      - name: Set up Terraform (pinned; same version as the validate job)
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.2"
+          terraform_wrapper: false
+
       - name: Offline tests — deploy scripts and Liquibase codegen (stub CLI and psql, no cloud)
         run: pytest scripts/tests liquibase/tests -q
 
