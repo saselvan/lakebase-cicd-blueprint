@@ -34,6 +34,7 @@ _STUB_PSQL = r"""#!/usr/bin/env bash
 # empty string to simulate a psql error whose output is empty.
 sql="${@: -1}"
 case "$sql" in
+  *NOT\ has_any_column_privilege*) printf '%s\n' "${STUB_BASE_DENIED-t}" ;;
   *pg_roles*)             printf '%s\n' "${STUB_ROLE_EXISTS-t}" ;;
   *pg_views*)             printf '%s\n' "${STUB_VIEW_EXISTS-t}" ;;
   *has_table_privilege*)  printf '%s\n' "${STUB_CAN_SELECT-t}" ;;
@@ -207,3 +208,48 @@ def test_view_owner_cannot_read_base_exits_nonzero_with_cause(tmp_path):
     assert r.returncode != 0, r.stdout + r.stderr
     assert "FAIL a real read through cicd_proj.members_v succeeds" in r.stdout
     assert "permission denied for table members" in (r.stdout + r.stderr)
+
+
+def test_base_table_grant_exits_nonzero(tmp_path):
+    # Hostile row: the app role can read or write the base synced table directly (or via column,
+    # PUBLIC, inherited role, or NOINHERIT role). verify_table.sh must run the base-table denial
+    # check from dabs/checks.py and exit non-zero when it returns 'f'.
+    r = _run_verify(tmp_path, {"STUB_BASE_DENIED": "f"}, _OK_ARGS)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "FAIL role members_app_ro is denied on synced table cicd_proj.members" in r.stdout
+
+
+def test_verify_table_fails_closed_when_checks_cli_errors_or_prints_zero_checks(tmp_path):
+    # verify_table.sh calls python3 dabs/checks.py --table-checks ...; if the CLI exits non-zero
+    # or emits 0 check lines, verify_table.sh must fail closed (non-zero exit), never pass with 0
+    # checks.
+    stub_psql = tmp_path / "psql"
+    stub_psql.write_text(_STUB_PSQL)
+    stub_psql.chmod(0o755)
+
+    # Case 1: python3 exits non-zero
+    stub_py = tmp_path / "python3"
+    stub_py.write_text("#!/usr/bin/env bash\necho 'simulated python failure' >&2\nexit 1\n")
+    stub_py.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{tmp_path}{os.pathsep}{env.get('PATH', '')}"
+    r_err = subprocess.run(
+        ["bash", str(VERIFY_SH), *_OK_ARGS],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert r_err.returncode != 0, r_err.stdout + r_err.stderr
+
+    # Case 2: python3 exits 0 but prints 0 checks (empty output)
+    stub_py.write_text("#!/usr/bin/env bash\nexit 0\n")
+    stub_py.chmod(0o755)
+    r_empty = subprocess.run(
+        ["bash", str(VERIFY_SH), *_OK_ARGS],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert r_empty.returncode != 0, r_empty.stdout + r_empty.stderr
+    assert "0 checks" in (r_empty.stdout + r_empty.stderr) or "failed" in (r_empty.stdout + r_empty.stderr).lower()
+

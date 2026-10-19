@@ -74,13 +74,19 @@ def run_checks(checks: Iterable[Check], execute: Callable[[str], object],
     return failures
 
 
-def _table_checks(table: dict) -> list[Check]:
-    """The verify checks for one configured table."""
-    role = render_ddl.validate_identifier(table["app_role"], "app_role")
-    schema = render_ddl.validate_identifier(table["app_schema"], "app_schema")
-    tbl = render_ddl.validate_identifier(render_ddl.pg_table_name(table), "synced_table")
-    view = render_ddl.resolve_view_name(table, tbl)
-    cols = [render_ddl.validate_identifier(c, "index_column") for c in (table.get("index_columns") or [])]
+def table_checks(
+    role: str,
+    schema: str,
+    tbl: str,
+    view: str,
+    index_columns: Iterable[str] = (),
+) -> list[Check]:
+    """The verify checks for one table, shared by the DABs verify task and scripts/verify_table.sh."""
+    role = render_ddl.validate_identifier(role, "app_role")
+    schema = render_ddl.validate_identifier(schema, "app_schema")
+    tbl = render_ddl.validate_identifier(tbl, "synced_table")
+    view = render_ddl.validate_identifier(view, "view_name")
+    cols = [render_ddl.validate_identifier(c, "index_column") for c in (index_columns or [])]
     base = f"{schema}.{tbl}"
     out: list[Check] = [
         (f"role {role} exists", f"SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = '{role}')"),
@@ -94,10 +100,15 @@ def _table_checks(table: dict) -> list[Check]:
          f"SELECT count(*) >= 0 FROM (SELECT 1 FROM {schema}.{view} LIMIT 1) AS read_check"),
         # Column-level grants are invisible to has_table_privilege; has_any_column_privilege sees
         # table and column grants. DELETE/TRUNCATE/TRIGGER exist only at table level. Both functions
-        # count PUBLIC and inherited grants.
+        # count PUBLIC and inherited grants, while the pg_has_role(..., 'MEMBER') subquery also
+        # catches NOINHERIT role memberships the app role could SET ROLE into to reach the base table.
         (f"role {role} is denied on synced table {base}",
          f"SELECT NOT has_any_column_privilege('{role}', '{base}', 'SELECT, INSERT, UPDATE, REFERENCES')"
-         f" AND NOT has_table_privilege('{role}', '{base}', 'DELETE, TRUNCATE, TRIGGER')"),
+         f" AND NOT has_table_privilege('{role}', '{base}', 'DELETE, TRUNCATE, TRIGGER')"
+         f" AND NOT EXISTS ("
+         f"SELECT 1 FROM pg_roles r WHERE pg_has_role('{role}', r.oid, 'MEMBER')"
+         f" AND (has_any_column_privilege(r.oid, '{base}', 'SELECT, INSERT, UPDATE, REFERENCES')"
+         f" OR has_table_privilege(r.oid, '{base}', 'DELETE, TRUNCATE, TRIGGER')))"),
     ]
     for col in cols:
         idx = f"idx_{tbl}_{col}"
@@ -105,6 +116,19 @@ def _table_checks(table: dict) -> list[Check]:
                     f"SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname = '{schema}' "
                     f"AND indexname = '{idx}')"))
     return out
+
+
+def _table_checks(table: dict) -> list[Check]:
+    """The verify checks for one configured table."""
+    tbl = render_ddl.validate_identifier(render_ddl.pg_table_name(table), "synced_table")
+    view = render_ddl.resolve_view_name(table, tbl)
+    return table_checks(
+        role=table["app_role"],
+        schema=table["app_schema"],
+        tbl=tbl,
+        view=view,
+        index_columns=table.get("index_columns") or (),
+    )
 
 
 def verify_checks(tables: list[dict]) -> list[Check]:
@@ -142,3 +166,29 @@ def policy_checks(expected_identity: str) -> list[Check]:
                     f"SELECT NOT EXISTS(SELECT 1 FROM pg_roles r WHERE r.{attr} "
                     f"AND pg_has_role(current_user, r.oid, 'MEMBER'))"))
     return out
+
+
+def _main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Emit Lakebase verification checks.")
+    parser.add_argument(
+        "--table-checks",
+        nargs="+",
+        metavar="ARG",
+        help="ROLE SCHEMA PG_TABLE VIEW [INDEX_COL ...]",
+    )
+    args = parser.parse_args(argv)
+    if not args.table_checks or len(args.table_checks) < 4:
+        parser.error("--table-checks requires at least ROLE SCHEMA PG_TABLE VIEW")
+    role, schema, tbl, view, *index_cols = args.table_checks
+    for label, sql in table_checks(role, schema, tbl, view, index_cols):
+        print(f"{label}\t{sql}")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    raise SystemExit(_main())
+

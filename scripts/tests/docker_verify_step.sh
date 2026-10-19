@@ -67,6 +67,13 @@ echo ""; echo "===== POSITIVE: grant present + both indexes ====="
 psql -v ON_ERROR_STOP=1 -q \
   -c "GRANT USAGE ON SCHEMA $SCHEMA TO $ROLE;" \
   -c "GRANT SELECT ON $SCHEMA.$VIEW TO $ROLE;"
+pos_out="$(verify_table "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code)"
+printf '%s\n' "$pos_out"
+if printf '%s\n' "$pos_out" | grep -q "PASS role $ROLE is denied on synced table $SCHEMA.$TABLE"; then
+  echo "  OK   verify_table executed dabs/checks.py check list including base-table denial"
+else
+  echo "  FAIL verify_table did not emit the base-table denial check from dabs/checks.py"; fail=1
+fi
 expect 0 "all post-conditions met -> exit 0" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
 
 echo ""; echo "===== LEAST PRIVILEGE: role reads the VIEW but is DENIED the base table ====="
@@ -79,6 +86,58 @@ if [ "$lp_base" = "f" ] && [ "$lp_view" = "t" ]; then
   echo "  OK   role can SELECT the view (t) but NOT the base table (f) (base=$lp_base view=$lp_view)"
 else
   echo "  FAIL least privilege violated (base=$lp_base view=$lp_view; want base=f view=t)"; fail=1
+fi
+
+echo ""; echo "===== NEGATIVE: direct GRANT SELECT on base table to app role ====="
+psql -v ON_ERROR_STOP=1 -q -c "GRANT SELECT ON $SCHEMA.$TABLE TO $ROLE;"
+expect nonzero "direct base-table SELECT grant -> non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+psql -v ON_ERROR_STOP=1 -q -c "REVOKE ALL ON $SCHEMA.$TABLE FROM $ROLE;"
+
+echo ""; echo "===== NEGATIVE: column-level GRANT SELECT (member_id) on base table ====="
+psql -v ON_ERROR_STOP=1 -q -c "GRANT SELECT (member_id) ON $SCHEMA.$TABLE TO $ROLE;"
+expect nonzero "column-level base-table SELECT grant -> non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+psql -v ON_ERROR_STOP=1 -q -c "REVOKE ALL (member_id) ON $SCHEMA.$TABLE FROM $ROLE;"
+
+echo ""; echo "===== NEGATIVE: GRANT SELECT on base table to PUBLIC ====="
+psql -v ON_ERROR_STOP=1 -q -c "GRANT SELECT ON $SCHEMA.$TABLE TO PUBLIC;"
+expect nonzero "PUBLIC base-table SELECT grant -> non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+psql -v ON_ERROR_STOP=1 -q -c "REVOKE ALL ON $SCHEMA.$TABLE FROM PUBLIC;"
+
+echo ""; echo "===== NEGATIVE: inherited role has SELECT on base table ====="
+psql -v ON_ERROR_STOP=1 -q \
+  -c "CREATE ROLE helper_inh NOLOGIN; GRANT SELECT ON $SCHEMA.$TABLE TO helper_inh; GRANT helper_inh TO $ROLE;"
+expect nonzero "inherited base-table SELECT grant -> non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+psql -v ON_ERROR_STOP=1 -q \
+  -c "REVOKE helper_inh FROM $ROLE; REVOKE ALL ON $SCHEMA.$TABLE FROM helper_inh; DROP ROLE helper_inh;"
+
+echo ""; echo "===== NEGATIVE: NOINHERIT role membership has SELECT on base table (SET ROLE route) ====="
+psql -v ON_ERROR_STOP=1 -q \
+  -c "ALTER ROLE $ROLE NOINHERIT; CREATE ROLE helper_noinh NOLOGIN; GRANT SELECT ON $SCHEMA.$TABLE TO helper_noinh; GRANT helper_noinh TO $ROLE;"
+expect nonzero "NOINHERIT base-table SELECT grant -> non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+psql -v ON_ERROR_STOP=1 -q \
+  -c "REVOKE helper_noinh FROM $ROLE; REVOKE ALL ON $SCHEMA.$TABLE FROM helper_noinh; DROP ROLE helper_noinh; ALTER ROLE $ROLE INHERIT;"
+
+echo ""; echo "===== NEGATIVE: dabs/checks.py CLI exits non-zero or prints 0 checks (fail closed) ====="
+stub_dir="$(mktemp -d "${TMPDIR:-/tmp}/verify_cli_stub.XXXXXX")"
+cat > "$stub_dir/python3" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$stub_dir/python3"
+rc_cli_err=0
+PATH="$stub_dir:$PATH" run_verify "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code || rc_cli_err=$?
+cat > "$stub_dir/python3" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$stub_dir/python3"
+rc_cli_zero=0
+PATH="$stub_dir:$PATH" run_verify "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code || rc_cli_zero=$?
+rm -rf "$stub_dir"
+if [ "$rc_cli_err" -ne 0 ] && [ "$rc_cli_zero" -ne 0 ]; then
+  echo "  OK   verify_table fails closed when CLI errors (rc=$rc_cli_err) or prints 0 checks (rc=$rc_cli_zero)"
+else
+  echo "  FAIL verify_table did not fail closed (rc_cli_err=$rc_cli_err, rc_cli_zero=$rc_cli_zero)"; fail=1
 fi
 
 echo ""; echo "===== NEGATIVE: SELECT on the consumer view REVOKED ====="
