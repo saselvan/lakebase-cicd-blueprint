@@ -489,10 +489,7 @@ def run_check_step(
         to_run = checks.verify_checks(load_tables(config))
         title = "verify"
     print(f"== {title}: {len(to_run)} check(s) on {branch} ==")
-    try:
-        executor = _live_execute(branch) if database is None else _live_execute(branch, database)
-    except TypeError:
-        executor = _live_execute(branch)
+    executor = _live_execute(branch) if database is None else _live_execute(branch, database)
     failures = checks.run_checks(to_run, executor)
     if failures:
         print(f"  {title.upper()} FAILED: {failures} check(s) not met")

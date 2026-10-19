@@ -13,7 +13,7 @@ CONFIG="${CONFIG:-$ROOT/config/tables.json}"
 
 run() {
   databricks api post /api/2.0/sql/statements -p "$PROFILE" \
-    --json "{\"warehouse_id\":\"$WH\",\"wait_timeout\":\"30s\",\"statement\":\"$1\"}" </dev/null \
+    --json "{\"warehouse_id\":\"$WH\",\"wait_timeout\":\"50s\",\"on_wait_timeout\":\"CANCEL\",\"statement\":\"$1\"}" </dev/null \
     | python3 -c "import sys,json;d=json.load(sys.stdin);st=d.get('status',{});state=st.get('state');msg=(st.get('error') or {}).get('message','');print(state,msg);sys.exit(0 if state=='SUCCEEDED' else 1)"
 }
 

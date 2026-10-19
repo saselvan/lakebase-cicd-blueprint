@@ -110,7 +110,7 @@ lakebase_validate_database() {
 # lakebase_resolve_database [repo_root]
 # Resolve the target Postgres logical database name in this exact order only:
 #   1. TF_VAR_logical_database environment variable
-#   2. terraform/terraform.tfvars (or terraform output -raw logical_database when state exists)
+#   2. terraform/terraform.tfvars
 #   3. terraform/variables.tf default (databricks_postgres)
 # PGDATABASE does NOT override terraform.tfvars or variables.tf. Validates the resolved name via
 # lakebase_validate_database before printing it.
@@ -123,16 +123,16 @@ lakebase_resolve_database() {
     db="$TF_VAR_logical_database"
   else
     db="$(python3 - "$tf_dir" <<'PY'
+from __future__ import annotations
+
 import ast
 import pathlib
-import subprocess
 import sys
 import tokenize
 
 tf_dir = pathlib.Path(sys.argv[1])
 tfvars = tf_dir / "terraform.tfvars"
 vars_tf = tf_dir / "variables.tf"
-tfstate = tf_dir / "terraform.tfstate"
 
 
 def read_tfvars_key(path: pathlib.Path, target: str) -> str | None:
@@ -176,18 +176,6 @@ def read_variables_tf_default(path: pathlib.Path, target: str) -> str | None:
 
 
 val = read_tfvars_key(tfvars, "logical_database")
-if val is None and tfstate.is_file():
-    try:
-        res = subprocess.run(
-            ["terraform", f"-chdir={tf_dir}", "output", "-raw", "logical_database"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        if res.stdout.strip():
-            val = res.stdout.strip()
-    except Exception:
-        pass
 if val is None:
     val = read_variables_tf_default(vars_tf, "logical_database") or "databricks_postgres"
 sys.stdout.write(val)

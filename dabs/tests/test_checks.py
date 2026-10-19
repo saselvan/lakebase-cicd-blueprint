@@ -136,14 +136,14 @@ def test_main_has_no_switch_that_skips_the_guard():
 
 def test_main_returns_nonzero_when_a_check_fails(monkeypatch):
     """A failed check makes the task fail: main() returns non-zero for verify and for policy."""
-    monkeypatch.setattr(mj, "_live_execute", lambda branch: (lambda sql: False))
+    monkeypatch.setattr(mj, "_live_execute", lambda branch, database=None: (lambda sql: False))
     assert mj.main(["--step", "verify", "--config", str(CONFIG), "--branch", "projects/p/branches/b"]) != 0
     assert mj.main(["--step", "policy", "--expected-identity", DEPLOY,
                     "--branch", "projects/p/branches/b"]) != 0
 
 
 def test_main_returns_zero_when_every_check_passes(monkeypatch):
-    monkeypatch.setattr(mj, "_live_execute", lambda branch: (lambda sql: True))
+    monkeypatch.setattr(mj, "_live_execute", lambda branch, database=None: (lambda sql: True))
     assert mj.main(["--step", "verify", "--config", str(CONFIG), "--branch", "projects/p/branches/b"]) == 0
     assert mj.main(["--step", "policy", "--expected-identity", DEPLOY,
                     "--branch", "projects/p/branches/b"]) == 0

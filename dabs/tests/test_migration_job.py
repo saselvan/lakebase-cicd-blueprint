@@ -808,6 +808,18 @@ def test_main_threads_database_into_apply_and_checks(monkeypatch, tmp_path):
         ("projects/p/branches/b", "custom_db"),
     ]
 
+    # A TypeError raised inside _live_execute must propagate, never silently fall back without database.
+    calls_on_err: list[tuple[str, str | None]] = []
+
+    def raising_live_execute(branch: str, database: str | None = None):
+        calls_on_err.append((branch, database))
+        raise TypeError("driver boom")
+
+    monkeypatch.setattr(mj, "_live_execute", raising_live_execute)
+    with pytest.raises(TypeError, match="driver boom"):
+        mj.run_check_step("verify", branch="projects/p/branches/b", database="custom_db", config=str(cfg))
+    assert calls_on_err == [("projects/p/branches/b", "custom_db")]
+
 
 def test_bundle_tasks_pass_lakebase_database_variable():
     """Every task in dabs/databricks.yml (migrate, verify, and prod verify_identity_policy) must
