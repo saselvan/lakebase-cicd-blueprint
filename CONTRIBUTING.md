@@ -48,7 +48,7 @@ verified once against a live Lakebase branch (recorded in `docs/DESIGN-NOTES.md`
 | Per-table changeset identity — tables sharing a schema never collide in one DATABASECHANGELOG | `docker_multitable_proof.sh` + `test_generate_changelogs.py::test_shared_schema_tables_get_distinct_changeset_identities` | Docker + offline |
 | Double-apply is idempotent (no version-table rollback on the 2nd apply) | `docker_double_apply_proof.sh` | Docker |
 | Verify step fails on a missing grant or index | `docker_verify_step.sh` + `test_verify_step.py` (`test_missing_grant_on_view_exits_nonzero`, `test_missing_index_exits_nonzero`) | Docker + offline |
-| App role reads the consumer VIEW but not the base synced table (least privilege) | least-privilege assertions in `docker_multitable_proof.sh` + `docker_double_apply_proof.sh`; live-confirmed | Docker + live |
+| App role reads the consumer VIEW but not the base synced table (least privilege) | least-privilege assertions in `docker_multitable_proof.sh` + `docker_double_apply_proof.sh` + `docker_verify_step.sh` + `test_checks.py`; live-confirmed | Docker + offline + live |
 | `view_name` override is honored — the overridden view is created, the derived `<tbl>_v` is not | `docker_multitable_proof.sh` + `test_generate_changelogs.py::test_view_name_override_appears_in_changelog`; deploy verify: `scripts/tests/test_deploy_view_name.py` | Docker + offline |
 | Deploy aborts on committed-changelog drift (uses reviewed artifacts, never regenerates) | `test_deploy_drift_gate.py` | offline |
 | Endpoint-based credential minting (projects API, no instance name; READ_WRITE endpoint chosen) | `test_endpoint_credential.py` | offline |

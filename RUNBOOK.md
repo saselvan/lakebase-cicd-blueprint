@@ -35,7 +35,8 @@ export PGUSER=<your-databricks-username>   # your login email; for a service pri
 ./scripts/deploy.sh
 ```
 
-`deploy.sh` does, in order:
+`deploy.sh` does, in order (resolving the target Postgres database name from `TF_VAR_logical_database`,
+then `terraform/terraform.tfvars`, then `terraform/variables.tf` default `databricks_postgres`):
 1. `terraform apply` — creates the synced table via `databricks_postgres_synced_table`. Reruns are a
    no-op because Terraform owns the state.
 2. `scripts/wait_for_sync.sh` — polls `databricks postgres get-synced-table` until `detailed_state`
@@ -46,9 +47,10 @@ export PGUSER=<your-databricks-username>   # your login email; for a service pri
    A distinct changelog file per table gives each changeset a distinct identity, so shared-schema
    tables never collide in `DATABASECHANGELOG`. Reruns reapply the `runAlways` changesets.
 4. verify (`scripts/verify_table.sh`) — asserts the role and view exist, the app role has `SELECT`
-   on the view and `USAGE` on the schema, a real read through the view works, and every
-   `idx_<table>_<col>` exists; exits non-zero (failing the deploy) if not.
-   Extracted from `deploy.sh` so it can be tested against a real Docker Postgres.
+   on the view and `USAGE` on the schema, a real read through the view works, the app role is denied
+   on the base synced table by every route, and every `idx_<table>_<col>` exists; exits non-zero
+   (failing the deploy) if not. Shares the check list in `dabs/checks.py` and is tested against a
+   real Docker Postgres.
 
 ## The PR flow (branching)
 
