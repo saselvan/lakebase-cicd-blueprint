@@ -125,54 +125,70 @@ lakebase_resolve_database() {
     db="$(python3 - "$tf_dir" <<'PY'
 from __future__ import annotations
 
-import ast
 import pathlib
+import re
 import sys
-import tokenize
 
 tf_dir = pathlib.Path(sys.argv[1])
 tfvars = tf_dir / "terraform.tfvars"
 vars_tf = tf_dir / "variables.tf"
 
 
+def strip_hcl_comments(src: str) -> str:
+    """Strip HCL #, //, and /* ... */ comments while preserving double-quoted string literals."""
+    out: list[str] = []
+    i = 0
+    n = len(src)
+    in_str = False
+    while i < n:
+        ch = src[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(src[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+        else:
+            if ch == '"':
+                in_str = True
+                out.append(ch)
+                i += 1
+            elif ch == "#" or src[i : i + 2] == "//":
+                while i < n and src[i] != "\n":
+                    i += 1
+            elif src[i : i + 2] == "/*":
+                end = src.find("*/", i + 2)
+                i = n if end == -1 else end + 2
+            else:
+                out.append(ch)
+                i += 1
+    return "".join(out)
+
+
 def read_tfvars_key(path: pathlib.Path, target: str) -> str | None:
     if not path.is_file():
         return None
-    with path.open("rb") as fh:
-        tokens = list(tokenize.tokenize(fh.readline))
-    for idx, tok in enumerate(tokens):
-        if tok.type == tokenize.NAME and tok.string == target:
-            rest = [t for t in tokens[idx + 1 : idx + 6] if t.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT, tokenize.INDENT, tokenize.DEDENT)]
-            if len(rest) >= 2 and rest[0].string == "=" and rest[1].type == tokenize.STRING:
-                return str(ast.literal_eval(rest[1].string))
-    return None
+    cleaned = strip_hcl_comments(path.read_text())
+    m = re.search(rf"(?m)^\s*{re.escape(target)}\s*=\s*\"([^\"]*)\"", cleaned)
+    return m.group(1) if m else None
 
 
 def read_variables_tf_default(path: pathlib.Path, target: str) -> str | None:
     if not path.is_file():
         return None
-    with path.open("rb") as fh:
-        tokens = list(tokenize.tokenize(fh.readline))
-    in_var = False
-    depth = 0
-    for idx, tok in enumerate(tokens):
-        if not in_var and tok.type == tokenize.NAME and tok.string == "variable":
-            rest = [t for t in tokens[idx + 1 : idx + 5] if t.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT)]
-            if rest and rest[0].type == tokenize.STRING and ast.literal_eval(rest[0].string) == target:
-                in_var = True
-                depth = 0
-        elif in_var:
-            if tok.string == "{":
-                depth += 1
-            elif tok.string == "}":
-                depth -= 1
-                if depth <= 0:
-                    in_var = False
-            elif depth == 1 and tok.type == tokenize.NAME and tok.string == "default":
-                rest = [t for t in tokens[idx + 1 : idx + 5] if t.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT)]
-                if len(rest) >= 2 and rest[0].string == "=" and rest[1].type == tokenize.STRING:
-                    return str(ast.literal_eval(rest[1].string))
-    return None
+    cleaned = strip_hcl_comments(path.read_text())
+    block_m = re.search(
+        rf"variable\s+\"{re.escape(target)}\"\s*\{{(?P<body>[^}}]*)\}}",
+        cleaned,
+        re.S,
+    )
+    if not block_m:
+        return None
+    def_m = re.search(r"(?m)^\s*default\s*=\s*\"([^\"]*)\"", block_m.group("body"))
+    return def_m.group(1) if def_m else None
 
 
 val = read_tfvars_key(tfvars, "logical_database")

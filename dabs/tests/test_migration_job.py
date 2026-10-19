@@ -726,6 +726,89 @@ def test_apply_threads_branch_into_conninfo(monkeypatch):
     assert captured["sql"] == "SELECT 1;"
 
 
+def test_apply_threads_database_into_conninfo(monkeypatch):
+    """apply_sql_to_lakebase threads an explicit database into _lakebase_conninfo."""
+    captured: dict[str, object] = {}
+
+    def fake_conninfo(*, branch, database=None):
+        captured["branch"] = branch
+        captured["database"] = database
+        return "host=x port=5432 dbname=custom_db user=u password=p sslmode=require"
+
+    monkeypatch.setattr(mj, "_lakebase_conninfo", fake_conninfo)
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql):
+            captured["sql"] = sql
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return _Cur()
+
+    fake_psycopg.connect = lambda conninfo, autocommit=False: _Conn()
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    mj.apply_sql_to_lakebase("SELECT 1;", branch="projects/p/branches/b", database="custom_db")
+
+    assert captured["branch"] == "projects/p/branches/b"
+    assert captured["database"] == "custom_db"
+    assert captured["sql"] == "SELECT 1;"
+
+
+def test_live_execute_threads_database_into_conninfo(monkeypatch):
+    """_live_execute threads an explicit database into _lakebase_conninfo and returns first column."""
+    captured: dict[str, object] = {}
+
+    def fake_conninfo(*, branch, database=None):
+        captured["branch"] = branch
+        captured["database"] = database
+        return "host=x port=5432 dbname=custom_db user=u password=p sslmode=require"
+
+    monkeypatch.setattr(mj, "_lakebase_conninfo", fake_conninfo)
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql):
+            captured["sql"] = sql
+
+        def fetchone(self):
+            return (True,)
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    fake_psycopg.connect = lambda conninfo, autocommit=False: _Conn()
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    execute = mj._live_execute("projects/p/branches/b", "custom_db")
+    assert execute("SELECT true;") is True
+    assert captured["branch"] == "projects/p/branches/b"
+    assert captured["database"] == "custom_db"
+    assert captured["sql"] == "SELECT true;"
+
+
 def test_bundle_task_passes_branch_variable():
     """The deploy passes the target branch to the task via ${var.lakebase_branch}, so the job
     migrates the TARGET branch endpoint, never the instance default."""

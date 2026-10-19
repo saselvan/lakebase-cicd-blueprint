@@ -194,9 +194,13 @@ def test_resolve_database_precedence_and_pgdatabase_does_not_override_tfvars(tmp
     assert r_def.stdout.strip() == "databricks_postgres"
 
     # Case 2: terraform.tfvars overrides variables.tf default, and PGDATABASE does NOT override tfvars.
+    # Include HCL #, // (with apostrophe), and /* ... */ comments to prove they are ignored.
     repo_tfvars = _make_tf_repo(
         tmp_path / "c_tfvars",
-        '# comment with logical_database = "ignored"\nlogical_database = "tfvars_custom_db"\n',
+        '# comment with logical_database = "ignored"\n'
+        '// don\'t use logical_database = "slash_comment_ignored"\n'
+        '/* logical_database = "block_comment_ignored" */\n'
+        'logical_database = "tfvars_custom_db"\n',
     )
     r_tfv = subprocess.run(
         ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_resolve_database "{repo_tfvars}"'],
