@@ -464,22 +464,28 @@ def test_resolve_database_no_terraform_binary_and_failing_terraform_console(tmp_
         assert res.returncode != 0, f"expected fail-closed on {var_file}"
         assert f"unsupported var file: {var_file}; set TF_VAR_logical_database" in res.stderr
 
-    # 3) Terraform IS on PATH, no var files, but `terraform console` fails -> exits non-zero (no silent fallback)
-    failing_tf_bin = tmp_path / "failing_tf_bin"
-    failing_tf_bin.mkdir()
-    tf_stub = failing_tf_bin / "terraform"
-    tf_stub.write_text("#!/usr/bin/env bash\necho 'console boom' >&2\nexit 1\n")
-    tf_stub.chmod(0o755)
-    env_fail_tf = dict(os.environ, PATH=f"{failing_tf_bin}{os.pathsep}{os.environ.get('PATH', '')}")
-    env_fail_tf.pop("TF_VAR_logical_database", None)
-    r_fail = subprocess.run(
-        ["bash", "-c", f'set -euo pipefail; . "{RESOLVE_HELPER}"; lakebase_resolve_database "{clean_root}"'],
-        env=env_fail_tf,
-        capture_output=True,
-        text=True,
-    )
-    assert r_fail.returncode != 0, "expected non-zero exit when terraform console fails"
-    assert "console boom" in r_fail.stderr
+    # 3) Terraform IS on PATH, no var files, but `terraform console` fails or emits junk -> exits non-zero
+    for case_name, stub_body, expected_stderr in [
+        ("nonzero_exit", "#!/usr/bin/env bash\necho 'console boom' >&2\nexit 1\n", "console boom"),
+        ("empty_output", "#!/usr/bin/env bash\nexit 0\n", "empty output"),
+        ("invalid_json", "#!/usr/bin/env bash\necho 'not-json'\nexit 0\n", "invalid JSON"),
+        ("non_string", "#!/usr/bin/env bash\necho '42'\nexit 0\n", "non-string"),
+    ]:
+        failing_tf_bin = tmp_path / f"failing_tf_{case_name}"
+        failing_tf_bin.mkdir()
+        tf_stub = failing_tf_bin / "terraform"
+        tf_stub.write_text(stub_body)
+        tf_stub.chmod(0o755)
+        env_fail_tf = dict(os.environ, PATH=f"{failing_tf_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+        env_fail_tf.pop("TF_VAR_logical_database", None)
+        r_fail = subprocess.run(
+            ["bash", "-c", f'set -euo pipefail; . "{RESOLVE_HELPER}"; lakebase_resolve_database "{clean_root}"'],
+            env=env_fail_tf,
+            capture_output=True,
+            text=True,
+        )
+        assert r_fail.returncode != 0, f"expected non-zero exit for {case_name}"
+        assert expected_stderr in r_fail.stderr, f"{case_name}: {r_fail.stderr!r}"
 
 
 
