@@ -160,3 +160,150 @@ def test_all_four_sites_use_projects_endpoint_cred_form():
     assert "postgres" in READ_VIA_VIEW.read_text() and "generate-database-credential" in (
         READ_VIA_VIEW.read_text()
     ), "read_via_view.py does not use the projects endpoint cred form"
+
+
+def _make_tf_repo(tmp_path: Path, tfvars_content: str | None = None) -> Path:
+    """Create a minimal repo layout with terraform/variables.tf, terraform/outputs.tf, and optional
+    terraform/terraform.tfvars for testing lakebase_resolve_database."""
+    tf_dir = tmp_path / "terraform"
+    tf_dir.mkdir(parents=True, exist_ok=True)
+    (tf_dir / "variables.tf").write_text((REPO_ROOT / "terraform" / "variables.tf").read_text())
+    (tf_dir / "outputs.tf").write_text((REPO_ROOT / "terraform" / "outputs.tf").read_text())
+    if tfvars_content is not None:
+        (tf_dir / "terraform.tfvars").write_text(tfvars_content)
+    return tmp_path
+
+
+def test_resolve_database_precedence_and_pgdatabase_does_not_override_tfvars(tmp_path):
+    """Resolution order is strictly:
+      1. TF_VAR_logical_database
+      2. terraform/terraform.tfvars
+      3. terraform/variables.tf default (databricks_postgres)
+    PGDATABASE and LOGICAL_DATABASE must NEVER override terraform.tfvars or variables.tf."""
+    # Case 3: default from variables.tf when neither TF_VAR_logical_database nor tfvars is set.
+    repo_default = _make_tf_repo(tmp_path / "c_default")
+    env = dict(os.environ)
+    env.pop("TF_VAR_logical_database", None)
+    env["PGDATABASE"] = "pgdatabase_must_not_win"
+    env["LOGICAL_DATABASE"] = "invented_var_must_not_win"
+    r_def = subprocess.run(
+        ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_resolve_database "{repo_default}"'],
+        env=env, capture_output=True, text=True,
+    )
+    assert r_def.returncode == 0, r_def.stderr
+    assert r_def.stdout.strip() == "databricks_postgres"
+
+    # Case 2: terraform.tfvars overrides variables.tf default, and PGDATABASE does NOT override tfvars.
+    repo_tfvars = _make_tf_repo(
+        tmp_path / "c_tfvars",
+        '# comment with logical_database = "ignored"\nlogical_database = "tfvars_custom_db"\n',
+    )
+    r_tfv = subprocess.run(
+        ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_resolve_database "{repo_tfvars}"'],
+        env=env, capture_output=True, text=True,
+    )
+    assert r_tfv.returncode == 0, r_tfv.stderr
+    assert r_tfv.stdout.strip() == "tfvars_custom_db"
+
+    # Case 1: TF_VAR_logical_database overrides terraform.tfvars.
+    env_tfvar = dict(env)
+    env_tfvar["TF_VAR_logical_database"] = "env_tfvar_db"
+    r_env = subprocess.run(
+        ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_resolve_database "{repo_tfvars}"'],
+        env=env_tfvar, capture_output=True, text=True,
+    )
+    assert r_env.returncode == 0, r_env.stderr
+    assert r_env.stdout.strip() == "env_tfvar_db"
+
+
+def test_resolve_database_rejects_hostile_database_names_in_bash(tmp_path):
+    """Hostile database names with URL or conninfo injection characters (e.g. db?sslmode=disable
+    or db sslmode=disable) must fail closed in bash before building any URL or conninfo."""
+    repo = _make_tf_repo(tmp_path / "repo")
+    for bad in ("db?sslmode=disable", "db sslmode=disable", "1bad", "db;drop"):
+        env = dict(os.environ)
+        env["TF_VAR_logical_database"] = bad
+        r = subprocess.run(
+            ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_resolve_database "{repo}"'],
+            env=env, capture_output=True, text=True,
+        )
+        assert r.returncode != 0 and r.returncode != 127, (
+            f"accepted hostile database name {bad!r}: {r.stdout}"
+        )
+        assert "invalid database name" in r.stderr.lower(), r.stderr
+
+
+def test_branch_test_fails_when_auth_describe_fails(tmp_path):
+    """In scripts/branch_test.sh, a failing `databricks auth describe` must NOT be masked by
+    `export PGUSER="$(...)"`."""
+    env, _ = _stub_env(tmp_path)
+    # Replace stub databricks so `auth describe` fails non-zero
+    stub = tmp_path / "databricks"
+    stub.write_text(
+        STUB_DATABRICKS.replace(
+            '"auth describe")                      printf \'%s\\n\' \'{"username":"stub-user@example.com"}\' ;;',
+            '"auth describe")                      echo "auth expired" >&2; exit 1 ;;',
+        )
+    )
+    stub.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(BRANCH_TEST_SH), "my-lakebase-project", "pr-123", "DEFAULT"],
+        env=env, capture_output=True, text=True,
+    )
+    assert result.returncode != 0, (
+        f"branch_test.sh exited 0 when `databricks auth describe` failed:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+def test_read_via_view_uses_pgdatabase_and_rejects_hostile_database_name(monkeypatch):
+    """examples/read_via_view.py reads PGDATABASE (default databricks_postgres) and validates it
+    against ^[A-Za-z_][A-Za-z0-9_$-]{0,62}$ before calling psycopg.connect."""
+    import importlib.util
+    import sys
+    import types
+    import pytest
+
+    fake_psycopg = types.ModuleType("psycopg")
+    connected: list[dict] = []
+
+    class _FakeConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql):
+            pass
+
+        def fetchone(self):
+            return (3,)
+
+    def fake_connect(**kwargs):
+        connected.append(kwargs)
+        return _FakeConn()
+
+    fake_psycopg.connect = fake_connect
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    spec = importlib.util.spec_from_file_location("read_via_view", READ_VIA_VIEW)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    monkeypatch.setattr(mod, "resolve_endpoint", lambda b, p: ("ep.host", "projects/p/branches/b/endpoints/e"))
+    monkeypatch.setattr(mod, "mint_token", lambda e, p: "tok")
+    monkeypatch.setenv("BRANCH", "projects/p/branches/b")
+    monkeypatch.setenv("PGUSER", "u@example.com")
+    monkeypatch.setenv("PGDATABASE", "custom_view_db")
+
+    mod.main()
+    assert connected and connected[-1]["dbname"] == "custom_view_db"
+
+    for bad in ("db?sslmode=disable", "db sslmode=disable"):
+        monkeypatch.setenv("PGDATABASE", bad)
+        with pytest.raises(ValueError):
+            mod.main()
+

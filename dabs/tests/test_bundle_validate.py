@@ -218,6 +218,11 @@ def test_prod_job_runs_the_identity_policy_before_migrate_and_verify_after(tmp_p
         _params(tasks["migrate"])[_params(tasks["migrate"]).index("--step") + 1] == "migrate"
     verify = _params(tasks["verify"])
     assert verify[verify.index("--step") + 1] == "verify", verify
+    for tname in ("migrate", "verify", "verify_identity_policy"):
+        p = _params(tasks[tname])
+        assert "--database" in p and p[p.index("--database") + 1] == "databricks_postgres", (
+            f"prod task {tname} did not interpolate --database from var.lakebase_database: {p}"
+        )
 
 
 def test_dev_job_has_no_identity_policy_and_migrate_runs_first(tmp_path):

@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -40,6 +41,16 @@ from typing import Callable
 # failures the gate must surface instead of polling forever.
 ONLINE = "ONLINE"
 _TERMINAL_FAILURES = ("FAILED", "ERROR")
+_DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_$-]{0,62}$")
+
+
+def validate_database_name(database: str) -> str:
+    """Validate a Postgres database name before embedding it in a conninfo or URL."""
+    if not isinstance(database, str) or not _DB_NAME.match(database):
+        raise ValueError(
+            f"invalid database name {database!r}: must match {_DB_NAME.pattern}"
+        )
+    return database
 
 
 # --- Single-source-of-truth locators (shared with Terraform + the DDL renderer) --------------
@@ -355,6 +366,7 @@ def _sdk_credential_source(endpoint: str) -> tuple[str, str]:
 def _lakebase_conninfo(
     *,
     branch: str,
+    database: str | None = None,
     resolve_endpoint: Callable[[str], object] | None = None,
     credential_source: Callable[[str], tuple[str, str]] | None = None,
 ) -> str:
@@ -381,6 +393,9 @@ def _lakebase_conninfo(
             "Lakebase conninfo; refusing to fall back to the instance default endpoint "
             "(the production branch)"
         )
+    db = validate_database_name(
+        database if database is not None else os.environ.get("PGDATABASE", "databricks_postgres")
+    )
     resolve_endpoint = resolve_endpoint or sdk_branch_endpoint_source()
     credential_source = credential_source or _sdk_credential_source
 
@@ -388,12 +403,17 @@ def _lakebase_conninfo(
     host = _endpoint_host(endpoint)  # never the instance default
     user, token = credential_source(_endpoint_name(endpoint))  # minted FROM that endpoint
     return (
-        f"host={host} port=5432 dbname={os.environ.get('PGDATABASE', 'databricks_postgres')} "
+        f"host={host} port=5432 dbname={db} "
         f"user={user} password={token} sslmode=require"
     )
 
 
-def apply_sql_to_lakebase(sql: str, *, branch: str) -> None:
+def apply_sql_to_lakebase(
+    sql: str,
+    *,
+    branch: str,
+    database: str | None = None,
+) -> None:
     """Apply rendered DDL to Lakebase over a runtime-OAuth psycopg connection (no stored secret).
 
     `branch` (``projects/<proj>/branches/<branch>``) is REQUIRED — it selects the TARGET branch
@@ -412,19 +432,29 @@ def apply_sql_to_lakebase(sql: str, *, branch: str) -> None:
     """
     import psycopg  # lazy: only the live apply needs a driver
 
-    with psycopg.connect(_lakebase_conninfo(branch=branch), autocommit=True) as conn:
+    conninfo = (
+        _lakebase_conninfo(branch=branch)
+        if database is None
+        else _lakebase_conninfo(branch=branch, database=database)
+    )
+    with psycopg.connect(conninfo, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
 
 
-def _live_execute(branch: str) -> Callable[[str], object]:
+def _live_execute(branch: str, database: str | None = None) -> Callable[[str], object]:
     """Return ``execute(sql) -> first column of the first row (or None)`` over ONE runtime-OAuth
     psycopg connection to the target branch (autocommit, so a failed check never poisons the next).
     Live path only; tests replace this seam. The connection closes when the process ends.
     """
     import psycopg  # lazy: only the live checks need a driver
 
-    conn = psycopg.connect(_lakebase_conninfo(branch=branch), autocommit=True)
+    conninfo = (
+        _lakebase_conninfo(branch=branch)
+        if database is None
+        else _lakebase_conninfo(branch=branch, database=database)
+    )
+    conn = psycopg.connect(conninfo, autocommit=True)
 
     def execute(sql: str) -> object:
         with conn.cursor() as cur:
@@ -435,13 +465,22 @@ def _live_execute(branch: str) -> Callable[[str], object]:
     return execute
 
 
-def run_check_step(step: str, *, branch: str, config: str | None = None,
-                   expected_identity: str | None = None) -> int:
+def run_check_step(
+    step: str,
+    *,
+    branch: str,
+    database: str | None = None,
+    config: str | None = None,
+    expected_identity: str | None = None,
+) -> int:
     """Run the `verify` or `policy` check step and return 0 only if every check passed.
 
     The policy step builds its checks BEFORE connecting, so an unusable expected identity fails
     the task without touching Postgres.
     """
+    validate_database_name(
+        database if database is not None else os.environ.get("PGDATABASE", "databricks_postgres")
+    )
     checks = _load_sibling("checks")
     if step == "policy":
         to_run = checks.policy_checks(expected_identity or "")
@@ -450,7 +489,11 @@ def run_check_step(step: str, *, branch: str, config: str | None = None,
         to_run = checks.verify_checks(load_tables(config))
         title = "verify"
     print(f"== {title}: {len(to_run)} check(s) on {branch} ==")
-    failures = checks.run_checks(to_run, _live_execute(branch))
+    try:
+        executor = _live_execute(branch) if database is None else _live_execute(branch, database)
+    except TypeError:
+        executor = _live_execute(branch)
+    failures = checks.run_checks(to_run, executor)
     if failures:
         print(f"  {title.upper()} FAILED: {failures} check(s) not met")
         return 1
@@ -490,6 +533,13 @@ def build_parser() -> argparse.ArgumentParser:
         "to the instance DEFAULT endpoint = the production branch, so it is refused rather than "
         "defaulted. Default: LAKEBASE_BRANCH env.",
     )
+    parser.add_argument(
+        "--database",
+        default=os.environ.get("PGDATABASE", "databricks_postgres"),
+        help="Lakebase Postgres database name (${var.lakebase_database}). Validated against "
+        "^[A-Za-z_][A-Za-z0-9_$-]{0,62}$ before building conninfo. Default: PGDATABASE env or "
+        "databricks_postgres.",
+    )
     parser.add_argument("--timeout", type=float, default=1800, help="Wait-for-ONLINE timeout (s).")
     parser.add_argument("--poll-interval", type=float, default=10, help="Wait-for-ONLINE poll interval (s).")
     parser.add_argument("--dry-run", action="store_true", help="Render only; do not connect/apply (offline).")
@@ -507,12 +557,18 @@ def main(argv: list[str] | None = None) -> int:
     """
     parser = build_parser()
     args = parser.parse_args(argv)
+    validate_database_name(args.database)
 
     if args.step in ("verify", "policy"):
         if not args.branch:
             parser.error("--branch / LAKEBASE_BRANCH is required for the verify and policy steps")
-        return run_check_step(args.step, branch=args.branch, config=args.config,
-                              expected_identity=args.expected_identity)
+        return run_check_step(
+            args.step,
+            branch=args.branch,
+            database=args.database,
+            config=args.config,
+            expected_identity=args.expected_identity,
+        )
 
     tables = load_tables(args.config)
     table_ids = synced_table_ids(tables)
@@ -535,7 +591,7 @@ def main(argv: list[str] | None = None) -> int:
     run_migration_task(
         table_ids,
         get_status,
-        lambda: apply_sql_to_lakebase(sql, branch=args.branch),
+        lambda: apply_sql_to_lakebase(sql, branch=args.branch, database=args.database),
         poll_interval=args.poll_interval,
         timeout=args.timeout,
     )

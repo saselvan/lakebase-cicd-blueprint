@@ -58,6 +58,8 @@ resources:
               # is minted from the branch endpoint. Interpolated at deploy time.
               - "--branch"
               - "${var.lakebase_branch}"
+              - "--database"
+              - "${var.lakebase_database}"
           environment_key: migration
         # verify: the post-migration checks (dabs/checks.py). It runs after migrate on every target,
         # and fails the run (so `bundle run` exits non-zero) when the app role cannot read its view,
@@ -74,6 +76,8 @@ resources:
               - "${workspace.file_path}/config/tables.json"
               - "--branch"
               - "${var.lakebase_branch}"
+              - "--database"
+              - "${var.lakebase_database}"
           environment_key: migration
       environments:
         - environment_key: migration
@@ -151,6 +155,8 @@ targets:
                   - "${var.run_as_sp}"
                   - "--branch"
                   - "${var.lakebase_branch}"
+                  - "--database"
+                  - "${var.lakebase_database}"
               environment_key: migration
             # Merged into the base migrate task by task_key: only depends_on is added.
             - task_key: migrate

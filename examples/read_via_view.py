@@ -22,9 +22,21 @@ Env: BRANCH (projects/<project>/branches/<branch>), PGUSER (your Databricks user
 """
 import json
 import os
+import re
 import subprocess
 
 import psycopg  # psycopg3
+
+_DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_$-]{0,62}$")
+
+
+def validate_database_name(database: str) -> str:
+    """Validate a Postgres database name before passing it to psycopg.connect."""
+    if not isinstance(database, str) or not _DB_NAME.match(database):
+        raise ValueError(
+            f"invalid database name {database!r}: must match {_DB_NAME.pattern}"
+        )
+    return database
 
 
 def _cli_json(args: list[str], profile: str) -> object:
@@ -77,11 +89,12 @@ def main() -> None:
 
     host, endpoint = resolve_endpoint(branch, profile)
     host = os.environ.get("PGHOST", host)  # allow an explicit override; otherwise use the endpoint's
+    dbname = validate_database_name(os.environ.get("PGDATABASE", "databricks_postgres"))
     token = mint_token(endpoint, profile)
 
     # In production use psycopg_pool.ConnectionPool with a per-connection token callback.
     with psycopg.connect(
-        host=host, port=5432, dbname="databricks_postgres",
+        host=host, port=5432, dbname=dbname,
         user=user, password=token, sslmode="require",
     ) as conn, conn.cursor() as cur:
         cur.execute(f"SELECT count(*) FROM {view}")
