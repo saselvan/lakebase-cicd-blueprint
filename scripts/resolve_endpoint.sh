@@ -101,7 +101,8 @@ lakebase_resolve_and_mint() {
 # db?sslmode=disable or "db sslmode=disable").
 lakebase_validate_database() {
   local db="${1-}"
-  if [[ "$db" == *$'\n'* ]] || [[ ! "$db" =~ ^[A-Za-z_][A-Za-z0-9_\$-]{0,62}$ ]]; then
+  local re='^[A-Za-z_][A-Za-z0-9_$-]{0,62}$'
+  if [[ "$db" == *$'\n'* ]] || [[ ! "$db" =~ $re ]]; then
     printf 'invalid database name %q: must match ^[A-Za-z_][A-Za-z0-9_$-]{0,62}$\n' "$db" >&2
     return 1
   fi

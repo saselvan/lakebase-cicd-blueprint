@@ -305,7 +305,7 @@ def test_resolve_database_rejects_hostile_database_names_in_bash(tmp_path):
     db sslmode=disable, trailing newline, non-ASCII, 64 chars, empty) must fail closed in bash
     before building any URL or conninfo."""
     repo = _make_tf_repo(tmp_path / "repo")
-    for bad in ("db?sslmode=disable", "db sslmode=disable", "1bad", "db;drop", "a" * 64, "db_é", ""):
+    for bad in ("db?sslmode=disable", "db sslmode=disable", "1bad", "db;drop", r"db\x", "a" * 64, "db_é", ""):
         env = dict(os.environ)
         env["TF_VAR_logical_database"] = bad
         r = subprocess.run(
