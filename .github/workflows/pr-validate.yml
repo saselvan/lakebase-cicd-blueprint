@@ -17,6 +17,10 @@ jobs:
       PROJECT: my-lakebase-project
     steps:
       - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.2"
+          terraform_wrapper: false
       - uses: liquibase/setup-liquibase@v1
         with: { version: "4.33.0", edition: "oss" }
       - name: Install Databricks CLI

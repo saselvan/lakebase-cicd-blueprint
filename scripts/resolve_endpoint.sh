@@ -116,7 +116,7 @@ lakebase_validate_database() {
 # terraform.tfvars -> terraform.tfvars.json -> *.auto.tfvars / *.auto.tfvars.json in lexical order).
 # If the terraform binary is unavailable, fails closed on any terraform.tfvars,
 # terraform.tfvars.json, or *.auto.tfvars(.json) file ("unsupported var file: <name>; set
-# TF_VAR_logical_database"), and otherwise uses ${TF_VAR_logical_database:-databricks_postgres}.
+# TF_VAR_logical_database"), and requires TF_VAR_logical_database to be set explicitly.
 # PGDATABASE never overrides Terraform's variable resolution. Validates the resolved name via
 # lakebase_validate_database before printing it.
 lakebase_resolve_database() {
@@ -186,7 +186,10 @@ if val is None:
             ):
                 sys.stderr.write(f"unsupported var file: {p.name}; set TF_VAR_logical_database\n")
                 sys.exit(1)
-    val = os.environ.get("TF_VAR_logical_database", "databricks_postgres")
+    if "TF_VAR_logical_database" not in os.environ:
+        sys.stderr.write("terraform binary not found; install terraform or set TF_VAR_logical_database\n")
+        sys.exit(1)
+    val = os.environ["TF_VAR_logical_database"]
 
 sys.stdout.write(val)
 PY

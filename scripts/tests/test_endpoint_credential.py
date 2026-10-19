@@ -416,7 +416,8 @@ def test_resolve_database_no_terraform_binary_and_failing_terraform_console(tmp_
         if real:
             (no_tf_bin / tool).symlink_to(real)
 
-    # 1) No terraform binary + no var files -> default 'databricks_postgres', or TF_VAR_logical_database
+    # 1) No terraform binary + no var files -> fails closed if TF_VAR_logical_database is unset,
+    #    succeeds with TF_VAR_logical_database when explicitly set.
     clean_root = tmp_path / "clean_root"
     clean_tf = clean_root / "terraform"
     clean_tf.mkdir(parents=True)
@@ -430,8 +431,8 @@ def test_resolve_database_no_terraform_binary_and_failing_terraform_console(tmp_
         capture_output=True,
         text=True,
     )
-    assert r_def.returncode == 0, r_def.stderr
-    assert r_def.stdout.strip() == "databricks_postgres"
+    assert r_def.returncode != 0
+    assert "terraform binary not found; install terraform or set TF_VAR_logical_database" in r_def.stderr
 
     env_with_var = dict(env_no_tf, TF_VAR_logical_database="env_db")
     r_env = subprocess.run(
