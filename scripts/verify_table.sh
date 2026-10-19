@@ -59,15 +59,12 @@ _expect_t() {
 # Asserts the post-conditions README/RUNBOOK step 4 promises, and RETURNS NON-ZERO if any fails:
 #   (c) the app role exists and the consumer view exists,
 #   (a) the app role can SELECT the consumer VIEW (the no-superuser read path),
-#   (d) the app role has USAGE on the schema, and a real read through the view succeeds, and
+#   (d) the app role has USAGE on the schema, and a real read through the view succeeds,
+#   (e) the app role is DENIED on the base synced table by every route (table, column, PUBLIC,
+#       inherited, and NOINHERIT role grants, for read and write privileges alike), and
 #   (b) every expected index idx_<pg_table>_<col> exists.
-# (d) closes a gap the catalog check (a) cannot see. Postgres checks the base table as the VIEW
-# OWNER, so if the owner loses SELECT on the synced table (live rotation spike, 2026-10-14, after
-# REASSIGN OWNED), (a) stays 't' while every app read fails with "permission denied for table".
-# The deploy identity usually cannot SET ROLE to an app role an admin created, so (d) reads as
-# itself: that still exercises the owner's base-table privilege, and (a) + USAGE cover the rest.
-# All checks run so the operator sees the full picture, then the function returns non-zero if any
-# failed (so deploy.sh's `set -e` aborts the pipeline on the first failing table).
+# Both DABs verify and this script share one check list from dabs/checks.py (--table-checks).
+# If the CLI fails or prints 0 checks, verify_table fails closed (returns 1).
 verify_table() {
   if [ "$#" -lt 4 ]; then
     echo "verify_table: usage: verify_table ROLE SCHEMA PG_TABLE VIEW [INDEX_COL ...]" >&2
@@ -75,30 +72,30 @@ verify_table() {
   fi
   local role="$1" schema="$2" pg_table="$3" view="$4"
   shift 4
-  local failures=0 col
+  local failures=0 count=0 root checks_out label sql
 
   echo "== 4. verify table '$pg_table' (role=$role, view=$schema.$view) =="
 
-  _expect_t "role $role exists" \
-    "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='$role')" || failures=$((failures + 1))
-  _expect_t "consumer view $schema.$view exists" \
-    "SELECT EXISTS(SELECT 1 FROM pg_views WHERE schemaname='$schema' AND viewname='$view')" \
-    || failures=$((failures + 1))
-  _expect_t "role $role can SELECT $schema.$view" \
-    "SELECT has_table_privilege('$role','$schema.$view','SELECT')" || failures=$((failures + 1))
-  _expect_t "role $role has USAGE on schema $schema" \
-    "SELECT has_schema_privilege('$role','$schema','USAGE')" || failures=$((failures + 1))
-  _expect_t "a real read through $schema.$view succeeds" \
-    "SELECT count(*) >= 0 FROM (SELECT 1 FROM $schema.$view LIMIT 1) AS read_check" \
-    || failures=$((failures + 1))
+  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if ! checks_out="$(python3 "$root/dabs/checks.py" --table-checks "$role" "$schema" "$pg_table" "$view" "$@")"; then
+    echo "  VERIFY FAILED for '$pg_table': dabs/checks.py --table-checks exited non-zero" >&2
+    return 1
+  fi
+  if [ -z "$checks_out" ]; then
+    echo "  VERIFY FAILED for '$pg_table': dabs/checks.py --table-checks emitted 0 checks" >&2
+    return 1
+  fi
 
-  # One assertion per expected index. Zero index columns => this loop is a no-op (still asserts
-  # role + view above), matching index_statements() which emits zero statements for zero columns.
-  for col in "$@"; do
-    _expect_t "index idx_${pg_table}_${col} exists" \
-      "SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname='$schema' AND indexname='idx_${pg_table}_${col}')" \
-      || failures=$((failures + 1))
-  done
+  while IFS=$'\t' read -r label sql <&3; do
+    [ -z "$label" ] && continue
+    count=$((count + 1))
+    _expect_t "$label" "$sql" || failures=$((failures + 1))
+  done 3<<< "$checks_out"
+
+  if [ "$count" -eq 0 ]; then
+    echo "  VERIFY FAILED for '$pg_table': dabs/checks.py --table-checks emitted 0 checks" >&2
+    return 1
+  fi
 
   if [ "$failures" -ne 0 ]; then
     echo "  VERIFY FAILED for '$pg_table': $failures post-condition(s) not met" >&2

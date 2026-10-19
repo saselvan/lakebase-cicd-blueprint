@@ -117,6 +117,13 @@ def hermetic_pg():
                  "postgres", "-tA"],
                 input=sql, capture_output=True, text=True,
             )
+        run.env = {
+            **os.environ,
+            "PGHOST": sock,
+            "PGUSER": "postgres",
+            "PGDATABASE": "postgres",
+            "PATH": f"{os.path.dirname(bins['psql'])}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
         yield run
     finally:
         subprocess.run(
@@ -358,6 +365,51 @@ def test_config_resolves_when_dunder_file_undefined(tmp_path):
     )
 
 
+def test_load_sibling_and_render_when_dunder_file_undefined(tmp_path):
+    """Attacker 4: in the serverless exec runtime (__file__ unbound and `dabs` NOT on sys.path under
+    `python3 -I`), `_load_sibling("checks")` and `render_migration_sql()` must fall back to loading
+    `checks.py` and `render_ddl.py` by path via `repo_root()`.
+
+    MUTATION GATE — remove the path-based fallback in `_load_sibling` and this test goes RED.
+    """
+    root = tmp_path / "files"
+    (root / "dabs").mkdir(parents=True)
+    (root / "config").mkdir(parents=True)
+    for mod in ("migration_job.py", "checks.py", "render_ddl.py"):
+        (root / "dabs" / mod).write_bytes((REPO_ROOT / "dabs" / mod).read_bytes())
+    (root / "config" / "tables.json").write_bytes((REPO_ROOT / "config" / "tables.json").read_bytes())
+
+    entry = root / "dabs" / "migration_job.py"
+    script = r"""
+import json, sys
+from pathlib import Path
+
+entry = sys.argv[1]
+src = Path(entry).read_text()
+g = {"__name__": "not_dunder_main"}
+assert "__file__" not in g
+sys.argv = [entry]
+exec(compile(src, entry, "exec"), g)
+
+p_checks = g["_load_sibling"]("checks").policy_checks("deploy_sp")
+sql = g["render_migration_sql"]()
+print(json.dumps({"policy_count": len(p_checks), "has_members_v": "members_v" in sql}))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(entry)],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        f"_load_sibling / render_migration_sql failed under python -I without __file__:\n"
+        f"STDOUT:{proc.stdout}\nSTDERR:{proc.stderr}"
+    )
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["policy_count"] == 6, out
+    assert out["has_members_v"] is True, out
+
+
 def test_bundle_task_passes_deployed_config_path():
     """The deploy passes the DEPLOYED config/ location to the task explicitly, via bundle
     interpolation — so the live task never depends on the __file__/argv fallback, and no literal
@@ -561,9 +613,10 @@ def test_main_no_instance_needed_proceeds_to_apply(monkeypatch, tmp_path):
 
     applied: dict[str, object] = {}
 
-    def fake_apply(sql, *, branch):
+    def fake_apply(sql, *, branch, database=None):
         applied["sql"] = sql
         applied["branch"] = branch
+        applied["database"] = database
 
     monkeypatch.setattr(mj, "apply_sql_to_lakebase", fake_apply)
 
@@ -673,6 +726,89 @@ def test_apply_threads_branch_into_conninfo(monkeypatch):
     assert captured["sql"] == "SELECT 1;"
 
 
+def test_apply_threads_database_into_conninfo(monkeypatch):
+    """apply_sql_to_lakebase threads an explicit database into _lakebase_conninfo."""
+    captured: dict[str, object] = {}
+
+    def fake_conninfo(*, branch, database=None):
+        captured["branch"] = branch
+        captured["database"] = database
+        return "host=x port=5432 dbname=custom_db user=u password=p sslmode=require"
+
+    monkeypatch.setattr(mj, "_lakebase_conninfo", fake_conninfo)
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql):
+            captured["sql"] = sql
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return _Cur()
+
+    fake_psycopg.connect = lambda conninfo, autocommit=False: _Conn()
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    mj.apply_sql_to_lakebase("SELECT 1;", branch="projects/p/branches/b", database="custom_db")
+
+    assert captured["branch"] == "projects/p/branches/b"
+    assert captured["database"] == "custom_db"
+    assert captured["sql"] == "SELECT 1;"
+
+
+def test_live_execute_threads_database_into_conninfo(monkeypatch):
+    """_live_execute threads an explicit database into _lakebase_conninfo and returns first column."""
+    captured: dict[str, object] = {}
+
+    def fake_conninfo(*, branch, database=None):
+        captured["branch"] = branch
+        captured["database"] = database
+        return "host=x port=5432 dbname=custom_db user=u password=p sslmode=require"
+
+    monkeypatch.setattr(mj, "_lakebase_conninfo", fake_conninfo)
+
+    fake_psycopg = types.ModuleType("psycopg")
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql):
+            captured["sql"] = sql
+
+        def fetchone(self):
+            return (True,)
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    fake_psycopg.connect = lambda conninfo, autocommit=False: _Conn()
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    execute = mj._live_execute("projects/p/branches/b", "custom_db")
+    assert execute("SELECT true;") is True
+    assert captured["branch"] == "projects/p/branches/b"
+    assert captured["database"] == "custom_db"
+    assert captured["sql"] == "SELECT true;"
+
+
 def test_bundle_task_passes_branch_variable():
     """The deploy passes the target branch to the task via ${var.lakebase_branch}, so the job
     migrates the TARGET branch endpoint, never the instance default."""
@@ -681,6 +817,168 @@ def test_bundle_task_passes_branch_variable():
     assert "--branch" in params, f"task parameters missing --branch: {params}"
     assert params[params.index("--branch") + 1] == "${var.lakebase_branch}", (
         f"--branch is not the interpolated lakebase_branch var: {params}"
+    )
+
+
+def test_conninfo_threads_database_parameter(monkeypatch):
+    """_lakebase_conninfo uses the explicit database parameter over PGDATABASE and defaults to
+    PGDATABASE / databricks_postgres when omitted."""
+    monkeypatch.setenv("PGDATABASE", "env_decoy_db")
+    conninfo = mj._lakebase_conninfo(
+        branch=_BRANCH,
+        database="custom_analytics_db",
+        resolve_endpoint=lambda b: _fake_endpoint(_ENDPOINT_NAME, _BRANCH_HOST),
+        credential_source=lambda e: ("svc@databricks.com", "tok-runtime-oauth"),
+    )
+    fields = dict(kv.split("=", 1) for kv in conninfo.split())
+    assert fields["dbname"] == "custom_analytics_db", fields
+
+
+@pytest.mark.parametrize("bad_db", [
+    "db?sslmode=disable",
+    "db sslmode=disable",
+    "db\nsslmode=disable",
+    "db_ok\n",
+    "db'sslmode=disable",
+    "",
+    "1leading_digit",
+    "a" * 64,
+    "db_é",
+])
+def test_conninfo_rejects_hostile_database_names(bad_db):
+    """Attacker 5 & 6 (conninfo guard): a database name with URL or conninfo characters, trailing
+    newline, non-ASCII, >63 chars, or empty must be rejected inside _lakebase_conninfo before
+    endpoint resolution or credential minting."""
+    called: list[str] = []
+    with pytest.raises(ValueError, match="database"):
+        mj._lakebase_conninfo(
+            branch=_BRANCH,
+            database=bad_db,
+            resolve_endpoint=lambda b: (called.append("ep"), _fake_endpoint(_ENDPOINT_NAME, _BRANCH_HOST))[1],
+            credential_source=lambda e: (called.append("cred"), ("u", "t"))[1],
+        )
+    assert called == [], f"invalid database name reached network/SDK seams: {called}"
+
+
+@pytest.mark.parametrize("step", ["migrate", "verify", "policy"])
+@pytest.mark.parametrize("via_env", [False, True])
+@pytest.mark.parametrize("bad_db", [
+    "db sslmode=disable",
+    "db?sslmode=disable",
+    "",
+    "a" * 64,
+    "db_ok\n",
+    "db_é",
+])
+def test_main_rejects_hostile_database_before_touching_seams(monkeypatch, tmp_path, step, via_env, bad_db):
+    """Attacker 5 & 6 (main entry-point guard): main() rejects a hostile --database or PGDATABASE
+    (with no flag) across migrate, verify, and policy BEFORE calling sdk_status_source,
+    apply_sql_to_lakebase, or _live_execute."""
+    cfg = tmp_path / "tables.json"
+    cfg.write_text('[{"synced_table_id": "cat.sch.tbl", "app_schema": "sch", "app_role": "r"}]')
+
+    rec_status: list[str] = []
+    rec_apply: list[tuple[str, str, str | None]] = []
+    rec_exec: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(mj, "sdk_status_source", lambda: (rec_status.append("init"), (lambda tid: "ONLINE"))[1])
+    monkeypatch.setattr(
+        mj,
+        "apply_sql_to_lakebase",
+        lambda sql, *, branch, database=None: rec_apply.append((sql, branch, database)),
+    )
+    monkeypatch.setattr(
+        mj,
+        "_live_execute",
+        lambda branch, database=None: (rec_exec.append((branch, database)), (lambda sql: True))[1],
+    )
+
+    argv = ["--step", step, "--config", str(cfg), "--branch", "projects/p/branches/b"]
+    if step == "policy":
+        argv += ["--expected-identity", "deploy_sp"]
+    if via_env:
+        monkeypatch.setenv("PGDATABASE", bad_db)
+    else:
+        monkeypatch.delenv("PGDATABASE", raising=False)
+        argv += ["--database", bad_db]
+
+    with pytest.raises(ValueError, match="database"):
+        mj.main(argv)
+
+    assert rec_status == [], f"sdk_status_source called on hostile DB {bad_db!r}: {rec_status}"
+    assert rec_apply == [], f"apply_sql_to_lakebase called on hostile DB {bad_db!r}: {rec_apply}"
+    assert rec_exec == [], f"_live_execute called on hostile DB {bad_db!r}: {rec_exec}"
+
+
+def test_main_threads_database_into_apply_and_checks(monkeypatch, tmp_path):
+    """main() threads --database into apply_sql_to_lakebase (migrate) and run_check_step (verify/policy)."""
+    cfg = tmp_path / "tables.json"
+    cfg.write_text('[{"synced_table_id": "cat.sch.tbl", "app_schema": "sch", "app_role": "r"}]')
+    monkeypatch.setattr(mj, "render_migration_sql", lambda **kw: "SELECT 1;")
+    monkeypatch.setattr(mj, "sdk_status_source", lambda: (lambda tid: "ONLINE"))
+
+    seen_apply: dict[str, object] = {}
+
+    def fake_apply(sql, *, branch, database="databricks_postgres"):
+        seen_apply["branch"] = branch
+        seen_apply["database"] = database
+
+    monkeypatch.setattr(mj, "apply_sql_to_lakebase", fake_apply)
+    rc = mj.main(["--config", str(cfg), "--branch", "projects/p/branches/b", "--database", "custom_db"])
+    assert rc == 0
+    assert seen_apply["database"] == "custom_db"
+
+    seen_exec: list[tuple[str, str | None]] = []
+
+    def fake_live_execute(branch: str, database: str | None = None):
+        seen_exec.append((branch, database))
+        return lambda sql: True
+
+    monkeypatch.setattr(mj, "_live_execute", fake_live_execute)
+    assert mj.main(["--step", "verify", "--config", str(cfg),
+                    "--branch", "projects/p/branches/b", "--database", "custom_db"]) == 0
+    assert mj.main(["--step", "policy", "--expected-identity", "deploy_sp",
+                    "--branch", "projects/p/branches/b", "--database", "custom_db"]) == 0
+    assert seen_exec == [
+        ("projects/p/branches/b", "custom_db"),
+        ("projects/p/branches/b", "custom_db"),
+    ]
+
+    # A TypeError raised inside _live_execute must propagate, never silently fall back without database.
+    calls_on_err: list[tuple[str, str | None]] = []
+
+    def raising_live_execute(branch: str, database: str | None = None):
+        calls_on_err.append((branch, database))
+        raise TypeError("driver boom")
+
+    monkeypatch.setattr(mj, "_live_execute", raising_live_execute)
+    with pytest.raises(TypeError, match="driver boom"):
+        mj.run_check_step("verify", branch="projects/p/branches/b", database="custom_db", config=str(cfg))
+    assert calls_on_err == [("projects/p/branches/b", "custom_db")]
+
+
+def test_bundle_tasks_pass_lakebase_database_variable():
+    """Every task in dabs/databricks.yml (migrate, verify, and prod verify_identity_policy) must
+    pass --database ${var.lakebase_database} so overriding var.lakebase_database reaches Postgres."""
+    bundle = yaml.safe_load((mj.repo_root() / "dabs" / "databricks.yml").read_text())
+    base_tasks = {
+        t["task_key"]: t["spark_python_task"]["parameters"]
+        for t in bundle["resources"]["jobs"]["lakebase_migration"]["tasks"]
+    }
+    for key in ("migrate", "verify"):
+        params = base_tasks[key]
+        assert "--database" in params, f"{key} task missing --database: {params}"
+        assert params[params.index("--database") + 1] == "${var.lakebase_database}", (
+            f"{key} --database is not ${{var.lakebase_database}}: {params}"
+        )
+    prod_tasks = {
+        t["task_key"]: t.get("spark_python_task", {}).get("parameters", [])
+        for t in bundle["targets"]["prod"]["resources"]["jobs"]["lakebase_migration"]["tasks"]
+    }
+    guard_params = prod_tasks["verify_identity_policy"]
+    assert "--database" in guard_params, f"verify_identity_policy missing --database: {guard_params}"
+    assert guard_params[guard_params.index("--database") + 1] == "${var.lakebase_database}", (
+        f"verify_identity_policy --database is not ${{var.lakebase_database}}: {guard_params}"
     )
 
 

@@ -43,6 +43,8 @@ pg_read_all_data / pg_write_all_data are real Postgres 14+ roles.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -134,14 +136,14 @@ def test_main_has_no_switch_that_skips_the_guard():
 
 def test_main_returns_nonzero_when_a_check_fails(monkeypatch):
     """A failed check makes the task fail: main() returns non-zero for verify and for policy."""
-    monkeypatch.setattr(mj, "_live_execute", lambda branch: (lambda sql: False))
+    monkeypatch.setattr(mj, "_live_execute", lambda branch, database=None: (lambda sql: False))
     assert mj.main(["--step", "verify", "--config", str(CONFIG), "--branch", "projects/p/branches/b"]) != 0
     assert mj.main(["--step", "policy", "--expected-identity", DEPLOY,
                     "--branch", "projects/p/branches/b"]) != 0
 
 
 def test_main_returns_zero_when_every_check_passes(monkeypatch):
-    monkeypatch.setattr(mj, "_live_execute", lambda branch: (lambda sql: True))
+    monkeypatch.setattr(mj, "_live_execute", lambda branch, database=None: (lambda sql: True))
     assert mj.main(["--step", "verify", "--config", str(CONFIG), "--branch", "projects/p/branches/b"]) == 0
     assert mj.main(["--step", "policy", "--expected-identity", DEPLOY,
                     "--branch", "projects/p/branches/b"]) == 0
@@ -224,6 +226,9 @@ def test_verify_passes_on_a_clean_deploy(deployed):
     "GRANT SELECT ON cicd_proj.members TO PUBLIC",                          # V-public
     "CREATE ROLE helper NOLOGIN; GRANT SELECT ON cicd_proj.members TO helper; "
     "GRANT helper TO members_app_ro",                                       # V-inherit
+    "ALTER ROLE members_app_ro NOINHERIT; CREATE ROLE helper_noinh NOLOGIN; "
+    "GRANT SELECT ON cicd_proj.members TO helper_noinh; "
+    "GRANT helper_noinh TO members_app_ro",                                 # V-noinh (SET ROLE)
     "GRANT UPDATE ON cicd_proj.members TO members_app_ro",                  # V-write
     "GRANT DELETE ON cicd_proj.members TO members_app_ro",                  # V-write
 ])
@@ -235,6 +240,39 @@ def test_verify_fails_when_the_app_role_can_reach_the_synced_table(deployed, fau
     fails = _verify_failures(deployed)
     assert len(fails) == 1, fails
     assert "members_app_ro" in fails[0] and "denied" in fails[0] and "members" in fails[0], fails
+
+
+@_needs_pg
+@pytest.mark.parametrize("fault", [
+    "GRANT SELECT ON cicd_proj.members TO members_app_ro",                  # V-table
+    "GRANT SELECT (member_id) ON cicd_proj.members TO members_app_ro",       # V-column
+    "GRANT SELECT ON cicd_proj.members TO PUBLIC",                          # V-public
+    "CREATE ROLE helper NOLOGIN; GRANT SELECT ON cicd_proj.members TO helper; "
+    "GRANT helper TO members_app_ro",                                       # V-inherit
+    "ALTER ROLE members_app_ro NOINHERIT; CREATE ROLE helper_noinh NOLOGIN; "
+    "GRANT SELECT ON cicd_proj.members TO helper_noinh; "
+    "GRANT helper_noinh TO members_app_ro",                                 # V-noinh (SET ROLE)
+    "GRANT UPDATE ON cicd_proj.members TO members_app_ro",                  # V-write
+    "GRANT DELETE ON cicd_proj.members TO members_app_ro",                  # V-write
+])
+def test_terraform_verify_table_fails_when_app_role_can_reach_synced_table(deployed, fault):
+    """The Terraform-path verify (scripts/verify_table.sh) shares the same check list as DABs verify
+    and fails on every route that gives the app role access to the base synced table."""
+    import subprocess
+    res = deployed(f"{fault};")
+    assert res.returncode == 0, res.stderr
+    verify_sh = REPO_ROOT / "scripts" / "verify_table.sh"
+    r = subprocess.run(
+        ["bash", str(verify_sh), "members_app_ro", "cicd_proj", "members", "members_v",
+         "member_id", "plan_code"],
+        env=deployed.env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "FAIL role members_app_ro is denied on synced table cicd_proj.members" in r.stdout, (
+        r.stdout + r.stderr
+    )
 
 
 @_needs_pg
@@ -288,3 +326,48 @@ def test_policy_does_not_error_where_a_named_role_is_absent(hermetic_pg):  # noq
     run = hermetic_pg
     assert run(f"CREATE ROLE {DEPLOY} LOGIN;").returncode == 0
     assert _policy_failures(run) == []
+
+
+def test_checks_loads_render_ddl_by_path_without_package(tmp_path):
+    """Attacker 5: when `dabs/checks.py` is loaded by path in an isolated interpreter (`python3 -I`)
+    where `dabs` is not on `sys.path`, its fallback `spec_from_file_location` block must load
+    sibling `render_ddl.py` and build `verify_checks(TABLES)`.
+
+    MUTATION GATE — break the `except Exception:` fallback in `dabs/checks.py` and this goes RED.
+    """
+    isolated = tmp_path / "isolated_dabs"
+    isolated.mkdir(parents=True)
+    for mod in ("checks.py", "render_ddl.py"):
+        (isolated / mod).write_bytes((REPO_ROOT / "dabs" / mod).read_bytes())
+    cfg = tmp_path / "tables.json"
+    cfg.write_bytes((REPO_ROOT / "config" / "tables.json").read_bytes())
+
+    script = r"""
+import importlib.util, json, sys
+from pathlib import Path
+
+checks_path = Path(sys.argv[1])
+cfg_path = Path(sys.argv[2])
+
+spec = importlib.util.spec_from_file_location("isolated_checks", checks_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+tables = json.loads(cfg_path.read_text())
+v_checks = mod.verify_checks(tables)
+print(json.dumps({"count": len(v_checks), "labels": [c[0] for c in v_checks]}))
+"""
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(isolated / "checks.py"), str(cfg)],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, (
+        f"checks.py failed to load render_ddl by path under python -I:\n"
+        f"STDOUT:{proc.stdout}\nSTDERR:{proc.stderr}"
+    )
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["count"] == 16, out
+    assert any("is denied on synced table" in lbl for lbl in out["labels"]), out
+

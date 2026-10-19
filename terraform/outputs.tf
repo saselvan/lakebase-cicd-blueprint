@@ -9,3 +9,9 @@ output "synced_tables" {
     }
   }
 }
+
+output "logical_database" {
+  description = "Postgres database name inside the branch (from var.logical_database)."
+  value       = var.logical_database
+}
+

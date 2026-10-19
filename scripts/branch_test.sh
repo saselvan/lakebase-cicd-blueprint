@@ -20,6 +20,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SCRIPT_DIR/resolve_endpoint.sh"
 
 echo "== create ephemeral branch (2h TTL, auto-cleanup) =="
+DB="$(lakebase_resolve_database "$SCRIPT_DIR/..")"
+lakebase_validate_database "$DB"
 databricks postgres create-branch "projects/$PROJECT" "$BRANCH" \
   --json '{"spec":{"ttl":"7200s"}}' -p "$PROFILE" >/dev/null
 
@@ -27,9 +29,11 @@ echo "== resolve the branch READ_WRITE endpoint + mint a credential from it =="
 lakebase_resolve_and_mint "projects/$PROJECT/branches/$BRANCH" "$PROFILE"
 echo "  host=$LB_HOST"
 echo "  endpoint=$LB_ENDPOINT"
+echo "  database=$DB"
 
-export PGHOST="$LB_HOST" PGPORT=5432 PGDATABASE=databricks_postgres PGSSLMODE=require
-export PGUSER="$(databricks auth describe -p "$PROFILE" -o json | python3 -c "import sys,json;print(json.load(sys.stdin)['username'])")"
+export PGHOST="$LB_HOST" PGPORT=5432 PGDATABASE="$DB" PGSSLMODE=require
+PGUSER="$(databricks auth describe -p "$PROFILE" -o json | python3 -c "import sys,json;print(json.load(sys.stdin)['username'])")"
+export PGUSER
 export PGPASSWORD="$LB_TOKEN"
 
 echo "== run your migration here against the BRANCH, then validate =="

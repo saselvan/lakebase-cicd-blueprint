@@ -50,7 +50,8 @@ The migration job takes no database-instance name. It stays on the projects (Aut
 resolves the target branch's READ_WRITE compute endpoint and mints a runtime OAuth credential from
 that endpoint (a workspace-scoped token, no stored secret). The branch alone — not an instance
 name — selects where the migration lands, so there is nothing to point at the production branch by
-mistake.
+mistake. `var.lakebase_database` (default `databricks_postgres`) is threaded into the generated
+synced-table resources and into every job task (`verify_identity_policy`, `migrate`, and `verify`).
 
 `config/tables.json` is the single source of truth. DABs YAML cannot loop a list into many
 resources, so `python -m dabs.generate_resources` reads that file and writes one synced table per
@@ -79,7 +80,7 @@ After migrate, a `verify` task checks the result and fails the run, so `bundle r
 when any check fails. Per table it checks that the app role exists and can read its consumer view,
 that a real read through the view works, that each index exists, and that the app role is denied on
 the base synced table by every route: a table grant, a column grant, a grant to `PUBLIC`, or a grant
-it inherits from another role. Migrate never revokes anything, so a direct grant an admin added
+on a role it is a member of (including `NOINHERIT` memberships it could `SET ROLE` into). Migrate never revokes anything, so a direct grant an admin added
 stays until someone removes it, and verify fails until then. On serverless, a failed task can run a
 second time before the run fails, because serverless auto-optimization retries failed tasks by
 default ([docs](https://docs.databricks.com/aws/en/jobs/run-serverless-jobs)). The checks only read,
@@ -371,9 +372,10 @@ The pipeline is four ordered steps, run the same way by hand (`scripts/deploy.sh
 
    A distinct changelog file per table gives each changeset a distinct identity, so two tables that
    share one `app_schema` never collide in a shared `DATABASECHANGELOG`.
-4. Verify. Asserts the app role can `SELECT` the consumer view and every expected index exists, and
-   **fails the pipeline** (non-zero exit) if any post-condition is missing. Factored into
-   `scripts/verify_table.sh` so it is independently testable (see `scripts/tests/`).
+4. Verify. Asserts the app role can `SELECT` the consumer view, is denied on the base synced table
+   by every route, and every expected index exists, and **fails the pipeline** (non-zero exit) if
+   any post-condition is missing. Factored into `scripts/verify_table.sh` (which shares the check
+   list in `dabs/checks.py`) so it is independently testable (see `scripts/tests/`).
 
 The grant, index, and view changesets are `runAlways:true`, so they reapply on every deploy. See
 the self-healing caveat above for the one case where a plain redeploy does not restore access.
