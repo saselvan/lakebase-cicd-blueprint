@@ -12,8 +12,10 @@ Run the full local gate (no cloud needed) — this is what CI enforces:
 make validate                                   # terraform validate + fmt, bash syntax, tables.json JSON
 shellcheck --severity=error scripts/*.sh        # shell lint (errors only)
 
-# 2. The offline test suite (155+ tests, no database)
-.venv-dev/bin/python -m pytest dabs/tests liquibase/tests scripts/tests -q
+# 2. The offline test suite (no database), run the way CI runs it: plain `pytest`, not
+#    `python -m pytest`, which adds the repo root to sys.path and hides bad imports
+.venv-dev/bin/pytest dabs/tests -q
+.venv-dev/bin/pytest scripts/tests liquibase/tests -q
 
 # 3. Both single-source-of-truth drift checks (committed artifacts == fresh generation)
 python3 -m dabs.generate_resources --check      # dabs/resources vs config/tables.json

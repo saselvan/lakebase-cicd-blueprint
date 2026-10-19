@@ -24,8 +24,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from scripts.tests.test_endpoint_credential import ENDPOINTS_JSON, RW_HOST, STUB_DATABRICKS
-from scripts.tests.test_verify_step import _STUB_PSQL
+from test_endpoint_credential import ENDPOINTS_JSON, RW_HOST, STUB_DATABRICKS
+from test_verify_step import _STUB_PSQL
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PR_VALIDATE_YML = REPO_ROOT / ".github" / "workflows" / "pr-validate.yml"
