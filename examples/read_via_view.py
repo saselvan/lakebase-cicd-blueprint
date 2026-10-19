@@ -32,7 +32,7 @@ _DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_$-]{0,62}$")
 
 def validate_database_name(database: str) -> str:
     """Validate a Postgres database name before passing it to psycopg.connect."""
-    if not isinstance(database, str) or not _DB_NAME.match(database):
+    if not isinstance(database, str) or not _DB_NAME.fullmatch(database):
         raise ValueError(
             f"invalid database name {database!r}: must match {_DB_NAME.pattern}"
         )

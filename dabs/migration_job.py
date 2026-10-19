@@ -46,7 +46,7 @@ _DB_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_$-]{0,62}$")
 
 def validate_database_name(database: str) -> str:
     """Validate a Postgres database name before embedding it in a conninfo or URL."""
-    if not isinstance(database, str) or not _DB_NAME.match(database):
+    if not isinstance(database, str) or not _DB_NAME.fullmatch(database):
         raise ValueError(
             f"invalid database name {database!r}: must match {_DB_NAME.pattern}"
         )
@@ -478,9 +478,6 @@ def run_check_step(
     The policy step builds its checks BEFORE connecting, so an unusable expected identity fails
     the task without touching Postgres.
     """
-    validate_database_name(
-        database if database is not None else os.environ.get("PGDATABASE", "databricks_postgres")
-    )
     checks = _load_sibling("checks")
     if step == "policy":
         to_run = checks.policy_checks(expected_identity or "")

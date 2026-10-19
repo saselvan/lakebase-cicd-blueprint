@@ -838,14 +838,17 @@ def test_conninfo_threads_database_parameter(monkeypatch):
     "db?sslmode=disable",
     "db sslmode=disable",
     "db\nsslmode=disable",
+    "db_ok\n",
     "db'sslmode=disable",
     "",
     "1leading_digit",
     "a" * 64,
+    "db_é",
 ])
 def test_conninfo_rejects_hostile_database_names(bad_db):
-    """A database name with URL or conninfo characters (e.g. db?sslmode=disable or
-    db sslmode=disable) must be rejected before endpoint resolution or credential minting."""
+    """Attacker 5 & 6 (conninfo guard): a database name with URL or conninfo characters, trailing
+    newline, non-ASCII, >63 chars, or empty must be rejected inside _lakebase_conninfo before
+    endpoint resolution or credential minting."""
     called: list[str] = []
     with pytest.raises(ValueError, match="database"):
         mj._lakebase_conninfo(
@@ -855,6 +858,56 @@ def test_conninfo_rejects_hostile_database_names(bad_db):
             credential_source=lambda e: (called.append("cred"), ("u", "t"))[1],
         )
     assert called == [], f"invalid database name reached network/SDK seams: {called}"
+
+
+@pytest.mark.parametrize("step", ["migrate", "verify", "policy"])
+@pytest.mark.parametrize("via_env", [False, True])
+@pytest.mark.parametrize("bad_db", [
+    "db sslmode=disable",
+    "db?sslmode=disable",
+    "",
+    "a" * 64,
+    "db_ok\n",
+    "db_é",
+])
+def test_main_rejects_hostile_database_before_touching_seams(monkeypatch, tmp_path, step, via_env, bad_db):
+    """Attacker 5 & 6 (main entry-point guard): main() rejects a hostile --database or PGDATABASE
+    (with no flag) across migrate, verify, and policy BEFORE calling sdk_status_source,
+    apply_sql_to_lakebase, or _live_execute."""
+    cfg = tmp_path / "tables.json"
+    cfg.write_text('[{"synced_table_id": "cat.sch.tbl", "app_schema": "sch", "app_role": "r"}]')
+
+    rec_status: list[str] = []
+    rec_apply: list[tuple[str, str, str | None]] = []
+    rec_exec: list[tuple[str, str | None]] = []
+
+    monkeypatch.setattr(mj, "sdk_status_source", lambda: (rec_status.append("init"), (lambda tid: "ONLINE"))[1])
+    monkeypatch.setattr(
+        mj,
+        "apply_sql_to_lakebase",
+        lambda sql, *, branch, database=None: rec_apply.append((sql, branch, database)),
+    )
+    monkeypatch.setattr(
+        mj,
+        "_live_execute",
+        lambda branch, database=None: (rec_exec.append((branch, database)), (lambda sql: True))[1],
+    )
+
+    argv = ["--step", step, "--config", str(cfg), "--branch", "projects/p/branches/b"]
+    if step == "policy":
+        argv += ["--expected-identity", "deploy_sp"]
+    if via_env:
+        monkeypatch.setenv("PGDATABASE", bad_db)
+    else:
+        monkeypatch.delenv("PGDATABASE", raising=False)
+        argv += ["--database", bad_db]
+
+    with pytest.raises(ValueError, match="database"):
+        mj.main(argv)
+
+    assert rec_status == [], f"sdk_status_source called on hostile DB {bad_db!r}: {rec_status}"
+    assert rec_apply == [], f"apply_sql_to_lakebase called on hostile DB {bad_db!r}: {rec_apply}"
+    assert rec_exec == [], f"_live_execute called on hostile DB {bad_db!r}: {rec_exec}"
 
 
 def test_main_threads_database_into_apply_and_checks(monkeypatch, tmp_path):
