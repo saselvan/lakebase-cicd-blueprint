@@ -101,102 +101,91 @@ lakebase_resolve_and_mint() {
 # db?sslmode=disable or "db sslmode=disable").
 lakebase_validate_database() {
   local db="${1-}"
-  if [[ ! "$db" =~ ^[A-Za-z_][A-Za-z0-9_\$-]{0,62}$ ]]; then
+  if [[ "$db" == *$'\n'* ]] || [[ ! "$db" =~ ^[A-Za-z_][A-Za-z0-9_\$-]{0,62}$ ]]; then
     printf 'invalid database name %q: must match ^[A-Za-z_][A-Za-z0-9_$-]{0,62}$\n' "$db" >&2
     return 1
   fi
 }
 
 # lakebase_resolve_database [repo_root]
-# Resolve the target Postgres logical database name in this exact order only:
-#   1. TF_VAR_logical_database environment variable
-#   2. terraform/terraform.tfvars
-#   3. terraform/variables.tf default (databricks_postgres)
-# PGDATABASE does NOT override terraform.tfvars or variables.tf. Validates the resolved name via
+# Resolve the target Postgres logical database name on no-apply paths (branch_test.sh,
+# pr-validate.yml) by asking Terraform (`echo var.logical_database | terraform console`) in a
+# provider-free scratch copy of terraform/variables.tf + terraform/terraform.tfvars(.json) +
+# terraform/*.auto.tfvars(.json). Terraform itself is the single source of truth for its variable
+# precedence (from lowest to highest: variables.tf default -> TF_VAR_logical_database ->
+# terraform.tfvars -> terraform.tfvars.json -> *.auto.tfvars / *.auto.tfvars.json in lexical order).
+# If the terraform binary is unavailable, fails closed on any terraform.tfvars,
+# terraform.tfvars.json, or *.auto.tfvars(.json) file ("unsupported var file: <name>; set
+# TF_VAR_logical_database"), and otherwise uses ${TF_VAR_logical_database:-databricks_postgres}.
+# PGDATABASE never overrides Terraform's variable resolution. Validates the resolved name via
 # lakebase_validate_database before printing it.
 lakebase_resolve_database() {
   local root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   local tf_dir="$root/terraform"
   local db=""
 
-  if [ -n "${TF_VAR_logical_database+x}" ]; then
-    db="$TF_VAR_logical_database"
-  else
-    db="$(python3 - "$tf_dir" <<'PY'
+  if ! db="$(python3 - "$tf_dir" <<'PY'
 from __future__ import annotations
 
+import json
+import os
 import pathlib
-import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 tf_dir = pathlib.Path(sys.argv[1])
-tfvars = tf_dir / "terraform.tfvars"
 vars_tf = tf_dir / "variables.tf"
 
 
-def strip_hcl_comments(src: str) -> str:
-    """Strip HCL #, //, and /* ... */ comments while preserving double-quoted string literals."""
-    out: list[str] = []
-    i = 0
-    n = len(src)
-    in_str = False
-    while i < n:
-        ch = src[i]
-        if in_str:
-            out.append(ch)
-            if ch == "\\" and i + 1 < n:
-                out.append(src[i + 1])
-                i += 2
+def ask_terraform_console() -> str | None:
+    if shutil.which("terraform") is None or not vars_tf.is_file():
+        return None
+    with tempfile.TemporaryDirectory(prefix="lb-tfvars-") as tmp:
+        scratch = pathlib.Path(tmp)
+        shutil.copy(vars_tf, scratch / "variables.tf")
+        for p in sorted(tf_dir.iterdir()):
+            if not p.is_file():
                 continue
-            if ch == '"':
-                in_str = False
-            i += 1
-        else:
-            if ch == '"':
-                in_str = True
-                out.append(ch)
-                i += 1
-            elif ch == "#" or src[i : i + 2] == "//":
-                while i < n and src[i] != "\n":
-                    i += 1
-            elif src[i : i + 2] == "/*":
-                end = src.find("*/", i + 2)
-                i = n if end == -1 else end + 2
-            else:
-                out.append(ch)
-                i += 1
-    return "".join(out)
+            if p.name in ("terraform.tfvars", "terraform.tfvars.json") or p.name.endswith(
+                (".auto.tfvars", ".auto.tfvars.json")
+            ):
+                shutil.copy(p, scratch / p.name)
+        res = subprocess.run(
+            ["terraform", f"-chdir={scratch}", "console"],
+            input="var.logical_database\n",
+            capture_output=True,
+            text=True,
+        )
+        if res.returncode != 0:
+            return None
+        lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
+        if not lines:
+            return None
+        try:
+            val = json.loads(lines[-1])
+            return val if isinstance(val, str) else None
+        except Exception:
+            return None
 
 
-def read_tfvars_key(path: pathlib.Path, target: str) -> str | None:
-    if not path.is_file():
-        return None
-    cleaned = strip_hcl_comments(path.read_text())
-    m = re.search(rf"(?m)^\s*{re.escape(target)}\s*=\s*\"([^\"]*)\"", cleaned)
-    return m.group(1) if m else None
-
-
-def read_variables_tf_default(path: pathlib.Path, target: str) -> str | None:
-    if not path.is_file():
-        return None
-    cleaned = strip_hcl_comments(path.read_text())
-    block_m = re.search(
-        rf"variable\s+\"{re.escape(target)}\"\s*\{{(?P<body>[^}}]*)\}}",
-        cleaned,
-        re.S,
-    )
-    if not block_m:
-        return None
-    def_m = re.search(r"(?m)^\s*default\s*=\s*\"([^\"]*)\"", block_m.group("body"))
-    return def_m.group(1) if def_m else None
-
-
-val = read_tfvars_key(tfvars, "logical_database")
+val = ask_terraform_console()
 if val is None:
-    val = read_variables_tf_default(vars_tf, "logical_database") or "databricks_postgres"
+    if tf_dir.is_dir():
+        for p in sorted(tf_dir.iterdir()):
+            if p.is_file() and (
+                p.name in ("terraform.tfvars", "terraform.tfvars.json")
+                or p.name.endswith((".auto.tfvars", ".auto.tfvars.json"))
+            ):
+                sys.stderr.write(f"unsupported var file: {p.name}; set TF_VAR_logical_database\n")
+                sys.exit(1)
+    val = os.environ.get("TF_VAR_logical_database", "databricks_postgres")
+
 sys.stdout.write(val)
 PY
-)"
+)"; then
+    return 1
   fi
 
   lakebase_validate_database "$db" || return 1

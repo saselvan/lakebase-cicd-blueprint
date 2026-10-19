@@ -174,73 +174,138 @@ def _make_tf_repo(tmp_path: Path, tfvars_content: str | None = None) -> Path:
     return tmp_path
 
 
-def test_resolve_database_precedence_and_pgdatabase_does_not_override_tfvars(tmp_path):
-    """Resolution order is strictly:
-      1. TF_VAR_logical_database
-      2. terraform/terraform.tfvars
-      3. terraform/variables.tf default (databricks_postgres)
-    PGDATABASE and LOGICAL_DATABASE must NEVER override terraform.tfvars or variables.tf."""
-    # Case 3: default from variables.tf when neither TF_VAR_logical_database nor tfvars is set.
-    repo_default = _make_tf_repo(tmp_path / "c_default")
-    env = dict(os.environ)
-    env.pop("TF_VAR_logical_database", None)
-    env["PGDATABASE"] = "pgdatabase_must_not_win"
-    env["LOGICAL_DATABASE"] = "invented_var_must_not_win"
-    r_def = subprocess.run(
-        ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_resolve_database "{repo_default}"'],
-        env=env, capture_output=True, text=True,
-    )
-    assert r_def.returncode == 0, r_def.stderr
-    assert r_def.stdout.strip() == "databricks_postgres"
+def _terraform_console_logical_db(tf_dir: Path, env: dict[str, str]) -> str:
+    """Ask the real terraform binary in an isolated scratch dir (variables.tf + all *.tfvars*) for
+    var.logical_database."""
+    import shutil
+    import tempfile
 
-    # Case 3b: custom default in variables.tf (with commented-out decoy) proves variables.tf is parsed.
-    repo_custom_vars = _make_tf_repo(tmp_path / "c_vars_custom")
-    (repo_custom_vars / "terraform" / "variables.tf").write_text(
-        'variable "logical_database" {\n'
-        '  // default = "decoy_comment_db"\n'
-        '  # default = "hash_decoy_db"\n'
-        '  default = "vars_default_db"\n'
-        '}\n'
-    )
-    r_vars = subprocess.run(
-        ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_resolve_database "{repo_custom_vars}"'],
-        env=env, capture_output=True, text=True,
-    )
-    assert r_vars.returncode == 0, r_vars.stderr
-    assert r_vars.stdout.strip() == "vars_default_db"
+    with tempfile.TemporaryDirectory(prefix="tf-oracle-") as scratch_str:
+        scratch = Path(scratch_str)
+        shutil.copy(tf_dir / "variables.tf", scratch / "variables.tf")
+        for f in tf_dir.iterdir():
+            if f.name in ("terraform.tfvars", "terraform.tfvars.json") or f.name.endswith(
+                (".auto.tfvars", ".auto.tfvars.json")
+            ):
+                shutil.copy(f, scratch / f.name)
+        res = subprocess.run(
+            ["terraform", f"-chdir={scratch}", "console"],
+            input="var.logical_database\n",
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return json.loads(res.stdout.strip().splitlines()[-1])
 
-    # Case 2: terraform.tfvars overrides variables.tf default, and PGDATABASE does NOT override tfvars.
-    # Include HCL #, // (with apostrophe), and /* ... */ comments to prove they are ignored.
-    repo_tfvars = _make_tf_repo(
-        tmp_path / "c_tfvars",
-        '# comment with logical_database = "ignored"\n'
-        '// don\'t use logical_database = "slash_comment_ignored"\n'
-        '/* logical_database = "block_comment_ignored" */\n'
-        'logical_database = "tfvars_custom_db"\n',
-    )
-    r_tfv = subprocess.run(
-        ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_resolve_database "{repo_tfvars}"'],
-        env=env, capture_output=True, text=True,
-    )
-    assert r_tfv.returncode == 0, r_tfv.stderr
-    assert r_tfv.stdout.strip() == "tfvars_custom_db"
 
-    # Case 1: TF_VAR_logical_database overrides terraform.tfvars.
-    env_tfvar = dict(env)
-    env_tfvar["TF_VAR_logical_database"] = "env_tfvar_db"
-    r_env = subprocess.run(
-        ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_resolve_database "{repo_tfvars}"'],
-        env=env_tfvar, capture_output=True, text=True,
-    )
-    assert r_env.returncode == 0, r_env.stderr
-    assert r_env.stdout.strip() == "env_tfvar_db"
+def test_resolve_database_matches_real_terraform_oracle(tmp_path):
+    """Differential test (Attackers 1, 2, 4): lakebase_resolve_database must match the real
+    `terraform console` evaluation across:
+      - variables.tf default (and custom default with HCL comments)
+      - Attacker 1: prod.auto.tfvars, terraform.tfvars.json, x.auto.tfvars.json
+      - Attacker 2: two *.auto.tfvars files that disagree (lexical order decides in Terraform)
+      - Attacker 4: TF_VAR_logical_database AND a tfvars value (tfvars wins in Terraform)
+      - PGDATABASE and LOGICAL_DATABASE never override Terraform's resolution."""
+    import shutil
+    import pytest
+
+    if shutil.which("terraform") is None:
+        pytest.skip("no terraform binary on PATH; cannot run real-Terraform differential test")
+
+    base_env = dict(os.environ)
+    base_env.pop("TF_VAR_logical_database", None)
+    base_env["PGDATABASE"] = "pgdatabase_must_not_win"
+    base_env["LOGICAL_DATABASE"] = "invented_var_must_not_win"
+
+    cases = [
+        # (name, files_dict, tf_var_env, expected)
+        ("default", {}, None, "databricks_postgres"),
+        (
+            "custom_variables_tf_with_comments",
+            {
+                "variables.tf": (
+                    'variable "logical_database" {\n'
+                    '  // default = "decoy_comment_db"\n'
+                    '  # default = "hash_decoy_db"\n'
+                    '  /* default = "block_decoy_db" */\n'
+                    '  type    = string\n'
+                    '  default = "vars_default_db"\n'
+                    '}\n'
+                )
+            },
+            None,
+            "vars_default_db",
+        ),
+        ("tf_var_only", {}, "env_only_db", "env_only_db"),
+        # Attacker 1a: prod.auto.tfvars
+        ("prod_auto_tfvars", {"prod.auto.tfvars": 'logical_database = "prod_auto_db"\n'}, None, "prod_auto_db"),
+        # Attacker 1b: terraform.tfvars.json
+        (
+            "terraform_tfvars_json",
+            {"terraform.tfvars.json": '{"logical_database": "tfvars_json_db"}\n'},
+            None,
+            "tfvars_json_db",
+        ),
+        # Attacker 1c: x.auto.tfvars.json overrides terraform.tfvars
+        (
+            "x_auto_tfvars_json",
+            {
+                "terraform.tfvars": 'logical_database = "base_tfvars_db"\n',
+                "x.auto.tfvars.json": '{"logical_database": "x_auto_json_db"}\n',
+            },
+            None,
+            "x_auto_json_db",
+        ),
+        # Attacker 2: two auto.tfvars files that disagree (lexical order: b_second wins over a_first)
+        (
+            "two_disagreeing_auto_tfvars",
+            {
+                "a_first.auto.tfvars": 'logical_database = "first_auto_db"\n',
+                "b_second.auto.tfvars": 'logical_database = "second_auto_db"\n',
+            },
+            None,
+            "second_auto_db",
+        ),
+        # Attacker 4: TF_VAR_logical_database set AND a tfvars value (tfvars wins in Terraform!)
+        (
+            "tf_var_and_tfvars_disagree",
+            {"terraform.tfvars": 'logical_database = "tfvars_wins_over_env_db"\n'},
+            "env_loses_to_tfvars_db",
+            "tfvars_wins_over_env_db",
+        ),
+    ]
+
+    for name, files, tf_var, expected in cases:
+        repo = _make_tf_repo(tmp_path / name)
+        for fname, content in files.items():
+            (repo / "terraform" / fname).write_text(content)
+        env = dict(base_env)
+        if tf_var is not None:
+            env["TF_VAR_logical_database"] = tf_var
+
+        oracle = _terraform_console_logical_db(repo / "terraform", env)
+        assert oracle == expected, f"case {name}: terraform oracle returned {oracle!r}, expected {expected!r}"
+
+        r = subprocess.run(
+            ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_resolve_database "{repo}"'],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert r.returncode == 0, f"case {name}: resolver failed:\n{r.stderr}"
+        resolved = r.stdout.strip()
+        assert resolved == oracle, (
+            f"case {name}: lakebase_resolve_database returned {resolved!r} != terraform oracle {oracle!r}"
+        )
 
 
 def test_resolve_database_rejects_hostile_database_names_in_bash(tmp_path):
-    """Hostile database names with URL or conninfo injection characters (e.g. db?sslmode=disable
-    or db sslmode=disable) must fail closed in bash before building any URL or conninfo."""
+    """Hostile database names with URL or conninfo injection characters (e.g. db?sslmode=disable,
+    db sslmode=disable, trailing newline, non-ASCII, 64 chars, empty) must fail closed in bash
+    before building any URL or conninfo."""
     repo = _make_tf_repo(tmp_path / "repo")
-    for bad in ("db?sslmode=disable", "db sslmode=disable", "1bad", "db;drop"):
+    for bad in ("db?sslmode=disable", "db sslmode=disable", "1bad", "db;drop", "a" * 64, "db_é", ""):
         env = dict(os.environ)
         env["TF_VAR_logical_database"] = bad
         r = subprocess.run(
@@ -251,6 +316,13 @@ def test_resolve_database_rejects_hostile_database_names_in_bash(tmp_path):
             f"accepted hostile database name {bad!r}: {r.stdout}"
         )
         assert "invalid database name" in r.stderr.lower(), r.stderr
+
+    # Direct validator check for trailing newline ("db_ok\n") which bash command substitution strips
+    r_nl = subprocess.run(
+        ["bash", "-c", f'. "{RESOLVE_HELPER}" && lakebase_validate_database $\'db_ok\\n\''],
+        capture_output=True, text=True,
+    )
+    assert r_nl.returncode != 0, "lakebase_validate_database accepted trailing newline"
 
 
 def test_branch_test_fails_when_auth_describe_fails(tmp_path):
@@ -322,8 +394,43 @@ def test_read_via_view_uses_pgdatabase_and_rejects_hostile_database_name(monkeyp
     mod.main()
     assert connected and connected[-1]["dbname"] == "custom_view_db"
 
-    for bad in ("db?sslmode=disable", "db sslmode=disable"):
+    for bad in ("db?sslmode=disable", "db sslmode=disable", "db_ok\n", "db_é"):
         monkeypatch.setenv("PGDATABASE", bad)
         with pytest.raises(ValueError):
             mod.main()
+
+
+def test_resolve_database_fails_closed_on_var_files_when_terraform_unavailable(tmp_path):
+    """When terraform is unavailable or fails, lakebase_resolve_database fails closed if any
+    terraform.tfvars, terraform.tfvars.json, or *.auto.tfvars(.json) file exists in terraform/."""
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    # Stub terraform that fails (simulating no working terraform binary)
+    tf_stub = fake_bin / "terraform"
+    tf_stub.write_text("#!/usr/bin/env bash\nexit 127\n")
+    tf_stub.chmod(0o755)
+
+    for var_file, content in [
+        ("prod.auto.tfvars", 'logical_database = "prod_db"\n'),
+        ("terraform.tfvars.json", '{"logical_database": "json_db"}\n'),
+        ("x.auto.tfvars.json", '{"logical_database": "x_db"}\n'),
+        ("terraform.tfvars", 'logical_database = "tf_db"\n'),
+    ]:
+        root = tmp_path / f"case_{var_file}"
+        tf_dir = root / "terraform"
+        tf_dir.mkdir(parents=True)
+        (tf_dir / "variables.tf").write_text((REPO_ROOT / "terraform" / "variables.tf").read_text())
+        (tf_dir / var_file).write_text(content)
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+        env.pop("TF_VAR_logical_database", None)
+        res = subprocess.run(
+            ["bash", "-c", f'set -euo pipefail; . "{RESOLVE_HELPER}"; lakebase_resolve_database "{root}"'],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode != 0, f"expected fail-closed on {var_file}"
+        assert f"unsupported var file: {var_file}; set TF_VAR_logical_database" in res.stderr
+
 

@@ -44,9 +44,9 @@ CONFIG="$ROOT/config/tables.json"
 . "$ROOT/scripts/verify_table.sh"
 
 echo "== 1. terraform apply (for_each creates all tables in config/tables.json) =="
-DB="$(lakebase_resolve_database "$ROOT")"
-lakebase_validate_database "$DB"
 ( cd "$ROOT/terraform" && terraform init -input=false >/dev/null && terraform apply -auto-approve -input=false )
+DB="$(terraform -chdir="$ROOT/terraform" output -raw logical_database)"
+lakebase_validate_database "$DB"
 
 echo "== 1b. verify committed per-table Liquibase changelogs are in sync with config/tables.json =="
 # Do NOT regenerate at deploy time — that could apply something other than the reviewed, committed

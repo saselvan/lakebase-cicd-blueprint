@@ -35,8 +35,11 @@ export PGUSER=<your-databricks-username>   # your login email; for a service pri
 ./scripts/deploy.sh
 ```
 
-`deploy.sh` does, in order (resolving the target Postgres database name from `TF_VAR_logical_database`,
-then `terraform/terraform.tfvars`, then `terraform/variables.tf` default `databricks_postgres`):
+`deploy.sh` does, in order (asking Terraform for `var.logical_database` — after apply via
+`terraform -chdir=terraform output -raw logical_database`, and on no-apply paths via
+`terraform console`, which follows Terraform's variable precedence: `variables.tf` default →
+`TF_VAR_logical_database` → `terraform.tfvars` → `terraform.tfvars.json` → `*.auto.tfvars` /
+`*.auto.tfvars.json` in lexical order):
 1. `terraform apply` — creates the synced table via `databricks_postgres_synced_table`. Reruns are a
    no-op because Terraform owns the state.
 2. `scripts/wait_for_sync.sh` — polls `databricks postgres get-synced-table` until `detailed_state`

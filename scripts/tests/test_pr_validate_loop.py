@@ -65,7 +65,35 @@ def _setup_stubs(tmp_path: Path, liquibase_body: str) -> tuple[dict[str, str], P
     lb_stub.chmod(0o755)
 
     tf_stub = bin_dir / "terraform"
-    tf_stub.write_text("#!/usr/bin/env bash\nexit 0\n")
+    tf_stub.write_text(
+        r"""#!/usr/bin/env bash
+dir="."
+for a in "$@"; do
+  case "$a" in
+    -chdir=*) dir="${a#-chdir=}" ;;
+  esac
+done
+resolve_stub_db() {
+  local d="$1"
+  if [ -f "$d/terraform.tfvars" ]; then
+    python3 -c 'import pathlib,re,sys; m=re.search(r"logical_database\s*=\s*\"([^\"]*)\"", pathlib.Path(sys.argv[1]).read_text()); print(m.group(1) if m else "databricks_postgres", end="")' "$d/terraform.tfvars"
+  else
+    printf '%s' "${TF_VAR_logical_database:-databricks_postgres}"
+  fi
+}
+case "$*" in
+  *"output -raw logical_database"*)
+    resolve_stub_db "$dir"
+    exit 0
+    ;;
+  *console*)
+    printf '"%s"\n' "$(resolve_stub_db "$dir")"
+    exit 0
+    ;;
+esac
+exit 0
+"""
+    )
     tf_stub.chmod(0o755)
 
     psql_stub = bin_dir / "psql"
@@ -210,13 +238,68 @@ exit 0
     assert "generated/providers.changelog.sql" in calls, calls
     assert f"jdbc:postgresql://{RW_HOST}:5432/deploy_custom_db?sslmode=require" in calls, calls
 
-    # 3) Hostile DB name in TF_VAR_logical_database -> deploy.sh exits non-zero
+    # 3) Hostile DB name in TF_VAR_logical_database (no tfvars override) -> deploy.sh exits non-zero
+    (work / "terraform" / "terraform.tfvars").unlink(missing_ok=True)
     env_bad = dict(env_ok, TF_VAR_logical_database="db?sslmode=disable")
     r_bad = subprocess.run(
         ["bash", str(work / "scripts" / "deploy.sh")],
         cwd=str(work), env=env_bad, capture_output=True, text=True,
     )
     assert r_bad.returncode != 0, "deploy.sh accepted hostile database name db?sslmode=disable"
+
+
+def test_deploy_sh_reads_database_from_terraform_output_after_apply(tmp_path):
+    """Attacker 3: if Terraform applies with a value from -var-file / -var / state (which only
+    `terraform -chdir=terraform output -raw logical_database` after apply knows), deploy.sh must
+    read `DB` from `terraform output -raw logical_database` after `terraform apply` and validate it."""
+    work = _stage_repo(tmp_path)
+    (work / "scripts" / "wait_for_sync.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+    env, lb_log = _setup_stubs(
+        tmp_path / "tf_out_case",
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$LB_LOG"
+exit 0
+""",
+    )
+    # Stub terraform so `output -raw logical_database` prints `applied_via_var_file_db`
+    tf_stub = Path(env["PATH"].split(os.pathsep)[0]) / "terraform"
+    tf_stub.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *"output -raw logical_database"*) printf 'applied_via_var_file_db\\n' ;;
+  *) exit 0 ;;
+esac
+"""
+    )
+    tf_stub.chmod(0o755)
+
+    r = subprocess.run(
+        ["bash", str(work / "scripts" / "deploy.sh")],
+        cwd=str(work), env=env, capture_output=True, text=True,
+    )
+    assert r.returncode == 0, f"deploy.sh failed:\n{r.stdout}\n{r.stderr}"
+    calls = lb_log.read_text()
+    assert f"jdbc:postgresql://{RW_HOST}:5432/applied_via_var_file_db?sslmode=require" in calls, (
+        f"deploy.sh did not use `terraform output -raw logical_database` after apply:\n{calls}"
+    )
+
+    # And if `terraform output -raw logical_database` returns a hostile DB name, deploy.sh fails closed
+    lb_log.write_text("")
+    tf_stub.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *"output -raw logical_database"*) printf 'db?sslmode=disable\\n' ;;
+  *) exit 0 ;;
+esac
+"""
+    )
+    tf_stub.chmod(0o755)
+    r_bad = subprocess.run(
+        ["bash", str(work / "scripts" / "deploy.sh")],
+        cwd=str(work), env=env, capture_output=True, text=True,
+    )
+    assert r_bad.returncode != 0, "deploy.sh accepted hostile database name from terraform output"
+    assert lb_log.read_text() == "", "liquibase ran despite hostile terraform output database name"
 
 
 def test_seed_source_sh_fails_on_bad_config_or_failed_statement_and_isolates_stdin(tmp_path):
