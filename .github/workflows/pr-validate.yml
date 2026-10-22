@@ -31,6 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           . scripts/resolve_endpoint.sh
+          . scripts/verify_table.sh
           DB="$(lakebase_resolve_database "$PWD")"
           lakebase_validate_database "$DB"
           databricks postgres create-branch "projects/$PROJECT" "$BRANCH" \
@@ -42,19 +43,22 @@ jobs:
           lakebase_resolve_and_mint "projects/$PROJECT/branches/$BRANCH" ""
           HOST="$LB_HOST"
           TOKEN="$LB_TOKEN"
+          export PGHOST="$HOST" PGPORT=5432 PGDATABASE="$DB" PGSSLMODE=require \
+            PGUSER="${PGUSER:-${DATABRICKS_CLIENT_ID:-${{ secrets.DATABRICKS_CLIENT_ID }}}}" \
+            PGPASSWORD="$TOKEN"
           # Generate one changelog per table from config/tables.json, then run EACH table's own
           # changelog (distinct FILENAME => distinct changeset identity, so shared-schema tables do
           # not collide in one DATABASECHANGELOG). Mirrors scripts/deploy.sh.
           python3 liquibase/generate_changelogs.py
           URL="jdbc:postgresql://$HOST:5432/$DB?sslmode=require"
           cd liquibase
-          TABLES="$(python3 -c "import json;[print(t['name'],t['app_schema']) for t in json.load(open('../config/tables.json'))]")"
-          while read -r NAME SCHEMA; do
+          TABLES="$(python3 -c "import json;[print(t['name'],t['app_schema'],json.dumps(t,separators=(',',':'))) for t in json.load(open('../config/tables.json'))]")"
+          while read -r NAME SCHEMA ROW; do
             [ -z "$NAME" ] && continue
             liquibase update \
               --changeLogFile="generated/$NAME.changelog.sql" \
               --url="$URL" \
               --username="${{ secrets.DATABRICKS_CLIENT_ID }}" --password="$TOKEN" \
               --liquibase-schema-name="$SCHEMA" </dev/null || exit 1
+            verify_table_from_row "$ROW" </dev/null || exit 1
           done <<< "$TABLES"
-          # add pytest/psycopg validation here -- it runs against the branch, not prod

@@ -138,7 +138,7 @@ emit("T_ROLE",   t["app_role"])
 pg_table = str(t["synced_table_id"]).split(".")[-1]   # last part of the 3-part UC name
 emit("T_VIEW",   resolve_view_name(t, pg_table))      # override or derived <pg_table>_v (shared seam)
 # index columns as a shell array (0/1/N), each shlex-quoted -> read straight into T_IDX=(...)
-cols = t.get("index_columns") or []
+cols = t.get("index_columns") or t.get("create_index_on") or []
 print("T_IDX=(" + " ".join(shlex.quote(str(c)) for c in cols) + ")")
 PY
 )"
@@ -177,9 +177,9 @@ PY
   # swallowed the way the old `2>&1`-and-ignore inline psql checks were.
   # ${#T_IDX[@]} guards the empty-array expansion for a table with zero index_columns (bash 3.2).
   if [ "${#T_IDX[@]}" -gt 0 ]; then
-    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW" "${T_IDX[@]}"
+    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW" "${T_IDX[@]}" </dev/null || exit 1
   else
-    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW"
+    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW" </dev/null || exit 1
   fi
 done
 

@@ -175,6 +175,36 @@ else
 fi
 expect nonzero "view owner without base SELECT -> non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
 
+echo ""; echo "===== PR-VALIDATE WORKFLOW PATH: verify_table_from_row on config/tables.json row ====="
+# Restore valid view ownership + least-privilege grants, then exercise the exact helper function
+# (.github/workflows/pr-validate.yml -> verify_table_from_row "$ROW") against real Postgres 16.
+psql -v ON_ERROR_STOP=1 -q \
+  -c "ALTER VIEW $SCHEMA.$VIEW OWNER TO postgres;" \
+  -c "GRANT USAGE ON SCHEMA $SCHEMA TO $ROLE;" \
+  -c "GRANT SELECT ON $SCHEMA.$VIEW TO $ROLE;" \
+  -c "REVOKE ALL ON $SCHEMA.$TABLE FROM $ROLE;"
+MEMBERS_ROW="$(python3 -c "import json; print(json.dumps(json.load(open('$REPO_ROOT/config/tables.json'))[0], separators=(',',':')))")"
+run_verify_row() { set +e; verify_table_from_row "$1"; local rc=$?; set -e; return "$rc"; }
+expect_row() {
+  local want="$1" label="$2" row="$3" rc=0
+  run_verify_row "$row" || rc=$?
+  if { [ "$want" = 0 ] && [ "$rc" -eq 0 ]; } || { [ "$want" = nonzero ] && [ "$rc" -ne 0 ]; }; then
+    echo "  OK   $label (rc=$rc)"
+  else
+    echo "  FAIL $label (rc=$rc, wanted $want)"; fail=1
+  fi
+}
+expect_row 0 "pr-validate verify_table_from_row: all post-conditions met -> exit 0" "$MEMBERS_ROW"
+
+psql -v ON_ERROR_STOP=1 -q -c "REVOKE SELECT ON $SCHEMA.$VIEW FROM $ROLE;"
+expect_row nonzero "pr-validate verify_table_from_row: missing view SELECT grant -> non-zero exit" "$MEMBERS_ROW"
+
+psql -v ON_ERROR_STOP=1 -q \
+  -c "GRANT SELECT ON $SCHEMA.$VIEW TO $ROLE;" \
+  -c "GRANT SELECT ON $SCHEMA.$TABLE TO $ROLE;"
+expect_row nonzero "pr-validate verify_table_from_row: base-table SELECT grant -> non-zero exit" "$MEMBERS_ROW"
+psql -v ON_ERROR_STOP=1 -q -c "REVOKE ALL ON $SCHEMA.$TABLE FROM $ROLE;"
+
 echo ""
 if [ "$fail" = 0 ]; then
   echo "VERDICT: PASS — verify exits 0 only when the app role can read the view AND all indexes exist."

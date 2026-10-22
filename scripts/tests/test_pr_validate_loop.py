@@ -16,15 +16,17 @@ What must never happen:
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
 
-from test_endpoint_credential import ENDPOINTS_JSON, RW_HOST, STUB_DATABRICKS
+from test_endpoint_credential import ENDPOINTS_JSON, RW_HOST, STUB_DATABRICKS, STUB_TOKEN
 from test_verify_step import _STUB_PSQL
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -96,8 +98,30 @@ exit 0
     )
     tf_stub.chmod(0o755)
 
+    psql_log = tmp_path / "psql.log"
     psql_stub = bin_dir / "psql"
-    psql_stub.write_text(_STUB_PSQL)
+    psql_stub.write_text(
+        r"""#!/usr/bin/env bash
+if [ "${STUB_PSQL_DRAIN_STDIN:-0}" = "1" ]; then
+  cat >/dev/null
+fi
+sql="${@: -1}"
+if [ -n "${PSQL_LOG:-}" ]; then
+  printf 'PGHOST=%s\tPGPORT=%s\tPGDATABASE=%s\tPGUSER=%s\tPGPASSWORD=%s\tPGSSLMODE=%s\tSQL=%s\n' \
+    "${PGHOST-}" "${PGPORT-}" "${PGDATABASE-}" "${PGUSER-}" "${PGPASSWORD-}" "${PGSSLMODE-}" "$sql" >> "$PSQL_LOG"
+fi
+if [ -n "${STUB_PSQL_FAIL_TABLE:-}" ]; then
+  case "$sql" in
+    *"${STUB_PSQL_FAIL_TABLE}"*)
+      printf 'f\n'
+      exit 0
+      ;;
+  esac
+fi
+"""
+        + "\n".join(_STUB_PSQL.splitlines()[1:])
+        + "\n"
+    )
     psql_stub.chmod(0o755)
 
     endpoints = tmp_path / "endpoints.json"
@@ -108,6 +132,7 @@ exit 0
     env["STUB_LOG"] = str(tmp_path / "databricks.log")
     env["STUB_ENDPOINTS_JSON"] = str(endpoints)
     env["LB_LOG"] = str(lb_log)
+    env["PSQL_LOG"] = str(psql_log)
     env["PROJECT"] = "my-lakebase-project"
     env["BRANCH"] = "pr-42"
     env["PGUSER"] = "stub-user@example.com"
@@ -352,3 +377,181 @@ printf '{"status":{"state":"FAILED","error":{"message":"simulated warehouse fail
     assert r_stmt_fail.returncode != 0, (
         f"seed_source.sh exited 0 when statement returned FAILED:\n{r_stmt_fail.stdout}"
     )
+
+
+def test_pr_validate_fails_when_verify_fails_on_first_table_and_second_succeeds(tmp_path):
+    """Attacker 1 & Attacker 2 (Issue 06 / Finding 9):
+    When `liquibase update` succeeds on both tables (`members` and `providers`), but `verify_table`
+    (`psql`) fails on table 1 (`members`) and would pass on table 2 (`providers`),
+    `.github/workflows/pr-validate.yml` must exit non-zero — both under `set -euo pipefail` AND when
+    `set -e` is stripped (`set -uo pipefail`), proving the verify call inside the loop carries
+    `|| exit 1` so table 2's pass cannot hide table 1's failed verify."""
+    work = _stage_repo(tmp_path)
+    env, _lb_log = _setup_stubs(
+        tmp_path,
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$LB_LOG"
+exit 0
+""",
+    )
+    env["STUB_PSQL_FAIL_TABLE"] = "members"
+    script = _extract_pr_validate_run_script()
+
+    # 1) Standard execution of the workflow step script
+    r = subprocess.run(["bash", "-c", script], cwd=str(work), env=env, capture_output=True, text=True)
+    assert r.returncode != 0, (
+        f"pr-validate.yml exited 0 when verify_table failed on table 1 (members):\n"
+        f"STDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+    assert "VERIFY FAILED for 'members'" in (r.stdout + r.stderr), (
+        f"expected VERIFY FAILED for 'members' diagnostic, got:\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+    )
+
+    # 2) Without `set -e` (`set -uo pipefail`), the loop's own `|| exit 1` on verify must still
+    #    prevent table 2 (providers) from masking table 1's failure and exiting 0.
+    script_no_errexit = script.replace("set -euo pipefail", "set -uo pipefail")
+    r_no_e = subprocess.run(
+        ["bash", "-c", script_no_errexit], cwd=str(work), env=env, capture_output=True, text=True
+    )
+    assert r_no_e.returncode != 0, (
+        "pr-validate.yml verify call is missing `|| exit 1`: when `set -e` is inactive, table 2 "
+        f"(providers) succeeded and hid table 1 (members) verify failure:\nSTDOUT:\n{r_no_e.stdout}\nSTDERR:\n{r_no_e.stderr}"
+    )
+
+
+def test_pr_validate_verify_isolates_stdin_across_tables(tmp_path):
+    """Attacker 4 (Issue 06 / Finding 9):
+    When `psql` (inside `verify_table`) greedily reads stdin (`cat >/dev/null`), `</dev/null`
+    isolation on the verify call in `.github/workflows/pr-validate.yml` ensures both tables
+    (`members` and `providers`) still run both `liquibase update` and `verify_table`."""
+    work = _stage_repo(tmp_path)
+    env, lb_log = _setup_stubs(
+        tmp_path,
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$LB_LOG"
+exit 0
+""",
+    )
+    env["STUB_PSQL_DRAIN_STDIN"] = "1"
+    script = _extract_pr_validate_run_script()
+
+    r = subprocess.run(["bash", "-e", "-c", script], cwd=str(work), env=env, capture_output=True, text=True)
+    assert r.returncode == 0, f"pr-validate.yml failed:\nSTDOUT:\n{r.stdout}\nSTDERR:\n{r.stderr}"
+
+    lb_calls = lb_log.read_text()
+    assert "generated/members.changelog.sql" in lb_calls, lb_calls
+    assert "generated/providers.changelog.sql" in lb_calls, (
+        f"table 2 (providers) was skipped because verify/psql on table 1 drained stdin:\n{lb_calls}"
+    )
+    assert "VERIFY OK for 'members'" in r.stdout, r.stdout
+    assert "VERIFY OK for 'providers'" in r.stdout, (
+        f"verify did not run for table 2 (providers) after table 1 drained stdin:\n{r.stdout}"
+    )
+
+
+def test_pr_validate_and_deploy_invoke_verify_with_identical_args_and_pg_env(tmp_path):
+    """Attacker 3, 5, 6 (Issue 06 / Finding 9):
+    For a hostile multi-table `config/tables.json` fixture containing:
+      - `members` with a custom `view_name` override (`members_custom_v` != derived `members_v`)
+        and 3 `index_columns` (`member_id`, `plan_code`, `region_code`),
+      - `providers` with no `view_name` override (derived `providers_v`) and 0 `index_columns` (`[]`),
+      - and a custom `logical_database = "parity_custom_db"` in `terraform/terraform.tfvars`,
+    `scripts/deploy.sh` and `.github/workflows/pr-validate.yml` must execute the exact same
+    `verify_table` checks (`psql` queries) with the exact same `PG*` environment (`PGHOST`,
+    `PGPORT=5432`, `PGDATABASE=parity_custom_db`, `PGUSER`, `PGPASSWORD`, `PGSSLMODE=require`)."""
+    hostile_tables = [
+        {
+            "name": "members",
+            "synced_table_id": "my_catalog.cicd_proj.members",
+            "source_table_full_name": "my_catalog.cicd_proj.members_src",
+            "primary_key_columns": ["id"],
+            "app_schema": "cicd_proj",
+            "app_role": "members_app_ro",
+            # Hostile element 1: explicit view_name override distinct from derived members_v
+            "view_name": "members_custom_v",
+            # Hostile element 2: 3 index columns (tests >2 index columns)
+            "index_columns": ["member_id", "plan_code", "region_code"],
+        },
+        {
+            "name": "providers",
+            "synced_table_id": "my_catalog.cicd_proj.providers",
+            "source_table_full_name": "my_catalog.cicd_proj.providers_src",
+            "primary_key_columns": ["id"],
+            "app_schema": "cicd_proj",
+            "app_role": "providers_app_ro",
+            # Hostile element 3: 0 index columns + default derived view name (providers_v)
+            "index_columns": [],
+        },
+    ]
+
+    # --- Run 1: scripts/deploy.sh ---
+    work_deploy = _stage_repo(tmp_path / "deploy_run")
+    (work_deploy / "scripts" / "wait_for_sync.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (work_deploy / "config" / "tables.json").write_text(json.dumps(hostile_tables, indent=2) + "\n")
+    (work_deploy / "terraform" / "terraform.tfvars").write_text('logical_database = "parity_custom_db"\n')
+    subprocess.run(
+        [sys.executable, str(work_deploy / "liquibase" / "generate_changelogs.py")],
+        cwd=str(work_deploy),
+        check=True,
+    )
+    env_deploy, _ = _setup_stubs(
+        tmp_path / "deploy_stubs",
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$LB_LOG"
+exit 0
+""",
+    )
+    env_deploy["PGUSER"] = "sp-client-id-parity"
+    r_deploy = subprocess.run(
+        ["bash", str(work_deploy / "scripts" / "deploy.sh")],
+        cwd=str(work_deploy),
+        env=env_deploy,
+        capture_output=True,
+        text=True,
+    )
+    assert r_deploy.returncode == 0, f"deploy.sh failed:\n{r_deploy.stdout}\n{r_deploy.stderr}"
+    deploy_psql_lines = Path(env_deploy["PSQL_LOG"]).read_text().strip().splitlines()
+    assert len(deploy_psql_lines) > 0, "deploy.sh produced 0 psql verify calls"
+
+    # --- Run 2: .github/workflows/pr-validate.yml ---
+    work_pr = _stage_repo(tmp_path / "pr_run")
+    (work_pr / "config" / "tables.json").write_text(json.dumps(hostile_tables, indent=2) + "\n")
+    (work_pr / "terraform" / "terraform.tfvars").write_text('logical_database = "parity_custom_db"\n')
+    env_pr, _ = _setup_stubs(
+        tmp_path / "pr_stubs",
+        """#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$LB_LOG"
+exit 0
+""",
+    )
+    # Hostile element 4: unset PGUSER and set DATABRICKS_CLIENT_ID as GitHub Actions does
+    env_pr.pop("PGUSER", None)
+    env_pr["DATABRICKS_CLIENT_ID"] = "sp-client-id-parity"
+    script_pr = _extract_pr_validate_run_script().replace("stub-client-id", "sp-client-id-parity")
+    r_pr = subprocess.run(
+        ["bash", "-e", "-c", script_pr],
+        cwd=str(work_pr),
+        env=env_pr,
+        capture_output=True,
+        text=True,
+    )
+    assert r_pr.returncode == 0, f"pr-validate.yml failed:\n{r_pr.stdout}\n{r_pr.stderr}"
+    assert Path(env_pr["PSQL_LOG"]).is_file(), "pr-validate.yml did not invoke psql (verify_table never ran)"
+    pr_psql_lines = Path(env_pr["PSQL_LOG"]).read_text().strip().splitlines()
+
+    # Exact parity: every single psql invocation and its PG* env in pr-validate.yml must equal deploy.sh
+    assert pr_psql_lines == deploy_psql_lines, (
+        "pr-validate.yml and deploy.sh invoked verify_table/psql with different args or PG* env!\n"
+        f"pr-validate ({len(pr_psql_lines)} lines):\n"
+        + "\n".join(pr_psql_lines)
+        + f"\n\ndeploy.sh ({len(deploy_psql_lines)} lines):\n"
+        + "\n".join(deploy_psql_lines)
+    )
+    # Spot-check that the custom view override, 3rd index column, and custom DB are actually in the log
+    joined = "\n".join(pr_psql_lines)
+    assert f"PGHOST={RW_HOST}\tPGPORT=5432\tPGDATABASE=parity_custom_db\tPGUSER=sp-client-id-parity\tPGPASSWORD={STUB_TOKEN}\tPGSSLMODE=require" in joined
+    assert "members_custom_v" in joined
+    assert "members_v" not in joined
+    assert "idx_members_region_code" in joined
+    assert "providers_v" in joined
+

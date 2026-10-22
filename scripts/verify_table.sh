@@ -14,8 +14,14 @@
 # It reads the database connection from the standard PG* env vars (PGHOST/PGPORT/PGDATABASE/PGUSER/
 # PGPASSWORD/PGSSLMODE), exactly as scripts/deploy.sh exports them before the per-table loop.
 #
-# Sourced by scripts/deploy.sh; also runnable standalone (and by the tests):
+# Sourced by scripts/deploy.sh and .github/workflows/pr-validate.yml; also runnable standalone:
 #   scripts/verify_table.sh ROLE SCHEMA PG_TABLE VIEW [INDEX_COL ...]
+#   scripts/verify_table.sh --from-row ROW_JSON
+
+# Capture the repo root at source/load time so callers that later `cd liquibase` (such as
+# .github/workflows/pr-validate.yml after sourcing `. scripts/verify_table.sh` relatively) still
+# resolve dabs/checks.py and dabs/render_ddl.py against the repo root.
+_VERIFY_TABLE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # _scalar QUERY -- run a single-cell psql query and print the trimmed scalar. On any psql error the
 # result is the empty string, which FAILS the assertion below instead of passing it: the whole point
@@ -76,7 +82,7 @@ verify_table() {
 
   echo "== 4. verify table '$pg_table' (role=$role, view=$schema.$view) =="
 
-  root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  root="${_VERIFY_TABLE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   if ! checks_out="$(python3 "$root/dabs/checks.py" --table-checks "$role" "$schema" "$pg_table" "$view" "$@")"; then
     echo "  VERIFY FAILED for '$pg_table': dabs/checks.py --table-checks exited non-zero" >&2
     return 1
@@ -105,9 +111,53 @@ verify_table() {
   return 0
 }
 
+# verify_table_from_row ROW_JSON
+# Parse one config/tables.json object (compact JSON row) into ROLE, SCHEMA, PG_TABLE, VIEW
+# (resolved through the shared seam dabs.render_ddl.resolve_view_name), and INDEX_COLUMNS, then
+# invoke verify_table with the exact same positional arguments as scripts/deploy.sh.
+verify_table_from_row() {
+  if [ "$#" -lt 1 ] || [ -z "${1:-}" ]; then
+    echo "verify_table_from_row: usage: verify_table_from_row ROW_JSON" >&2
+    return 2
+  fi
+  local row="$1" root eval_out
+  local T_ROLE="" T_SCHEMA="" PG_TABLE="" T_VIEW=""
+  local -a T_IDX=()
+  root="${_VERIFY_TABLE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  if ! eval_out="$(python3 - "$row" "$root" <<'PY'
+import json, shlex, sys
+sys.path.insert(0, sys.argv[2])
+from dabs.render_ddl import resolve_view_name
+t = json.loads(sys.argv[1])
+def emit(k, v): print(f"{k}={shlex.quote(str(v))}")
+pg_table = str(t["synced_table_id"]).split(".")[-1]
+emit("T_ROLE",   t["app_role"])
+emit("T_SCHEMA", t["app_schema"])
+emit("PG_TABLE", pg_table)
+emit("T_VIEW",   resolve_view_name(t, pg_table))
+cols = t.get("index_columns") or t.get("create_index_on") or []
+print("T_IDX=(" + " ".join(shlex.quote(str(c)) for c in cols) + ")")
+PY
+)"; then
+    echo "  VERIFY FAILED: could not parse table config row" >&2
+    return 1
+  fi
+  eval "$eval_out"
+  if [ "${#T_IDX[@]}" -gt 0 ]; then
+    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW" "${T_IDX[@]}"
+  else
+    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW"
+  fi
+}
+
 # Standalone execution (not sourced): verify one table from CLI args. deploy.sh sources this file
 # (this guard is false there), so the function is defined without running.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   set -euo pipefail
-  verify_table "$@"
+  if [ "${1:-}" = "--from-row" ]; then
+    shift
+    verify_table_from_row "$@"
+  else
+    verify_table "$@"
+  fi
 fi

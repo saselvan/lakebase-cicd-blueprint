@@ -283,6 +283,38 @@ def test_attacker_3_all_workflows_pin_terraform_and_deploy_sets_pguser_and_empty
         f"deploy.yml must set PGUSER from secrets.DATABRICKS_CLIENT_ID, got {deploy_env.get('PGUSER')!r}"
     )
 
+    # Verify pr-validate.yml sources scripts/verify_table.sh, exports PG* env vars, and invokes
+    # verify_table_from_row (or verify_table) with </dev/null and || exit 1 after liquibase update.
+    pr_doc = yaml.safe_load((WORKFLOWS_DIR / "pr-validate.yml").read_text())
+    pr_steps = pr_doc["jobs"]["validate"]["steps"]
+    pr_run = ""
+    for step in pr_steps:
+        if "Create ephemeral CoW branch" in str(step.get("name") or ""):
+            pr_run = str(step.get("run") or "")
+            break
+    assert pr_run, "Create ephemeral CoW branch step not found in pr-validate.yml"
+    non_comment_lines = [
+        ln.strip() for ln in pr_run.splitlines() if ln.strip() and not ln.strip().startswith("#")
+    ]
+    non_comment_body = "\n".join(non_comment_lines)
+    assert "scripts/verify_table.sh" in non_comment_body, (
+        "pr-validate.yml must source scripts/verify_table.sh"
+    )
+    for pg_var in ("PGHOST=", "PGPORT=5432", "PGDATABASE=", "PGUSER=", "PGPASSWORD=", "PGSSLMODE=require"):
+        assert pg_var in non_comment_body, (
+            f"pr-validate.yml must export {pg_var} before running verify:\n{non_comment_body}"
+        )
+    verify_call_lines = [
+        ln for ln in non_comment_lines if re.match(r"verify_table(_from_row)?\b", ln)
+    ]
+    assert verify_call_lines, (
+        "pr-validate.yml must invoke verify_table_from_row (or verify_table) for each table after Liquibase"
+    )
+    for vline in verify_call_lines:
+        assert "</dev/null" in vline and "|| exit 1" in vline, (
+            f"pr-validate.yml verify call must isolate stdin (</dev/null) and fail fast (|| exit 1): {vline!r}"
+        )
+
 
 def test_attacker_4_setup_terraform_wrapper_stdout_corrupts_database_output_and_fails_closed(tmp_path):
     """Attacker 4: Simulate `hashicorp/setup-terraform` with `terraform_wrapper: true` (the default
