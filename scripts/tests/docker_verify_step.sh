@@ -205,6 +205,29 @@ psql -v ON_ERROR_STOP=1 -q \
 expect_row nonzero "pr-validate verify_table_from_row: base-table SELECT grant -> non-zero exit" "$MEMBERS_ROW"
 psql -v ON_ERROR_STOP=1 -q -c "REVOKE ALL ON $SCHEMA.$TABLE FROM $ROLE;"
 
+echo ""; echo "===== MUTATED CHANGELOG: GRANT SELECT on base table in 002 fails verify ====="
+mut_dir="$(mktemp -d "${TMPDIR:-/tmp}/verify_mut_cl.XXXXXX")"
+python3 - "$REPO_ROOT/liquibase/generated/members.changelog.sql" "$mut_dir/members.mutated.sql" <<'PY'
+import sys
+from pathlib import Path
+src = Path(sys.argv[1]).read_text()
+# Inject base-table SELECT grant into changeset 002 (no TABLE keyword — matches offline Attacker 3a)
+target = "--changeset cicd:002-app-grants runAlways:true\n"
+assert target in src
+mut = src.replace(
+    target,
+    target + "GRANT SELECT ON cicd_proj.members TO members_app_ro;\n",
+    1,
+)
+assert "GRANT SELECT ON cicd_proj.members TO members_app_ro;" in mut
+Path(sys.argv[2]).write_text(mut)
+PY
+# Apply the active SQL of the mutated changelog against Docker PG16, then run verify_table_from_row:
+grep -v '^--' "$mut_dir/members.mutated.sql" | psql -v ON_ERROR_STOP=1 -q >/dev/null
+expect_row nonzero "mutated changelog with GRANT SELECT ON cicd_proj.members -> verify fails" "$MEMBERS_ROW"
+psql -v ON_ERROR_STOP=1 -q -c "REVOKE ALL ON $SCHEMA.$TABLE FROM $ROLE;"
+rm -rf "$mut_dir"
+
 echo ""
 if [ "$fail" = 0 ]; then
   echo "VERDICT: PASS — verify exits 0 only when the app role can read the view AND all indexes exist."

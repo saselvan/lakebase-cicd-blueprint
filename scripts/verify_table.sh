@@ -135,7 +135,7 @@ emit("T_ROLE",   t["app_role"])
 emit("T_SCHEMA", t["app_schema"])
 emit("PG_TABLE", pg_table)
 emit("T_VIEW",   resolve_view_name(t, pg_table))
-cols = t.get("index_columns") or t.get("create_index_on") or []
+cols = t.get("index_columns") or []
 print("T_IDX=(" + " ".join(shlex.quote(str(c)) for c in cols) + ")")
 PY
 )"; then

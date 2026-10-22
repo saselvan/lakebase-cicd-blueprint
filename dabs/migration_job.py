@@ -105,9 +105,8 @@ def tables_config_path(config_path: str | Path | None = None) -> Path:
 
 
 def load_tables(config_path: str | Path | None = None) -> list[dict]:
-    """Read the single-source-of-truth tables config as a list of dicts."""
-    with tables_config_path(config_path).open() as fh:
-        return json.load(fh)
+    """Read the single-source-of-truth tables config as a list of dicts (validated for unique table names)."""
+    return _load_render_ddl().load_tables(tables_config_path(config_path))
 
 
 def synced_table_ids(tables: list[dict]) -> list[str]:

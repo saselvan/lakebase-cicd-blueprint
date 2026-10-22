@@ -138,7 +138,7 @@ emit("T_ROLE",   t["app_role"])
 pg_table = str(t["synced_table_id"]).split(".")[-1]   # last part of the 3-part UC name
 emit("T_VIEW",   resolve_view_name(t, pg_table))      # override or derived <pg_table>_v (shared seam)
 # index columns as a shell array (0/1/N), each shlex-quoted -> read straight into T_IDX=(...)
-cols = t.get("index_columns") or t.get("create_index_on") or []
+cols = t.get("index_columns") or []
 print("T_IDX=(" + " ".join(shlex.quote(str(c)) for c in cols) + ")")
 PY
 )"
