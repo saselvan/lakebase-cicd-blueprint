@@ -188,6 +188,12 @@ Autoscaling projects model:
   its indexes and rows throughout. Teardown is seconds and leaves only production.
 - **Each branch has its own connection endpoint** — resolve the branch's endpoint (list the project's
   branch endpoints) rather than reusing the production host. This is the main gotcha for scripts/CI.
+  Both paths (`dabs/migration_job.py` and `scripts/resolve_endpoint.sh`) require an endpoint with
+  `status.endpoint_type` matching `READ_WRITE`, a ready connection `status.hosts.host`, and a
+  non-empty resource `name` before minting a credential. Neither path falls back to a `READ_ONLY`
+  endpoint: migrations execute DDL and post-migration `verify` checks validate the target branch's
+  primary compute, so connecting to a read-only replica would fail late (`read-only transaction`) or
+  test the wrong endpoint.
 - Branches take an **expiry (TTL) at create time** and auto-clean at the TTL even without an explicit
   delete — a safety net against orphaned branches.
 - The database credential is **minted at runtime** (short-lived OAuth), never stored.

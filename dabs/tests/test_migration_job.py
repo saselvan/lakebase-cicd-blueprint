@@ -683,6 +683,227 @@ def test_host_from_endpoints_prefers_read_write():
     )
 
 
+# Redacted live `databricks postgres list-endpoints` response from `projects/lakebase-cicd-ref`.
+_LIVE_REDACTED_ENDPOINTS = [
+    {
+        "create_time": "2026-09-16T16:16:56Z",
+        "endpoint_id": "primary",
+        "name": "projects/lakebase-cicd-ref/branches/production/endpoints/primary",
+        "parent": "projects/lakebase-cicd-ref/branches/production",
+        "status": {
+            "autoscaling_limit_max_cu": 8,
+            "autoscaling_limit_min_cu": 4,
+            "current_state": "ACTIVE",
+            "disabled": False,
+            "endpoint_id": "primary",
+            "endpoint_type": "ENDPOINT_TYPE_READ_WRITE",
+            "group": {"enable_readable_secondaries": False, "max": 1, "min": 1},
+            "hosts": {
+                "host": "ep-live-fixture-rw.database.cloud.databricks.com",
+                "read_write_pooled_host": "ep-live-fixture-pooler.database.us-east-1.cloud.databricks.com",
+            },
+            "last_active_time": "2026-10-21T11:33:21Z",
+            "settings": {},
+        },
+        "uid": "00000000-0000-0000-0000-000000000001",
+        "update_time": "2026-10-21T11:33:33Z",
+    }
+]
+
+# Shared attacker table (Attacker items 1-9 + live fixture) exercised against both DABs Python
+# (`_select_endpoint` + `_lakebase_conninfo`) and Shell (`lakebase_resolve_and_mint`).
+_ENDPOINT_ATTACKER_CASES = [
+    (
+        "1_only_read_only_with_hosts",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/ro-1",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_ONLY", "hosts": {"host": "ro1.example"}},
+            },
+            {
+                "name": "projects/p/branches/b/endpoints/ro-2",
+                "status": {"endpoint_type": "READ_ONLY", "hosts": {"host": "ro2.example"}},
+            },
+        ],
+        None,
+        "no compute endpoint",
+    ),
+    (
+        "2_no_endpoint_has_host",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/rw",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": None}},
+            },
+            {
+                "name": "projects/p/branches/b/endpoints/ro",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_ONLY", "hosts": {"host": ""}},
+            },
+        ],
+        None,
+        "no compute endpoint",
+    ),
+    (
+        "3_read_write_no_host_plus_read_only_with_host",
+        [
+            # Hostile: READ_WRITE exists but its host is still provisioning (None), while READ_ONLY
+            # has a ready host. A fallback to with_host[0] would route the migration to READ_ONLY!
+            {
+                "name": "projects/p/branches/b/endpoints/rw",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": None}},
+            },
+            {
+                "name": "projects/p/branches/b/endpoints/ro",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_ONLY", "hosts": {"host": "ro-ready.example"}},
+            },
+        ],
+        None,
+        "no compute endpoint",
+    ),
+    (
+        "4a_read_write_with_host_and_empty_name",
+        [
+            {
+                "name": "",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "rw.example"}},
+            },
+        ],
+        None,
+        "no resource name",
+    ),
+    (
+        "4b_read_write_with_host_and_missing_name",
+        [
+            {
+                "name": None,
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "rw.example"}},
+            },
+        ],
+        None,
+        "no resource name",
+    ),
+    (
+        "5_read_only_first_read_write_second",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/ro",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_ONLY", "hosts": {"host": "ro.example"}},
+            },
+            {
+                "name": "projects/p/branches/b/endpoints/rw",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "rw.example"}},
+            },
+        ],
+        ("rw.example", "projects/p/branches/b/endpoints/rw"),
+        None,
+    ),
+    (
+        "6_empty_endpoint_list",
+        [],
+        None,
+        "no compute endpoint",
+    ),
+    (
+        "7_live_redacted_lakebase_cicd_ref",
+        _LIVE_REDACTED_ENDPOINTS,
+        (
+            "ep-live-fixture-rw.database.cloud.databricks.com",
+            "projects/lakebase-cicd-ref/branches/production/endpoints/primary",
+        ),
+        None,
+    ),
+    (
+        "8_whitespace_only_host_and_name",
+        [
+            {
+                "name": "   ",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "rw.example"}},
+            },
+        ],
+        None,
+        "no resource name",
+    ),
+    (
+        "9_unspecified_endpoint_type_with_host",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/unspec",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_UNSPECIFIED", "hosts": {"host": "unspec.example"}},
+            },
+        ],
+        None,
+        "no compute endpoint",
+    ),
+]
+
+
+def _dict_to_sdk_endpoint(d: dict) -> object:
+    """Convert a JSON endpoint dict into a duck-typed SDK Endpoint object (with enum endpoint_type)."""
+    class _EndpointType(enum.Enum):
+        ENDPOINT_TYPE_READ_ONLY = "ENDPOINT_TYPE_READ_ONLY"
+        ENDPOINT_TYPE_READ_WRITE = "ENDPOINT_TYPE_READ_WRITE"
+        ENDPOINT_TYPE_UNSPECIFIED = "ENDPOINT_TYPE_UNSPECIFIED"
+
+    status_d = d.get("status") or {}
+    hosts_d = status_d.get("hosts") or {}
+    raw_etype = status_d.get("endpoint_type")
+    etype = _EndpointType(raw_etype) if raw_etype in _EndpointType._value2member_map_ else raw_etype
+    return types.SimpleNamespace(
+        name=d.get("name"),
+        status=types.SimpleNamespace(
+            endpoint_type=etype,
+            hosts=types.SimpleNamespace(host=hosts_d.get("host")),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "case_id,raw_eps,expected,err_substr",
+    _ENDPOINT_ATTACKER_CASES,
+    ids=[c[0] for c in _ENDPOINT_ATTACKER_CASES],
+)
+def test_select_endpoint_and_conninfo_attacker_matrix(case_id, raw_eps, expected, err_substr):
+    """Attacker items 1-9 + live fixture on DABs `_select_endpoint` and `_lakebase_conninfo`.
+
+    MUTATION GATES:
+      - Mutation A (allow READ_ONLY fallback in `_select_endpoint`): cases 1, 3, 9 go RED.
+      - Mutation B (drop the no-name check in `_select_endpoint` / `_endpoint_name`): cases 4a, 4b, 8 go RED.
+    """
+    sdk_eps = [_dict_to_sdk_endpoint(ep) for ep in raw_eps]
+    cred_calls: list[str] = []
+
+    def fake_cred_source(endpoint_name: str) -> tuple[str, str]:
+        cred_calls.append(endpoint_name)
+        return ("svc@example.com", "tok-123")
+
+    if expected is not None:
+        exp_host, exp_name = expected
+        ep = mj._select_endpoint(sdk_eps)
+        assert mj._endpoint_host(ep) == exp_host
+        assert mj._endpoint_name(ep) == exp_name
+
+        conninfo = mj._lakebase_conninfo(
+            branch=_BRANCH,
+            resolve_endpoint=lambda b: mj._select_endpoint(sdk_eps),
+            credential_source=fake_cred_source,
+        )
+        fields = dict(kv.split("=", 1) for kv in conninfo.split())
+        assert fields["host"] == exp_host
+        assert cred_calls == [exp_name]
+    else:
+        with pytest.raises(RuntimeError, match=err_substr):
+            mj._select_endpoint(sdk_eps)
+        with pytest.raises(RuntimeError, match=err_substr):
+            mj._lakebase_conninfo(
+                branch=_BRANCH,
+                resolve_endpoint=lambda b: mj._select_endpoint(sdk_eps),
+                credential_source=fake_cred_source,
+            )
+        assert cred_calls == [], (
+            f"case {case_id}: credential_source was called on an endpoint-selection error: {cred_calls}"
+        )
+
+
 def test_apply_threads_branch_into_conninfo(monkeypatch):
     """apply_sql_to_lakebase threads the branch through to the conninfo builder, so the live apply
     connects to the branch endpoint. It passes NO instance name (the conninfo builder takes only a
