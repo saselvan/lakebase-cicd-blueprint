@@ -77,19 +77,45 @@ def test_render_emits_guarded_role_per_table():
         assert f"CREATE ROLE {role} NOLOGIN" in sql, f"role {role} not created NOLOGIN:\n{sql}"
 
 
+def _strip_quotes(ident: str) -> str:
+    return ".".join(part.strip().strip('"').lower() for part in ident.split("."))
+
+
+_GRANT_RE = re.compile(
+    r"\bGRANT\s+(?P<priv>[A-Za-z_,\s]+?)\s+ON\s+(?:(?P<kind>SCHEMA|TABLE)\s+)?(?P<target>(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*))?)\s+TO\s+(?P<role>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_grants(sql: str) -> list[dict]:
+    active_lines = [ln for ln in sql.splitlines() if not ln.lstrip().startswith("--")]
+    active_sql = "\n".join(active_lines)
+    grants = []
+    for m in _GRANT_RE.finditer(active_sql):
+        priv = " ".join(m.group("priv").upper().split())
+        kind = (m.group("kind") or "").upper()
+        target = _strip_quotes(re.sub(r"\s*\.\s*", ".", m.group("target")))
+        role = _strip_quotes(m.group("role"))
+        grants.append({"priv": priv, "kind": kind, "target": target, "role": role, "raw": m.group(0)})
+    return grants
+
+
 def test_render_emits_grants_per_table():
     """Explicit GRANT USAGE on schema per table — and NO base-table SELECT (least privilege: the
     app role reads only through the consumer view, never the base synced table)."""
     sql = _render()
+    grants = _extract_grants(sql)
     for row in _fixture_rows():
         schema, role = row["app_schema"], row["app_role"]
         tbl = row["synced_table_id"].split(".")[-1]
+        base_fqn = f"{schema}.{tbl}".lower()
         assert re.search(rf"GRANT USAGE\s+ON SCHEMA {schema}\s+TO {role}", sql), (
             f"missing GRANT USAGE for {row['name']}:\n{sql}"
         )
-        assert not re.search(rf"GRANT SELECT ON TABLE\s+{schema}\.{tbl}\s+TO {role}", sql), (
-            f"base-table SELECT grant must be dropped for {row['name']} (least privilege):\n{sql}"
-        )
+        assert not any(
+            "SELECT" in g["priv"].split() and g["target"] == base_fqn
+            for g in grants
+        ), f"base-table SELECT grant must be dropped for {row['name']} (least privilege):\n{sql}"
 
 
 def test_grant_statements_grants_usage_only_no_base_table_select():
@@ -98,31 +124,42 @@ def test_grant_statements_grants_usage_only_no_base_table_select():
     the caller, so the app role never needs base-table SELECT to read the consumer view; keeping it
     would let the role bypass the (row-filterable) view.
 
-    MUTATION GATE: re-add `GRANT SELECT ON TABLE ... TO <role>` to grant_statements and this goes RED.
+    MUTATION GATE: re-add `GRANT SELECT ON ... TO <role>` (in any SQL spelling) to grant_statements and this goes RED.
     """
     stmts = rd.grant_statements("shared_schema", "claims_reader_ro", "claims_synced")
     joined = "\n".join(stmts)
+    grants = _extract_grants(joined)
     assert any(
-        re.search(r"GRANT USAGE\s+ON SCHEMA shared_schema\s+TO claims_reader_ro", s) for s in stmts
+        g["priv"] == "USAGE" and g["kind"] == "SCHEMA" and g["target"] == "shared_schema" and g["role"] == "claims_reader_ro"
+        for g in grants
     ), f"grant_statements must still grant schema USAGE:\n{joined}"
-    assert "ON TABLE" not in joined, f"grant_statements must NOT grant on the base table:\n{joined}"
-    assert "GRANT SELECT" not in joined, (
-        f"grant_statements must emit no SELECT grant at all (the view grant lives in "
-        f"view_statements):\n{joined}"
+    assert not any("SELECT" in g["priv"].split() for g in grants), (
+        f"grant_statements must emit no SELECT grant at all (the view grant lives in view_statements):\n{joined}"
     )
 
 
 def test_app_role_only_table_level_select_is_the_view():
-    """Across the WHOLE render, every `GRANT SELECT` targets a consumer view — never a base synced
-    table (`GRANT SELECT ON TABLE ...`). Proves the least-privilege end state: schema USAGE + SELECT
-    on the view only.
+    """Across the WHOLE render, every `GRANT SELECT` targets a resolved consumer view — never a base
+    synced table (with or without TABLE keyword, quoted, multiline, or lowercase). Proves the
+    least-privilege end state: schema USAGE + SELECT on the view only.
 
     MUTATION GATE: re-introduce the base-table SELECT grant and this goes RED.
     """
     sql = _render()
-    for line in sql.splitlines():
-        if "GRANT SELECT" in line:
-            assert "ON TABLE" not in line, f"a GRANT SELECT targets a base table (not the view):\n{line}"
+    grants = _extract_grants(sql)
+    expected_views = {
+        f"{r['app_schema']}.{rd.resolve_view_name(r, rd.pg_table_name(r))}".lower()
+        for r in _fixture_rows()
+    }
+    select_grants = [g for g in grants if "SELECT" in g["priv"].split()]
+    assert len(select_grants) == len(_fixture_rows()), (
+        f"expected {len(_fixture_rows())} GRANT SELECT statements (one per view), got {select_grants}"
+    )
+    for g in select_grants:
+        assert g["kind"] != "TABLE", f"a GRANT SELECT uses ON TABLE:\n{g['raw']}"
+        assert g["target"] in expected_views, (
+            f"a GRANT SELECT targets {g['target']!r} (not a consumer view {sorted(expected_views)}):\n{g['raw']}"
+        )
 
 
 def test_render_emits_one_index_per_column_no_cap():
@@ -491,6 +528,54 @@ def test_render_rejects_duplicate_resolved_view_names(tmp_path):
     with pytest.raises(ValueError) as exc:
         rd.render_ddl(rd.load_tables(cfg))
     assert "claims_synced_v" in str(exc.value), exc.value
+
+
+# --- 4f. cross-entry table-name uniqueness (shared seam, exact + case-insensitive) --------------
+
+def _dup_table_name_rows(second_name: str = "members") -> list[dict]:
+    return [
+        {
+            "name": "members",
+            "synced_table_id": "cat_a.s1.members_a",
+            "source_table_full_name": "cat_a.raw.members_a_src",
+            "primary_key_columns": ["id"],
+            "app_schema": "s1",
+            "app_role": "members_s1_ro",
+            "index_columns": [],
+        },
+        {
+            "name": second_name,
+            "synced_table_id": "cat_a.s2.members_b",
+            "source_table_full_name": "cat_a.raw.members_b_src",
+            "primary_key_columns": ["id"],
+            "app_schema": "s2",
+            "app_role": "members_s2_ro",
+            "index_columns": [],
+        },
+    ]
+
+
+@pytest.mark.parametrize("second_name", ["members", "MEMBERS", "Members"])
+def test_validate_table_names_unique_and_load_tables_reject_duplicates(tmp_path, second_name):
+    """Attacker 1 & 2: Two config rows with the same `name` (exact or case-insensitive) and
+    different schemas are rejected by `validate_table_names_unique`, `load_tables`, and `render_ddl`,
+    naming the duplicate."""
+    assert hasattr(rd, "validate_table_names_unique"), "render_ddl must expose validate_table_names_unique"
+    rows = _dup_table_name_rows(second_name)
+    with pytest.raises(ValueError) as exc_val:
+        rd.validate_table_names_unique(rows)
+    assert "members" in str(exc_val.value).lower(), f"error must name duplicate 'members': {exc_val.value}"
+
+    with pytest.raises(ValueError) as exc_render:
+        rd.render_ddl(rows)
+    assert "members" in str(exc_render.value).lower(), f"error must name duplicate 'members': {exc_render.value}"
+
+    cfg = tmp_path / "dup_name.json"
+    cfg.write_text(json.dumps(rows))
+    with pytest.raises(ValueError) as exc_load:
+        rd.load_tables(cfg)
+    assert "members" in str(exc_load.value).lower(), f"error must name duplicate 'members': {exc_load.value}"
+
 
 
 # --- 5. the standalone CLI (`python -m dabs.render_ddl | psql`) --------------------------------

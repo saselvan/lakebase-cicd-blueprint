@@ -48,11 +48,13 @@ _HEADER = (
 # --- config loading -----------------------------------------------------------------------------
 
 def load_tables(config_path: str | Path) -> list[dict]:
-    """Read the single-source-of-truth tables config as a list of dicts."""
+    """Read the single-source-of-truth tables config as a list of dicts, enforcing unique table
+    names across rows."""
     with Path(config_path).open() as fh:
         tables = json.load(fh)
     if not isinstance(tables, list):
         raise ValueError(f"{config_path}: expected a JSON array of table objects")
+    validate_table_names_unique(tables)
     return tables
 
 
@@ -244,6 +246,34 @@ def resolve_view_name(table: dict, synced_table: str) -> str:
     return validate_derived_name(f"{synced_table}_v", "view name", "the synced table name")
 
 
+def validate_table_names_unique(tables: list[dict]) -> None:
+    """Fail loud when two config entries share the same `name` (exact or case-insensitive).
+
+    Each row's `name` is the per-table handle that drives the Liquibase changelog filename
+    (``<name>.changelog.sql``) and the DABs synced-table resource file/key (``<name>.yml``).
+    If two rows share a `name` (for example across different schemas, or differing only in case),
+    `write_changelogs` / `write_resources` would overwrite the first file with the second (dropping
+    the first table's role, grants, indexes, and view), and `check_drift`'s dict keyed by filename
+    would collapse the duplicate and report no drift.
+    """
+    seen: dict[str, str] = {}
+    for table in tables:
+        if "name" not in table:
+            continue
+        raw_name = table["name"]
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            validate_identifier(raw_name, "name")
+        key = raw_name.strip().lower()
+        if key in seen:
+            raise ValueError(
+                f"duplicate table name {raw_name!r} (collides with {seen[key]!r}): each entry in "
+                f"config/tables.json must have a unique 'name' (case-insensitive) because it "
+                f"determines the per-table changelog and bundle resource filename."
+            )
+        seen[key] = raw_name
+        validate_identifier(raw_name, "name")
+
+
 def validate_view_names_unique(tables: list[dict]) -> None:
     """Fail loud when two config entries resolve to the SAME (app_schema, view_name) (shared seam).
 
@@ -261,6 +291,7 @@ def validate_view_names_unique(tables: list[dict]) -> None:
     ``liquibase/generate_changelogs.py``) and ``render_ddl`` call it at generation time, so every
     path inherits the guard. Resolving each name also runs it through the per-name identifier seam.
     """
+    validate_table_names_unique(tables)
     seen: dict[tuple[str, str], str] = {}
     for table in tables:
         schema = validate_identifier(table["app_schema"], "app_schema")
