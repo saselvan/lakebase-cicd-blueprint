@@ -236,6 +236,8 @@ def _real_terraform_outputs(tf_dir: Path, env: dict[str, str]) -> dict[str, str]
     """Evaluate var.project_id, var.branch, var.databricks_profile, var.logical_database using the
     real `terraform console` binary in an isolated provider-free scratch directory."""
     if shutil.which("terraform", path=os.environ.get("PATH", "")) is None:
+        if os.environ.get("CI"):
+            pytest.fail("no terraform binary on PATH in CI; the real-Terraform differential test must run")
         pytest.skip("real terraform binary not on PATH")
     real_tf = shutil.which("terraform", path=os.environ.get("PATH", ""))
     assert real_tf is not None

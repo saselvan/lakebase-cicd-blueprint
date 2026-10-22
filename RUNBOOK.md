@@ -25,7 +25,7 @@ drop/replace still has a gap — it is not zero-downtime: measured live at about
 export PROFILE=<your-cli-profile>
 export WAREHOUSE_ID=<your-sql-warehouse-id>
 export PROJECT=<your-lakebase-project-id>   # deploy is branch-driven; default my-lakebase-project
-export BRANCH=<branch-to-deploy-to>         # default main
+export BRANCH=<branch-to-deploy-to>         # default production
 export PGUSER=<your-databricks-username>   # your login email; for a service principal, its application id
 
 # 0. one-time: create the demo Delta source table the sync reads from
@@ -35,9 +35,11 @@ export PGUSER=<your-databricks-username>   # your login email; for a service pri
 ./scripts/deploy.sh
 ```
 
-`deploy.sh` does, in order (asking Terraform for `var.logical_database` — after apply via
-`terraform -chdir=terraform output -raw logical_database`, and on no-apply paths via
-`terraform console`, which follows Terraform's variable precedence: `variables.tf` default →
+`deploy.sh` does, in order (passing explicit `PROJECT`, `BRANCH`, and `PROFILE` settings via
+`TF_VAR_*` and reading back `project_id`, `branch`, `databricks_profile`, and `logical_database`
+from `terraform -chdir=terraform output -raw ...` after apply — aborting on any conflict between an
+explicit caller setting and Terraform's resolved value; on no-apply paths, `resolve_endpoint.sh`
+asks `terraform console`, which follows Terraform's variable precedence: `variables.tf` default →
 `TF_VAR_logical_database` → `terraform.tfvars` → `terraform.tfvars.json` → `*.auto.tfvars` /
 `*.auto.tfvars.json` in lexical order):
 1. `terraform apply` — creates the synced table via `databricks_postgres_synced_table`. Reruns are a
@@ -58,8 +60,9 @@ export PGUSER=<your-databricks-username>   # your login email; for a service pri
 ## The PR flow (branching)
 
 - Open a PR → `pr-validate.yml` creates an **ephemeral copy-on-write branch** `pr-<n>`, runs the
-  migrations against **that branch** (never production), validates. Dropping an index on a branch
-  leaves production untouched.
+  migrations against **that branch** (never production), and runs `verify_table_from_row` for every
+  table after Liquibase so a missing grant, view, or index fails the PR check. Dropping an index on a
+  branch leaves production untouched.
 - Close the PR → `pr-cleanup.yml` deletes the branch (and the TTL would anyway).
 - Do this by hand with `scripts/branch_test.sh`.
 

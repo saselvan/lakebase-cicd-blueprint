@@ -72,8 +72,8 @@ is stdlib-only, so there is no Java, no Liquibase, and no migration framework to
 At run time the job reads `config/tables.json`, waits for every synced table to reach `ONLINE`,
 then applies the database objects in order: the read-only role, explicit grants, indexes, and the
 consumer view. Every statement is idempotent (a `pg_roles`-guarded `CREATE ROLE`, `GRANT`,
-`CREATE INDEX IF NOT EXISTS`, `CREATE OR REPLACE VIEW`), and there is no migration version table. If
-a synced table is replaced, the job reapplies the objects on the next run. This is reconciliation,
+`CREATE INDEX IF NOT EXISTS`, `DROP VIEW IF EXISTS` + `CREATE OR REPLACE VIEW` in one transaction), and there is no migration version table. If
+a synced table is replaced or its columns change, the job reapplies the objects on the next run. This is reconciliation,
 not one-time setup — re-running is a clean no-op, never a version-bookkeeping conflict.
 
 After migrate, a `verify` task checks the result and fails the run, so `bundle run` exits non-zero,
@@ -426,7 +426,7 @@ then promote. Do not use one to solve the other.
 export PROFILE=<your-cli-profile>
 export WAREHOUSE_ID=<your-sql-warehouse-id>
 export PROJECT=<your-lakebase-project-id>   # deploy is branch-driven; default my-lakebase-project
-export BRANCH=<branch-to-deploy-to>         # default main
+export BRANCH=<branch-to-deploy-to>         # default production
 export PGUSER=<your-databricks-username>   # email; for a service principal, its application id
 
 # 1. list your tables (the ONE file most users edit):
@@ -442,14 +442,17 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit for yo
 `PGUSER` is your Databricks username (email). When you deploy as a service principal, set it to the
 SP's **application id** instead.
 
-`BRANCH` must match the `branch` in `terraform/terraform.tfvars` (the example sets `production`).
-Terraform creates the synced tables on the tfvars branch, and `deploy.sh` runs Liquibase on `$BRANCH`.
+`BRANCH` defaults to `production` (matching `terraform/variables.tf`). `deploy.sh` passes explicit
+`PROJECT`, `BRANCH`, and `PROFILE` values to Terraform via `TF_VAR_*`, reads back the resolved
+`project_id`, `branch`, `databricks_profile`, and `logical_database` from `terraform output -raw`
+after `terraform apply`, and aborts on any mismatch between an explicit caller setting and what
+Terraform resolved (for example when `terraform.tfvars` overrides `TF_VAR_*`).
 
 The Terraform provider takes its CLI profile from `databricks_profile` in `terraform/terraform.tfvars`
-(`provider "databricks" { profile = var.databricks_profile }` in `terraform/versions.tf`). A
-`TF_VAR_databricks_profile` environment variable does **not** override a value set in the tfvars file,
-so a CI job must either write `terraform.tfvars` with the SP's profile, or use SP environment auth
-(`DATABRICKS_HOST`, `DATABRICKS_CLIENT_ID`, `DATABRICKS_CLIENT_SECRET`).
+(`provider "databricks" { profile = var.databricks_profile != "" ? var.databricks_profile : null }`
+in `terraform/versions.tf`). Passing an empty `PROFILE=""` (as `deploy.yml` does in CI) maps
+`profile` to `null` in Terraform and omits `-p` in `wait_for_sync.sh` and `resolve_endpoint.sh`, so
+both Terraform and the Databricks CLI authenticate from `DATABRICKS_*` environment variables.
 
 `deploy.sh` is branch-driven: it resolves `projects/$PROJECT/branches/$BRANCH` to that branch's
 READ_WRITE compute endpoint, derives the connection host from it, and mints a runtime OAuth token
@@ -480,7 +483,7 @@ The renderer's output and the Liquibase changelog line up one to one:
 | `001-app-role` | `role_guard_sql` — idempotent `CREATE ROLE` via a `pg_roles` existence guard |
 | `002-app-grants` | `grant_statements` — `GRANT USAGE` on the schema only (no base-table SELECT; the app role reads through the view) |
 | `003-indexes` (generated as one `003-index-<col>` changeset per `index_columns` entry) | `index_statements` — `CREATE INDEX IF NOT EXISTS` per `index_columns` (handles 0/1/N) |
-| `004-app-view` | `view_statements` — `CREATE OR REPLACE VIEW` + `GRANT SELECT` on the view |
+| `004-app-view` | `view_statements` — `DROP VIEW IF EXISTS` + `CREATE OR REPLACE VIEW` + `GRANT SELECT` on the view (atomic in one transaction) |
 
 Both stay idempotent. To run the DABs path's SQL outside the job, render it and pipe it to psql on
 each deploy (this is the same SQL the Workflow job applies):

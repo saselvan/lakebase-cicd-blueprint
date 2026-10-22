@@ -60,10 +60,18 @@ The supported path needs no superuser — use a consumer view:
    deploy identity, which holds base `SELECT`), so consumers never need base access.
 
 ```sql
+DROP VIEW IF EXISTS <schema>.<table>_v;
 CREATE OR REPLACE VIEW <schema>.<table>_v AS SELECT * FROM <schema>.<table>;
 GRANT USAGE  ON SCHEMA <schema>            TO <app_role>;
 GRANT SELECT ON <schema>.<table>_v         TO <app_role>;
 ```
+
+Both paths execute `DROP VIEW IF EXISTS`, `CREATE OR REPLACE VIEW`, and `GRANT SELECT` inside a
+single database transaction (`autocommit=False` in `dabs/migration_job.py::apply_sql_to_lakebase`,
+and one Liquibase changeset `004-app-view` with default `runInTransaction:true`). Dropping and
+recreating the view in one transaction lets `SELECT *` survive base-table column drops, renames, and
+reorders without opening a window where the view is missing or ungranted, while keeping the view in
+place between deploys so an unplanned synced-table replace still fails closed.
 
 Keep the creator and the view owner the same identity and no `databricks_superuser` is needed.
 A view needs only `SELECT` on the synced table, which its creator is granted. Granting the table itself to the app would also need the grant option.

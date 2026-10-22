@@ -34,9 +34,11 @@ locally too if you touched migration SQL, the deploy verify step, or the changel
 (requires `docker`, plus `liquibase`/`psql` for the first and third):
 
 ```bash
-bash liquibase/tests/docker_multitable_proof.sh   # two shared-schema tables + a view_name override
-bash dabs/tests/docker_double_apply_proof.sh       # renderer double-apply is a clean reconciling no-op
-bash scripts/tests/docker_verify_step.sh           # verify step exits non-zero on a missing grant/index
+bash liquibase/tests/docker_multitable_proof.sh         # two shared-schema tables + a view_name override
+bash liquibase/tests/docker_view_edit_proof.sh          # runAlways view edit reruns on Liquibase 4.33
+bash liquibase/tests/docker_view_column_change_proof.sh # view survives column drop/rename/reorder atomically
+bash dabs/tests/docker_double_apply_proof.sh            # renderer double-apply is a clean reconciling no-op
+bash scripts/tests/docker_verify_step.sh                # verify step exits non-zero on a missing grant/index
 ```
 
 ### What each README promise is backed by
@@ -49,12 +51,14 @@ verified once against a live Lakebase branch (recorded in `docs/DESIGN-NOTES.md`
 |---|---|---|
 | Per-table changeset identity — tables sharing a schema never collide in one DATABASECHANGELOG | `docker_multitable_proof.sh` + `test_generate_changelogs.py::test_shared_schema_tables_get_distinct_changeset_identities` | Docker + offline |
 | Double-apply is idempotent (no version-table rollback on the 2nd apply) | `docker_double_apply_proof.sh` | Docker |
-| Verify step fails on a missing grant or index | `docker_verify_step.sh` + `test_verify_step.py` (`test_missing_grant_on_view_exits_nonzero`, `test_missing_index_exits_nonzero`) | Docker + offline |
-| App role reads the consumer VIEW but not the base synced table (least privilege) | least-privilege assertions in `docker_multitable_proof.sh` + `docker_double_apply_proof.sh` + `docker_verify_step.sh` + `test_checks.py`; live-confirmed | Docker + offline + live |
+| Consumer view survives base-table column drops, renames, and reorders atomically in one transaction (while still blocking an unplanned table replace) | `docker_view_column_change_proof.sh` + `test_render_ddl.py::test_view_statements_drops_before_create_and_regrants` + `test_migration_job.py::test_apply_sql_to_lakebase_runs_in_single_transaction_not_autocommit` | Docker + offline |
+| Verify step fails on a missing grant or index (in both `deploy.sh` and `pr-validate.yml`) | `docker_verify_step.sh` + `test_verify_step.py` + `test_pr_validate_loop.py` (`test_pr_validate_fails_when_verify_fails_on_first_table_and_second_succeeds`, `test_pr_validate_and_deploy_invoke_verify_with_identical_args_and_pg_env`) | Docker + offline |
+| App role reads the consumer VIEW but not the base synced table (least privilege) | least-privilege assertions in `docker_multitable_proof.sh` + `docker_double_apply_proof.sh` + `docker_verify_step.sh` + `test_checks.py` + `test_generate_changelogs.py::test_only_view_select_is_granted_across_changelog`; live-confirmed | Docker + offline + live |
 | `view_name` override is honored — the overridden view is created, the derived `<tbl>_v` is not | `docker_multitable_proof.sh` + `test_generate_changelogs.py::test_view_name_override_appears_in_changelog`; deploy verify: `scripts/tests/test_deploy_view_name.py` | Docker + offline |
 | Deploy aborts on committed-changelog drift (uses reviewed artifacts, never regenerates) | `test_deploy_drift_gate.py` | offline |
-| Endpoint-based credential minting (projects API, no instance name; READ_WRITE endpoint chosen) | `test_endpoint_credential.py` | offline |
-| Duplicate resolved view names are rejected at generation time | `test_generate_changelogs.py::test_duplicate_resolved_view_names_are_rejected` + `test_render_ddl.py` | offline |
+| Deploy, Terraform, Liquibase, and verify target one project, branch, profile, and database (and `make branch` threads `PROFILE`) | `test_deploy_target_parity.py` + `test_deploy_workflow.py` + `test_wait_for_sync.py` | offline |
+| Endpoint-based credential minting (projects API, no instance name; READ_WRITE endpoint with ready host and resource name required on both paths) | `test_endpoint_credential.py::test_shell_and_dabs_endpoint_parity_matrix` + `test_migration_job.py::test_select_endpoint_and_conninfo_attacker_matrix` | offline |
+| Duplicate table names and duplicate resolved view names are rejected at generation time across both generators | `test_generate_changelogs.py` (`test_duplicate_table_names_rejected_in_write_changelogs_and_load_tables`, `test_duplicate_resolved_view_names_are_rejected`) + `test_render_ddl.py` + `test_generate_resources.py` | offline |
 
 Or run the minimal subset individually:
 
