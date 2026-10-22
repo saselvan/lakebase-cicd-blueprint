@@ -394,6 +394,26 @@ def test_attacker_3_tfvars_overrides_env_fails_loudly_on_conflict_and_works_when
     assert r_p.returncode != 0, "deploy.sh exited 0 despite PROFILE conflicting with terraform.tfvars"
     assert not logs_p["liquibase"].exists() or logs_p["liquibase"].read_text() == ""
 
+    # Part (a3): terraform.tfvars sets databricks_profile = "" (empty), env sets PROFILE="env-prof"
+    work_pe, env_pe, logs_pe = _setup_deploy_harness(tmp_path / "conflict_empty_profile")
+    (work_pe / "terraform" / "terraform.tfvars").write_text(
+        'databricks_profile = ""\n'
+    )
+    env_pe["PROFILE"] = "env-prof"
+    r_pe = subprocess.run(
+        ["bash", str(work_pe / "scripts" / "deploy.sh")],
+        cwd=str(work_pe),
+        env=env_pe,
+        capture_output=True,
+        text=True,
+    )
+    assert r_pe.returncode != 0, (
+        "deploy.sh exited 0 despite PROFILE='env-prof' conflicting with empty databricks_profile='' in terraform.tfvars"
+    )
+    assert "target mismatch" in (r_pe.stdout + r_pe.stderr).lower(), r_pe.stderr
+    assert not logs_pe["wait"].exists() or logs_pe["wait"].read_text() == ""
+    assert not logs_pe["liquibase"].exists() or logs_pe["liquibase"].read_text() == ""
+
     # Part (b): env vars unset, terraform.tfvars sets project_id, branch, databricks_profile
     work_b, env_b, logs_b = _setup_deploy_harness(tmp_path / "tfvars_only")
     (work_b / "terraform" / "terraform.tfvars").write_text(

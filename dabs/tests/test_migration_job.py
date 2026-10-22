@@ -824,6 +824,28 @@ _ENDPOINT_ATTACKER_CASES = [
         "no resource name",
     ),
     (
+        "8b_whitespace_only_host",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/rw",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "   "}},
+            },
+        ],
+        None,
+        "no compute endpoint",
+    ),
+    (
+        "8c_padded_host",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/rw",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "  rw.example  "}},
+            },
+        ],
+        ("rw.example", "projects/p/branches/b/endpoints/rw"),
+        None,
+    ),
+    (
         "9_unspecified_endpoint_type_with_host",
         [
             {
