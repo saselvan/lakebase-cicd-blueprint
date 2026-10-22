@@ -15,3 +15,19 @@ output "logical_database" {
   value       = var.logical_database
 }
 
+output "project_id" {
+  description = "Lakebase Autoscaling project id (from var.project_id)."
+  value       = var.project_id
+}
+
+output "branch" {
+  description = "Full branch resource path the synced table lives on (from var.branch)."
+  value       = var.branch
+}
+
+output "databricks_profile" {
+  description = "Databricks CLI profile used by the provider (from var.databricks_profile)."
+  value       = var.databricks_profile
+}
+
+

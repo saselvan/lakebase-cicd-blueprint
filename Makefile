@@ -27,4 +27,4 @@ deploy: ## Run the pipeline: terraform apply -> per table wait-for-ONLINE -> liq
 
 branch: ## Ephemeral branch test: make branch PROJECT=<id> NAME=pr-123
 	@test -n "$(PROJECT)" || { echo "set PROJECT=<project-id> (and optionally NAME=<branch>)"; exit 1; }
-	./scripts/branch_test.sh $(PROJECT) $(or $(NAME),pr-test)
+	./scripts/branch_test.sh $(PROJECT) $(or $(NAME),pr-test) $(or $(PROFILE),DEFAULT)
