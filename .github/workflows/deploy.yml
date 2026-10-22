@@ -18,6 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.16.2"
+          terraform_wrapper: false
       - uses: liquibase/setup-liquibase@v1
         with: { version: "4.33.0", edition: "oss" }
       - name: Install Databricks CLI
@@ -25,4 +28,5 @@ jobs:
       - name: Deploy (terraform apply -> wait sync -> liquibase update)
         run: ./scripts/deploy.sh
         env:
-          PROFILE: DEFAULT   # CLI reads DATABRICKS_* env for auth
+          PROFILE: ""   # empty => omit -p; CLI uses DATABRICKS_* env auth
+          PGUSER: ${{ secrets.DATABRICKS_CLIENT_ID }}

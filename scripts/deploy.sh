@@ -93,7 +93,7 @@ if [ -n "$USER_SET_BRANCH" ] && [ -n "$TF_BRANCH" ] && [ "$TF_BRANCH" != "projec
     "$BRANCH" "$TF_BRANCH" >&2
   exit 1
 fi
-if [ -n "$USER_SET_PROFILE" ] && [ -n "$TF_PROFILE" ] && [ "$TF_PROFILE" != "$PROFILE" ]; then
+if [ -n "$USER_SET_PROFILE" ] && [ "$TF_PROFILE" != "$PROFILE" ]; then
   printf 'target mismatch: env PROFILE=%q conflicts with Terraform resolved databricks_profile=%q\n' \
     "$PROFILE" "$TF_PROFILE" >&2
   exit 1
