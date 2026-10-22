@@ -234,7 +234,11 @@ def test_changesets_are_idempotent_and_runalways(tmp_path):
         assert "runAlways:true" in c["attrs"], f"index changeset {c['id']} must be runAlways"
 
     assert "IF NOT EXISTS" in cs["001-app-role"]["body"] and "CREATE ROLE" in cs["001-app-role"]["body"]
+    assert "DROP VIEW IF EXISTS" in cs["004-app-view"]["body"], (
+        f"004-app-view must DROP VIEW IF EXISTS before CREATE so column changes succeed:\n{cs['004-app-view']['body']}"
+    )
     assert "CREATE OR REPLACE VIEW" in cs["004-app-view"]["body"]
+    assert cs["004-app-view"]["body"].index("DROP VIEW IF EXISTS") < cs["004-app-view"]["body"].index("CREATE OR REPLACE VIEW")
     assert "CREATE INDEX IF NOT EXISTS" in m["text"]
 
 

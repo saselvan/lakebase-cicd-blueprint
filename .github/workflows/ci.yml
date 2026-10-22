@@ -153,3 +153,6 @@ jobs:
 
       - name: Proof — deploy verify step exits non-zero on a missing grant or index
         run: bash scripts/tests/docker_verify_step.sh
+
+      - name: Proof — consumer view survives base-table column changes atomically on both paths
+        run: bash liquibase/tests/docker_view_column_change_proof.sh

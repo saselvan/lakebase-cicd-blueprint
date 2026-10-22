@@ -40,6 +40,7 @@ CREATE INDEX IF NOT EXISTS idx_members_plan_code ON cicd_proj.members (plan_code
 --changeset cicd:004-app-view runAlways:true
 -- No-superuser consumer pattern: the deploy identity owns this view over the synced
 -- table and grants consumers SELECT on the VIEW. runAlways so it survives a replace.
+DROP VIEW IF EXISTS cicd_proj.members_v;
 CREATE OR REPLACE VIEW cicd_proj.members_v AS
   SELECT * FROM cicd_proj.members;
 GRANT USAGE  ON SCHEMA cicd_proj                 TO members_app_ro;

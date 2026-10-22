@@ -938,13 +938,80 @@ def test_apply_threads_branch_into_conninfo(monkeypatch):
         def cursor(self):
             return _Cur()
 
-    fake_psycopg.connect = lambda conninfo, autocommit=False: _Conn()
+    def fake_connect(conninfo, autocommit=False):
+        captured["autocommit"] = autocommit
+        return _Conn()
+
+    fake_psycopg.connect = fake_connect
     monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
 
     mj.apply_sql_to_lakebase("SELECT 1;", branch="projects/p/branches/b")
 
     assert captured["branch"] == "projects/p/branches/b", "branch not threaded into the conninfo builder"
     assert captured["sql"] == "SELECT 1;"
+    assert captured["autocommit"] is False, (
+        f"apply_sql_to_lakebase must run inside a single transaction (autocommit=False), "
+        f"got autocommit={captured['autocommit']!r}; autocommit=True leaves a missing/ungranted-view "
+        f"window between DROP VIEW and CREATE VIEW + GRANT SELECT"
+    )
+
+
+def test_apply_sql_to_lakebase_runs_in_single_transaction_not_autocommit(monkeypatch):
+    """Attacker 4 & 5: `apply_sql_to_lakebase` must connect with `autocommit=False` so `DROP VIEW IF EXISTS`,
+    `CREATE OR REPLACE VIEW`, and `GRANT SELECT` execute inside ONE transaction and roll back atomically
+    if any statement fails halfway.
+
+    MUTATION GATE: pass `autocommit=True` in `apply_sql_to_lakebase` (or split statements into separate
+    autocommitted executions) and this test goes RED.
+    """
+    monkeypatch.setattr(
+        mj,
+        "_lakebase_conninfo",
+        lambda **kw: "host=x port=5432 dbname=d user=u password=p sslmode=require",
+    )
+
+    events: list[tuple[str, object]] = []
+    fake_psycopg = types.ModuleType("psycopg")
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql):
+            events.append(("execute", sql))
+
+    class _Conn:
+        def __init__(self, autocommit: bool):
+            self.autocommit = autocommit
+
+        def __enter__(self):
+            events.append(("enter_tx", self.autocommit))
+            return self
+
+        def __exit__(self, exc_type, *a):
+            events.append(("rollback" if exc_type else "commit", self.autocommit))
+            return False
+
+        def cursor(self):
+            return _Cur()
+
+    fake_psycopg.connect = lambda conninfo, autocommit=False: _Conn(autocommit)
+    monkeypatch.setitem(sys.modules, "psycopg", fake_psycopg)
+
+    ddl = mj.render_migration_sql(config_path=RENDER_FIXTURE)
+    mj.apply_sql_to_lakebase(ddl, branch="projects/p/branches/b")
+
+    assert events[0] == ("enter_tx", False), (
+        f"apply_sql_to_lakebase must open a non-autocommit transaction (autocommit=False): {events}"
+    )
+    exec_calls = [payload for kind, payload in events if kind == "execute"]
+    assert len(exec_calls) == 1 and "DROP VIEW IF EXISTS" in str(exec_calls[0]) and "GRANT SELECT" in str(exec_calls[0]), (
+        f"DROP VIEW, CREATE VIEW, and GRANT SELECT must execute in one multi-statement call inside the transaction: {exec_calls}"
+    )
+    assert events[-1] == ("commit", False), f"transaction must commit at exit: {events}"
 
 
 def test_apply_threads_database_into_conninfo(monkeypatch):

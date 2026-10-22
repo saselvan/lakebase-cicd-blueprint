@@ -281,8 +281,16 @@ def validate_view_names_unique(tables: list[dict]) -> None:
 def view_statements(app_schema: str, app_role: str, synced_table: str, view_name: str) -> list[str]:
     """Consumer view + grant — the no-superuser access path. The managed writer role owns the
     synced base table; the deploy identity holds SELECT on that base table and OWNS this view over
-    it, so it can grant consumers SELECT on the VIEW. CREATE OR REPLACE so the view self-heals after
-    a synced-table replace.
+    it, so it can grant consumers SELECT on the VIEW.
+
+    Emits `DROP VIEW IF EXISTS` before `CREATE OR REPLACE VIEW` and re-grants `SELECT` on the view.
+    Why: Postgres `CREATE OR REPLACE VIEW ... SELECT *` expands to the base table's columns at
+    creation time and refuses to drop, rename, reorder, or mid-insert columns (`cannot drop columns
+    from view` / `cannot change name of view column`). Dropping and recreating the view + re-granting
+    `SELECT` inside one transaction (one changeset on the Liquibase path; `autocommit=False` on the
+    DABs path) makes any base-table column change succeed with zero missing-view or ungranted-view
+    window for concurrent readers, while keeping the view in place between deploys so the replace
+    dependency interlock still blocks an uncoordinated `DROP TABLE`.
 
     `view_name` is the ALREADY-RESOLVED, already-validated consumer-view name (from
     `resolve_view_name`: the config override or the derived ``<tbl>_v``). Passing it in keeps ONE
@@ -293,6 +301,7 @@ def view_statements(app_schema: str, app_role: str, synced_table: str, view_name
     is an independent unit, so it self-contains its schema grant). In this single linear render it
     repeats the USAGE grant emitted by `grant_statements`, which is harmless — GRANT is idempotent."""
     return [
+        f"DROP VIEW IF EXISTS {app_schema}.{view_name}",
         f"CREATE OR REPLACE VIEW {app_schema}.{view_name} AS\n  SELECT * FROM {app_schema}.{synced_table}",
         f"GRANT USAGE  ON SCHEMA {app_schema}                 TO {app_role}",
         f"GRANT SELECT ON {app_schema}.{view_name}                TO {app_role}",

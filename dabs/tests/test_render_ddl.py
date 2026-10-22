@@ -145,17 +145,55 @@ def test_zero_index_table_emits_no_index():
 
 
 def test_render_emits_consumer_view_per_table():
-    """A `CREATE OR REPLACE VIEW <schema>.<tbl>_v` + a grant on the view, per table."""
+    """A `DROP VIEW IF EXISTS <schema>.<tbl>_v` followed by `CREATE OR REPLACE VIEW <schema>.<tbl>_v`
+    + a grant on the view, per table, so a base-table column drop, rename, reorder, or mid-insert
+    never breaks the deploy with `cannot drop columns from view` or `cannot change name of view column`.
+
+    MUTATION GATE: drop `DROP VIEW IF EXISTS` or drop the `GRANT SELECT` on the view and this goes RED.
+    """
     sql = _render()
     for row in _fixture_rows():
         schema, role = row["app_schema"], row["app_role"]
         tbl = row["synced_table_id"].split(".")[-1]
-        assert f"CREATE OR REPLACE VIEW {schema}.{tbl}_v" in sql, (
+        drop_stmt = f"DROP VIEW IF EXISTS {schema}.{tbl}_v;"
+        create_stmt = f"CREATE OR REPLACE VIEW {schema}.{tbl}_v"
+        assert drop_stmt in sql, (
+            f"missing DROP VIEW IF EXISTS before CREATE VIEW for {row['name']} (column-change safety):\n{sql}"
+        )
+        assert create_stmt in sql, (
             f"missing consumer view for {row['name']}:\n{sql}"
+        )
+        assert sql.index(drop_stmt) < sql.index(create_stmt), (
+            f"DROP VIEW IF EXISTS must precede CREATE OR REPLACE VIEW for {row['name']}:\n{sql}"
         )
         assert re.search(rf"GRANT SELECT ON {schema}\.{tbl}_v\s+TO {role}", sql), (
             f"missing GRANT SELECT on the view for {row['name']}:\n{sql}"
         )
+        grant_match = re.search(rf"GRANT SELECT ON {schema}\.{tbl}_v\s+TO {role}", sql)
+        assert grant_match and sql.index(create_stmt) < grant_match.start(), (
+            f"GRANT SELECT must follow CREATE OR REPLACE VIEW for {row['name']}:\n{sql}"
+        )
+
+
+def test_view_statements_drops_before_create_and_regrants():
+    """`view_statements` must emit `DROP VIEW IF EXISTS <schema>.<view>` before `CREATE OR REPLACE VIEW`
+    and then re-grant `USAGE ON SCHEMA` and `SELECT ON <schema>.<view>`.
+
+    Why: `CREATE OR REPLACE VIEW ... SELECT *` fails in Postgres when the underlying table drops,
+    renames, reorders, or mid-inserts a column. Dropping and recreating inside one transaction (and
+    re-granting `SELECT`, since `DROP VIEW` drops grants on the view) makes column changes safe.
+
+    MUTATION GATE: remove `DROP VIEW IF EXISTS` or the `GRANT SELECT` and this goes RED.
+    """
+    stmts = rd.view_statements("shared_schema", "claims_reader_ro", "claims_synced", "claims_synced_v")
+    assert stmts[0] == "DROP VIEW IF EXISTS shared_schema.claims_synced_v", stmts
+    assert stmts[1].startswith("CREATE OR REPLACE VIEW shared_schema.claims_synced_v AS"), stmts
+    assert any(
+        re.search(r"GRANT USAGE\s+ON SCHEMA shared_schema\s+TO claims_reader_ro", s) for s in stmts[2:]
+    ), stmts
+    assert any(
+        re.search(r"GRANT SELECT ON shared_schema\.claims_synced_v\s+TO claims_reader_ro", s) for s in stmts[2:]
+    ), stmts
 
 
 # --- 3. re-runnable shape + determinism --------------------------------------------------------

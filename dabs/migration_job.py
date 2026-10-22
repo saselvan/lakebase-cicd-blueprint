@@ -440,7 +440,7 @@ def apply_sql_to_lakebase(
         if database is None
         else _lakebase_conninfo(branch=branch, database=database)
     )
-    with psycopg.connect(conninfo, autocommit=True) as conn:
+    with psycopg.connect(conninfo, autocommit=False) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
 
