@@ -669,7 +669,7 @@ This repository does not include third-party code; it uses these tools, which yo
 
 | library | description | license | source |
 |---|---|---|---|
-| Databricks CLI 1.19.0 | Bundle validation/deploy and Lakebase CLI | Apache-2.0 | https://github.com/databricks/cli |
+| Databricks CLI 1.19.0 | Bundle validation/deploy and Lakebase CLI | Databricks License | https://github.com/databricks/cli |
 | Liquibase 4.33.0 | Postgres changelogs (Terraform path) | Apache-2.0 (5.0 and later: FSL-1.1-ALv2; stay on 4.x) | https://github.com/liquibase/liquibase |
 | Terraform 1.16.2 | Terraform path | BUSL-1.1 (1.6 and later) | https://github.com/hashicorp/terraform |
 | Databricks Terraform provider 1.132.0 | Terraform path | Apache-2.0 | https://github.com/databricks/terraform-provider-databricks |
