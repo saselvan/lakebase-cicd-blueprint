@@ -513,7 +513,10 @@ def _check_ci_gitleaks_step(ci_path: Path) -> None:
     assert statements, f"{ci_path.name} gitleaks step `run:` is empty"
 
     for stmt in statements:
-        assert not re.search(r"(?:^|[;\s])set\s+\+(?:e|o\s+errexit)\b", stmt), (
+        # Any `+` flag group holding `e` (`+e`, `+eu`, `+xe`, `+x +e`) or `+o errexit` turns errexit off.
+        assert not re.search(
+            r"(?:^|[;\s])set\b[^;|&\n]*?\s(?:\+[A-Za-z]*e[A-Za-z]*\b|\+o\s+errexit\b)", stmt
+        ), (
             f"{ci_path.name} gitleaks step must not use `set +e` / `set +o errexit`: {stmt!r}"
         )
         assert "||" not in stmt, (
@@ -848,6 +851,23 @@ _GITLEAKS_HOSTILE_MUTATIONS: list[tuple[str, Callable[[str], str], str]] = [
         ),
         r"set \+e",
     ),
+    *[
+        (
+            f"5b_{case_id}",
+            (lambda flags: lambda t: t.replace(
+                '          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"',
+                f'          set {flags}\n          archive="gitleaks_${{GITLEAKS_VERSION}}_linux_x64.tar.gz"',
+                1,
+            ))(flags),
+            r"set \+e",
+        )
+        for case_id, flags in [
+            ("set_plus_eu", "+eu"),
+            ("set_plus_xe", "+xe"),
+            ("set_plus_x_plus_e", "+x +e"),
+            ("set_minus_x_plus_o_errexit", "-x +o errexit"),
+        ]
+    ],
     (
         "5c_step_continue_on_error",
         lambda t: t.replace(
