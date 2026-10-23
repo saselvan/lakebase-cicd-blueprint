@@ -291,3 +291,109 @@ def test_readme_make_targets_match_makefile_help():
     assert "demo Delta source table " not in docs["README.md"], "D11: README must use plural demo Delta source tables"
     assert "demo Delta source table " not in docs["RUNBOOK.md"], "D11: RUNBOOK must use plural demo Delta source tables"
 
+
+# --- Ticket 10: Publish disclosures, Beta at first mention, and version parity ------------------
+
+
+def _extract_heading_section(text: str, heading: str) -> str:
+    """Extract the markdown body under `heading` up to the next heading of the same or higher level."""
+    import re
+
+    assert heading in text, f"README missing required heading: {heading!r}"
+    level = len(heading.split(" ", 1)[0])
+    rest = text.split(heading, 1)[1]
+    pattern = re.compile(rf"\n#{{1,{level}}}\s")
+    m = pattern.search(rest)
+    return rest if m is None else rest[: m.start()]
+
+
+def test_readme_beta_label_at_first_dabs_lakebase_mention():
+    """M9: The first mention of DABs Lakebase resources in README.md ('Recommended path:
+    Declarative Automation Bundles (DABs)') must label `postgres_synced_tables` / `postgres_synced_table`
+    as Beta with the bundle-resources docs link and date checked (2026-10-22), before the reader
+    copies the quickstart snippet."""
+    docs = _load_doc_texts()
+    readme = docs["README.md"]
+    # Isolate the intro of '## Recommended path: Declarative Automation Bundles (DABs)' BEFORE the first code block
+    dabs_intro = readme.split("## Recommended path: Declarative Automation Bundles (DABs)", 1)[1].split("```", 1)[0]
+    assert "Beta" in dabs_intro, (
+        "M9: First mention of DABs Lakebase resources (before the first snippet) must carry a Beta label"
+    )
+    assert "https://docs.databricks.com/aws/en/dev-tools/bundles/resources" in dabs_intro, (
+        "M9: First mention of DABs Lakebase resources must link to bundle resources docs"
+    )
+    assert "2026-10-22" in dabs_intro, (
+        "M9: First mention of DABs Lakebase resources must include the date checked (2026-10-22)"
+    )
+
+
+def test_readme_has_tested_on_and_tested_vs_not_tested_sections_matching_ci():
+    """M3, M8, M10, M12: README.md must have `### Tested on` and `### Tested vs not tested`
+    sections under `## Key findings`, with tool versions dynamically verified against
+    `.github/workflows/ci.yml` and `dabs/requirements-dev.txt` (hostile check: parses actual CI
+    workflow pins so a version drift between README and CI turns this test red)."""
+    import re
+
+    docs = _load_doc_texts()
+    readme = docs["README.md"]
+    ci_yml = docs[".github/workflows/ci.yml"]
+    req_dev = (REPO / "dabs" / "requirements-dev.txt").read_text()
+
+    tested_on = _extract_heading_section(readme, "### Tested on")
+    tested_vs = _extract_heading_section(readme, "### Tested vs not tested")
+
+    # Hostile dynamic extraction from .github/workflows/ci.yml and dabs/requirements-dev.txt
+    tf_ver = re.search(r'terraform_version:\s*"([^"]+)"', ci_yml).group(1)
+    cli_ver = re.search(r'databricks/setup-cli@[^\n]+\n\s+with:\n\s+version:\s*"([^"]+)"', ci_yml).group(1)
+    lb_ver = re.search(r'liquibase/setup-liquibase@[^\n]+\n\s+with:\n\s+version:\s*"([^"]+)"', ci_yml).group(1)
+    gitleaks_ver = re.search(r'GITLEAKS_VERSION:\s*"([^"]+)"', ci_yml).group(1)
+    py_ver = re.search(r'python-version:\s*"([^"]+)"', ci_yml).group(1)
+    pyyaml_ver = re.search(r"pyyaml==([0-9.]+)", req_dev).group(1)
+    pytest_ver = re.search(r"pytest==([0-9.]+)", req_dev).group(1)
+
+    expected_pins = {
+        "Terraform": tf_ver,
+        "Databricks CLI": cli_ver,
+        "Liquibase": lb_ver,
+        "gitleaks": gitleaks_ver,
+        "Python": py_ver,
+        "PyYAML": pyyaml_ver,
+        "pytest": pytest_ver,
+        "PostgreSQL": "16.15",
+        "databricks-sdk": "0.102.0",
+        "psycopg": "3.3.3",
+        "provider": "1.132.0",
+    }
+    missing_pins = {
+        name: ver for name, ver in expected_pins.items() if ver not in tested_on
+    }
+    assert not missing_pins, (
+        f"M8: '### Tested on' in README.md is missing or out of sync with CI/repo versions: {missing_pins}"
+    )
+
+    # M3: CU and cost / connection-drop disclosure must appear in Tested on or Prerequisites
+    assert ("1–8 CU" in tested_on or "1-8 CU" in tested_on) and "3600s" in tested_on, (
+        "M3: '### Tested on' must disclose the 1-8 CU autoscaling child-branch configuration and 3600s TTL"
+    )
+    assert "restarts compute and drops open connections" in readme or "restarts the compute and drops open connections" in readme, (
+        "M3: README.md must warn that changing an endpoint's CU ceiling restarts compute and drops open connections"
+    )
+
+    # M10 & M12: Tested vs not tested must explicitly cover live Lakebase, Docker PG16 + offline, and not-tested items
+    lower_vs = tested_vs.lower()
+    for required_phrase in (
+        "tested live on lakebase",
+        "tested in docker postgresql 16",
+        "not tested live end to end",
+        "github actions",
+        "oidc",
+        "blue/green",
+        "prevent_destroy",
+        "existing_pipeline_id",
+        "second person",
+    ):
+        assert required_phrase in lower_vs, (
+            f"M10/M12: '### Tested vs not tested' missing required disclosure phrase: {required_phrase!r}"
+        )
+
+

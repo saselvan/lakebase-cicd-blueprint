@@ -19,7 +19,10 @@ already standardized on Terraform. Both produce the same database objects from t
 ## Recommended path: Declarative Automation Bundles (DABs)
 
 Declarative Automation Bundles (DABs; formerly Databricks Asset Bundles,
-[docs](https://docs.databricks.com/aws/en/dev-tools/bundles/)) support Lakebase resources directly. That keeps the whole pipeline
+[docs](https://docs.databricks.com/aws/en/dev-tools/bundles/)) support Lakebase resources directly
+via the `postgres_synced_tables` (`postgres_synced_table`) bundle resource (**Beta** —
+[bundle resources](https://docs.databricks.com/aws/en/dev-tools/bundles/resources), checked
+2026-10-22). That keeps the whole pipeline
 on one platform, with fewer outside tools. This is the path a Databricks-first team should start
 from.
 
@@ -328,7 +331,9 @@ identity out of it and checks that on every prod run (`verify_identity_policy`, 
   synced table (`cannot have both row/column security and online materialized views`), and one added
   later makes the next refresh fail while Postgres keeps the old, unmasked rows.
 - **De-identified view sources sync in Snapshot mode.** Check the Automatic change data feed docs
-  before relying on Triggered or Continuous. Snapshot reloads the whole table on every sync.
+  ([sync-tables docs](https://docs.databricks.com/aws/en/oltp/projects/sync-tables), checked
+  2026-10-22) before relying on Triggered or Continuous. Snapshot reloads the whole table on every
+  sync.
 - **Select only the columns the app needs in the consumer view.** The view is where minimum necessary
   is enforced, and it is the only place to limit rows: row-level security needs the table owner, and
   the managed writer role owns the synced table.
@@ -374,8 +379,10 @@ replace** behaves differently from an **in-place sync-mode change**:
 
 Prefer this path if you are multi-cloud or already standardized on Terraform. Terraform provisions
 the synced table, GitHub Actions orchestrates the sequence, and Liquibase applies the database
-objects. It is built on the Lakebase Autoscaling projects model (`databricks_postgres_*`), which is
-the model to build on.
+objects. It is built on the Lakebase Autoscaling projects model (`databricks_postgres_*` Terraform
+resources and `databricks postgres` CLI;
+[sync-tables docs](https://docs.databricks.com/aws/en/oltp/projects/sync-tables), checked
+2026-10-22), which is the model to build on.
 
 ![CI/CD pipeline: git push then terraform apply then wait for sync then liquibase update then verify](docs/pipeline.customer.light.png)
 
@@ -558,6 +565,23 @@ through Liquibase 4.33.0 and the DABs renderer also run against Docker PostgreSQ
 - Copy-on-write branches isolate risk. A destructive migration on an ephemeral branch, such as
   dropping an index, leaves the production copy untouched.
 
+### Tested on
+
+Verified `2026-10-14` through `2026-10-23`:
+
+- **Lakebase Autoscaling PostgreSQL `16.15`** (live tests ran on child branches configured at `1–8 CU` autoscaling with a short TTL of `3600s`; the DABs serverless migration job runs on Databricks serverless Python compute). Note on CU sizing and connection pools: changing an endpoint's CU ceiling restarts compute and drops open connections (`FATAL: terminating connection due to administrator command`, verified live), so set CU limits before traffic and ensure app connection pools reconnect.
+- **Databricks CLI `1.19.0`** (live runs and pinned across `.github/workflows/*.yml`; also verified with `1.17.0`, minimum enforced `>= 1.5.0` by `dabs/scripts/offline_validate.sh`).
+- **`databricks-sdk` `0.102.0`** (`Python` `3.11`, `psycopg[binary]` `3.3.3`, `PyYAML` `6.0.2`, `pytest` `9.1.1`).
+- **Terraform `1.16.2`** and **`databricks/databricks` Terraform provider `1.132.0`** (pinned in `terraform/.terraform.lock.hcl` and `.github/workflows/*.yml`).
+- **Liquibase Community `4.33.0`** (pinned in `.github/workflows/*.yml` and Docker PostgreSQL 16 proofs).
+- **`gitleaks` `8.30.1`** (pinned with SHA-256 in `.github/workflows/ci.yml`).
+
+### Tested vs not tested
+
+- **Tested live on Lakebase (`1–8 CU` child branches, 2026-10-14 to 2026-10-23):** 1-table end-to-end deploy and primary-key replace as a non-superuser deploy service principal on both the DABs path and the Terraform + Liquibase path; identity policy guard pass and fail (`databricks_superuser` rejection); 2-table `verify` (`16/16` checks) and all 6 base-table grant routes (direct, column, `PUBLIC`, inherited role, `NOINHERIT` role, `DELETE`); drift `REVOKE` and re-reconcile; `python -m dabs.render_ddl --config config/tables.json | psql "$LAKEBASE_CONNINFO"` and `examples/read_via_view.py`.
+- **Tested in Docker PostgreSQL 16 + offline test suite (on every run):** 2 shared-schema tables with `view_name` override (`docker_multitable_proof.sh`), `runAlways` view body edit (`docker_view_edit_proof.sh`), atomic consumer view rebuild across column drop/rename/reorder with a concurrent reader loop (`docker_view_column_change_proof.sh`), double-apply idempotency and missing-role refusal with/without `CREATEROLE` (`docker_double_apply_proof.sh`), verify post-conditions (`docker_verify_step.sh`), and 350+ offline unit/workflow/parity tests.
+- **Not tested live end to end:** Running `.github/workflows/deploy.yml` or `pr-validate.yml` on a GitHub Actions runner against a live workspace; GitHub Actions OIDC workload identity federation; an end-to-end blue/green sync-mode swap on a live table; `lifecycle.prevent_destroy` or `existing_pipeline_id` bundle options; per-consumer-group `WHERE` views; and a fresh from-zero run by a second person outside the author's workspace.
+
 ---
 
 ## Repo layout
@@ -586,7 +610,7 @@ runs the no-cloud checks. Stuck? See `docs/TROUBLESHOOTING.md`.
 
 Shared:
 
-- A Databricks workspace with a Lakebase Autoscaling project and a `production` branch.
+- A Databricks workspace with a Lakebase Autoscaling project and a `production` branch (live tests in this repo ran on Lakebase child branches configured at `1–8 CU` autoscaling with a `3600s` TTL; note that changing an endpoint's CU ceiling restarts compute and drops open connections).
 - Databricks CLI, authenticated to your workspace (a named CLI profile).
 - A SQL warehouse (for seeding the demo Delta source tables) and an existing UC (Unity Catalog) catalog
   and schema.
