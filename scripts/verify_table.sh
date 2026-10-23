@@ -63,9 +63,11 @@ _expect_t() {
 
 # verify_table ROLE SCHEMA PG_TABLE VIEW [INDEX_COL ...]
 # Asserts the post-conditions README/RUNBOOK step 4 promises, and RETURNS NON-ZERO if any fails:
-#   (c) the app role exists and the consumer view exists,
+#   (c) the app role exists, the consumer view exists, and the view does not have security_invoker
+#       enabled in pg_class.reloptions,
 #   (a) the app role can SELECT the consumer VIEW (the no-superuser read path),
-#   (d) the app role has USAGE on the schema, and a real read through the view succeeds,
+#   (d) the app role has USAGE on the schema, and a real read through the view succeeds (as the
+#       deploy identity, which owns the view),
 #   (e) the app role is DENIED on the base synced table by every route (table, column, PUBLIC,
 #       inherited, and NOINHERIT role grants, for read and write privileges alike), and
 #   (b) every expected index idx_<pg_table>_<col> exists.

@@ -53,11 +53,12 @@ asks `terraform console`, which follows Terraform's variable precedence: `variab
    grant `SELECT` on the view. A distinct changelog file per table gives each changeset a distinct
    identity, so shared-schema tables never collide in `DATABASECHANGELOG`. Reruns reapply the
    `runAlways` changesets.
-4. verify (`scripts/verify_table.sh`) — asserts the role and view exist, the app role has `SELECT`
-   on the view and `USAGE` on the schema, a real read through the view works, the app role is denied
-   on the base synced table by every route, and every `idx_<table>_<col>` exists; exits non-zero
-   (failing the deploy) if not. Shares the check list in `dabs/checks.py` and is tested against a
-   real Docker Postgres.
+4. verify (`scripts/verify_table.sh`) — asserts the role and view exist, the consumer view does not
+   have `security_invoker` enabled in `pg_class.reloptions`, the app role has `SELECT`
+   on the view and `USAGE` on the schema, a real read through the view works (as the deploy
+   identity), the app role is denied on the base synced table by every route, and every
+   `idx_<table>_<col>` exists; exits non-zero (failing the deploy) if not. Shares the check list in
+   `dabs/checks.py` and is tested against a real Docker Postgres.
 
 ## The PR flow (branching)
 
@@ -145,7 +146,7 @@ deploy still fails on that table's index changeset.
 4. Run `deploy.sh` as the new SP (`PGUSER=<new-sp application id>`, profile/tfvars for the new SP).
    Observed live with one table: `Resources: 1 added`, ONLINE in about 30 s, Liquibase
    `Previously run: 1` (the changelog history carried over), verify (5/5 checks in that 2026-10-14
-   run; verify now runs 8 checks per table). With N tables, expect `Resources: N added`.
+   run; verify now runs 9 checks per table). With N tables, expect `Resources: N added`.
 
 ## Project facts
 

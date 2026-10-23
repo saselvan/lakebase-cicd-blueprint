@@ -2,7 +2,7 @@
 # Docker postgres:16 DOUBLE-APPLY proof for the DABs renderer.
 #
 # The renderer (dabs/render_ddl.py) emits NO migration-version table: every statement is idempotent
-# (guarded CREATE ROLE, idempotent GRANT, CREATE INDEX IF NOT EXISTS, CREATE OR REPLACE VIEW), so
+# (pg_roles existence check, idempotent GRANT, CREATE INDEX IF NOT EXISTS, CREATE OR REPLACE VIEW), so
 # applying the rendered DDL a second time is a clean reconciling no-op with nothing to roll back.
 # This proves that against a real Postgres. (Why a version-tracking variant was dropped:
 # docs/adr/0006-dabs-variant-mechanics.md.)

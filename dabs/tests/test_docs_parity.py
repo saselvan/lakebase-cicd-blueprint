@@ -194,12 +194,43 @@ def test_troubleshooting_does_not_make_false_ownership_or_seed_claims():
 
 
 def test_readme_and_design_notes_warn_against_security_invoker():
-    """Trap 9: Both README.md and docs/DESIGN-NOTES.md must explicitly warn not to set
-    security_invoker on the consumer view."""
+    """Trap 9 & Ticket 12 (Attacker 6):
+    1. Both README.md and docs/DESIGN-NOTES.md must explicitly warn not to set security_invoker on
+       the consumer view, and must state that `verify` checks `pg_class.reloptions` to confirm the
+       consumer view does not have `security_invoker` enabled (while the real-read check runs as
+       the deploy identity).
+    2. Neither doc may falsely claim that `verify`'s real-read check catches `security_invoker` or
+       runs as the app role.
+    3. `dabs/tests/docker_double_apply_proof.sh` must describe the role statement as a `pg_roles
+       existence check`, never `guarded CREATE ROLE`."""
     docs = _load_doc_texts()
     for rel in ("README.md", "docs/DESIGN-NOTES.md"):
-        text = docs[rel].lower()
-        assert "security_invoker" in text, f"Trap 9: {rel} must warn against setting security_invoker on the consumer view"
+        text = docs[rel]
+        lower = text.lower()
+        assert "security_invoker" in lower, (
+            f"Trap 9: {rel} must warn against setting security_invoker on the consumer view"
+        )
+        assert "real-read check catches this" not in lower, (
+            f"Ticket 12: {rel} falsely claims verify's real-read check catches security_invoker"
+        )
+        assert "reloptions" in lower, (
+            f"Ticket 12: {rel} must state that verify checks pg_class.reloptions for security_invoker"
+        )
+    # Also check the stale comment in dabs/tests/docker_double_apply_proof.sh
+    double_apply_sh = (REPO / "dabs" / "tests" / "docker_double_apply_proof.sh").read_text()
+    assert "guarded CREATE ROLE" not in double_apply_sh, (
+        "Ticket 12: docker_double_apply_proof.sh still says 'guarded CREATE ROLE'"
+    )
+    assert "pg_roles existence check" in double_apply_sh, (
+        "Ticket 12: docker_double_apply_proof.sh must say 'pg_roles existence check'"
+    )
+    # Check current verify check count in docs where current count is stated
+    assert "verify now runs 9 checks per table" in docs["RUNBOOK.md"], (
+        "Ticket 12: RUNBOOK.md must state verify now runs 9 checks per table"
+    )
+    assert "verify now runs 9 checks per table" in docs["docs/DESIGN-NOTES.md"], (
+        "Ticket 12: docs/DESIGN-NOTES.md must state verify now runs 9 checks per table"
+    )
 
 
 def test_role_guard_sql_described_as_existence_check_not_create_role():

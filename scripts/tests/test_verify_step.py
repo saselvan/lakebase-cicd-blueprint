@@ -35,6 +35,7 @@ _STUB_PSQL = r"""#!/usr/bin/env bash
 sql="${@: -1}"
 case "$sql" in
   *NOT\ has_any_column_privilege*) printf '%s\n' "${STUB_BASE_DENIED-t}" ;;
+  *reloptions*)           printf '%s\n' "${STUB_NO_SECURITY_INVOKER-t}" ;;
   *pg_roles*)             printf '%s\n' "${STUB_ROLE_EXISTS-t}" ;;
   *pg_views*)             printf '%s\n' "${STUB_VIEW_EXISTS-t}" ;;
   *has_table_privilege*)  printf '%s\n' "${STUB_CAN_SELECT-t}" ;;
@@ -217,6 +218,17 @@ def test_base_table_grant_exits_nonzero(tmp_path):
     r = _run_verify(tmp_path, {"STUB_BASE_DENIED": "f"}, _OK_ARGS)
     assert r.returncode != 0, r.stdout + r.stderr
     assert "FAIL role members_app_ro is denied on synced table cicd_proj.members" in r.stdout
+
+
+def test_security_invoker_enabled_exits_nonzero(tmp_path):
+    # Attacker 1: consumer view has security_invoker enabled in pg_class.reloptions, while every
+    # other check (including the deploy identity's own real-read check) returns 't'.
+    # verify_table.sh must run the security_invoker check from dabs/checks.py and exit non-zero.
+    r = _run_verify(tmp_path, {"STUB_NO_SECURITY_INVOKER": "f"}, _OK_ARGS)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert (
+        "FAIL consumer view cicd_proj.members_v does not have security_invoker enabled" in r.stdout
+    ), r.stdout + r.stderr
 
 
 def test_verify_table_fails_closed_when_checks_cli_errors_or_prints_zero_checks(tmp_path):

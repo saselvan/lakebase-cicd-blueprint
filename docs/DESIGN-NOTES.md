@@ -6,7 +6,8 @@ Databricks CLI v1.17.0 / v1.19.0, Terraform v1.16.2, Databricks Terraform provid
 Liquibase 4.33.0): live on Lakebase, one 3-row synced table (`members`) was exercised end to end
 through both the DABs path (2026-10-15) and the Terraform + Liquibase path (2026-10-14) as a
 non-superuser deploy service principal, and two tables (`members` and `providers` in one shared
-schema, 16/16 verify checks) were verified live on a Lakebase child branch (`1-8 CU`, 2026-10-19).
+schema, 16/16 verify checks in that 2026-10-19 run; `verify` now runs 9 checks per table / 18
+across the two shipped tables) were verified live on a Lakebase child branch (`1-8 CU`, 2026-10-19).
 Two shared-schema tables with a `view_name` override through Liquibase 4.33.0 and the DABs renderer
 also run in the Docker PostgreSQL 16 proofs (`docker_multitable_proof.sh`,
 `docker_double_apply_proof.sh`, `docker_view_column_change_proof.sh`). Terraform (or the DABs job)
@@ -67,8 +68,10 @@ The supported path needs no superuser — use a consumer view:
    deploy identity, which holds base `SELECT`), so consumers never need base access. **Do not set
    `security_invoker = true` on the consumer view**: this pattern relies on default PostgreSQL view
    behavior (views check the underlying table as the view owner); with `security_invoker = true`,
-   PostgreSQL checks the base synced table as the calling `app_role`, which is denied (`verify`'s
-   real-read check catches this and fails closed).
+   PostgreSQL checks the base synced table as the calling `app_role`, which is denied (while the
+   real-read check runs as the deploy identity, which owns the view and holds base `SELECT`, so
+   `verify` checks `pg_class.reloptions` directly and fails closed if `security_invoker` is enabled
+   on the consumer view).
 
 ```sql
 DROP VIEW IF EXISTS <schema>.<table>_v;
@@ -298,7 +301,7 @@ that class of bug — see [ADR 0006](adr/0006-dabs-variant-mechanics.md) for the
 
 Run on a throwaway branch with a non-superuser deploy SP (no `CREATEROLE`), one 3-row SNAPSHOT table.
 
-- S1, full flow as the deploy SP: PASS. 1 added, ONLINE in about 20 s, Liquibase ran 5, verify (5/5 checks in that 2026-10-14 run; verify now runs 8 checks per table); the SP owns the schema, view and Liquibase tables.
+- S1, full flow as the deploy SP: PASS. 1 added, ONLINE in about 20 s, Liquibase ran 5, verify (5/5 checks in that 2026-10-14 run; verify now runs 9 checks per table); the SP owns the schema, view and Liquibase tables.
 - S2, break and heal: PASS when the deploy SP revokes; the project owner's identical `REVOKE` changed nothing (see RUNBOOK → "Testing drift").
 - S3, second deploy identity: PASS (fails loudly). Another SP and the project owner get `permission denied` / `must be owner`; its deploy fails at Terraform and Liquibase.
 - S4, rotating the deploy SP: `REASSIGN OWNED` alone fails on the index changeset; rebuilding the synced table as the new SP works (see RUNBOOK → "Rotating the deploy service principal").

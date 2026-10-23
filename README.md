@@ -82,7 +82,9 @@ not one-time setup — re-running is a clean no-op, never a version-bookkeeping 
 
 After migrate, a `verify` task checks the result and fails the run, so `bundle run` exits non-zero,
 when any check fails. Per table it checks that the app role exists and can read its consumer view,
-that a real read through the view works, that each index exists, and that the app role is denied on
+that the consumer view does not have `security_invoker` enabled in `pg_class.reloptions`, that a
+real read through the view succeeds (as the deploy identity, which owns the view and holds `SELECT`
+on the base synced table), that each index exists, and that the app role is denied on
 the base synced table by every route: a table grant, a column grant, a grant to `PUBLIC`, or a grant
 on a role it is a member of (including `NOINHERIT` memberships it could `SET ROLE` into). Migrate never revokes anything, so a direct grant an admin added
 stays until someone removes it, and verify fails until then. On serverless, a failed task can run a
@@ -175,7 +177,7 @@ needs write access to that folder, or set `workspace.root_path` in `dabs/databri
 it owns. The live test used a folder in the service principal's home.
 
 A good run prints the guard, then migrate, then verify (live output, one table, renamed to the
-example names):
+example names and updated with the 9th `security_invoker` check):
 
 ```text
 == identity policy guard: 6 check(s) on projects/<project>/branches/<branch> ==
@@ -187,9 +189,10 @@ example names):
   PASS neither current_user nor a role it belongs to has SUPERUSER
   IDENTITY POLICY GUARD OK
 migration applied: all synced tables ONLINE, grants/indexes/view reconciled.
-== verify: 8 check(s) on projects/<project>/branches/<branch> ==
+== verify: 9 check(s) on projects/<project>/branches/<branch> ==
   PASS role members_app_ro exists
   PASS consumer view cicd_proj.members_v exists
+  PASS consumer view cicd_proj.members_v does not have security_invoker enabled
   PASS role members_app_ro can SELECT cicd_proj.members_v
   PASS role members_app_ro has USAGE on schema cicd_proj
   PASS a real read through cicd_proj.members_v succeeds
@@ -266,8 +269,9 @@ Consumers read the view, not the base table — and this is literally enforced: 
 owner, the deploy identity, which holds base `SELECT`). **Do not set `security_invoker = true` on
 the consumer view**: the pattern relies on default PostgreSQL view behavior (views check the
 underlying table as the view owner); with `security_invoker = true`, PostgreSQL checks the base
-synced table as the calling `app_role`, which is denied (`verify`'s real-read check catches this and
-fails closed). Access is granted on an object the deploy
+synced table as the calling `app_role`, which is denied (while a read as the deploy identity still
+succeeds because the deploy identity holds base `SELECT`, so `verify` checks `pg_class.reloptions`
+directly and fails closed if `security_invoker` is enabled on the consumer view). Access is granted on an object the deploy
 identity owns. It never depends on a privilege no user can hold, and no `databricks_superuser` is
 needed. A view needs only `SELECT` on the synced table, which its creator is granted. Granting the table itself to the app would also need the grant option.
 
@@ -408,8 +412,10 @@ The pipeline is four ordered steps, run the same way by hand (`scripts/deploy.sh
 
    A distinct changelog file per table gives each changeset a distinct identity, so two tables that
    share one `app_schema` never collide in a shared `DATABASECHANGELOG`.
-4. Verify. Asserts the app role can `SELECT` the consumer view, is denied on the base synced table
-   by every route, and every expected index exists, and **fails the pipeline** (non-zero exit) if
+4. Verify. Asserts the app role can `SELECT` the consumer view, the consumer view does not have
+   `security_invoker` enabled in `pg_class.reloptions`, a real read through the view succeeds (as
+   the deploy identity), the app role is denied on the base synced table by every route, and every
+   expected index exists, and **fails the pipeline** (non-zero exit) if
    any post-condition is missing. Factored into `scripts/verify_table.sh` (which shares the check
    list in `dabs/checks.py`) so it is independently testable (see `scripts/tests/`).
 
@@ -545,7 +551,8 @@ Exercised on the Autoscaling projects model (PostgreSQL 16, Databricks CLI v1.17
 Terraform v1.16.2, Databricks Terraform provider v1.132.0, Liquibase 4.33.0): live on Lakebase, one
 3-row synced table (`members`) was exercised end to end through both the DABs path (2026-10-15) and
 the Terraform + Liquibase path (2026-10-14) as a non-superuser deploy service principal, and two
-tables (`members` and `providers` in one shared schema, 16/16 verify checks) were verified live on a
+tables (`members` and `providers` in one shared schema, 16/16 verify checks in that 2026-10-19 run;
+`verify` now runs 9 checks per table / 18 across the two shipped tables) were verified live on a
 Lakebase child branch (`1-8 CU`, 2026-10-19). Two shared-schema tables with a `view_name` override
 through Liquibase 4.33.0 and the DABs renderer also run against Docker PostgreSQL 16
 (`docker_multitable_proof.sh`, `docker_double_apply_proof.sh`, `docker_view_column_change_proof.sh`):
@@ -578,7 +585,7 @@ Verified `2026-10-14` through `2026-10-23`:
 
 ### Tested vs not tested
 
-- **Tested live on Lakebase (`1–8 CU` child branches, 2026-10-14 to 2026-10-23):** 1-table end-to-end deploy and primary-key replace as a non-superuser deploy service principal on both the DABs path and the Terraform + Liquibase path; identity policy guard pass and fail (`databricks_superuser` rejection); 2-table `verify` (`16/16` checks) and all 6 base-table grant routes (direct, column, `PUBLIC`, inherited role, `NOINHERIT` role, `DELETE`); drift `REVOKE` and re-reconcile; `python -m dabs.render_ddl --config config/tables.json | psql "$LAKEBASE_CONNINFO"` and `examples/read_via_view.py`.
+- **Tested live on Lakebase (`1–8 CU` child branches, 2026-10-14 to 2026-10-23):** 1-table end-to-end deploy and primary-key replace as a non-superuser deploy service principal on both the DABs path and the Terraform + Liquibase path; identity policy guard pass and fail (`databricks_superuser` rejection); 2-table `verify` (`16/16` checks in those runs; `verify` now runs `9` checks per table / `18` across the two shipped tables) and all 6 base-table grant routes (direct, column, `PUBLIC`, inherited role, `NOINHERIT` role, `DELETE`); drift `REVOKE` and re-reconcile; `python -m dabs.render_ddl --config config/tables.json | psql "$LAKEBASE_CONNINFO"` and `examples/read_via_view.py`.
 - **Tested in Docker PostgreSQL 16 + offline test suite (on every run):** 2 shared-schema tables with `view_name` override (`docker_multitable_proof.sh`), `runAlways` view body edit (`docker_view_edit_proof.sh`), atomic consumer view rebuild across column drop/rename/reorder with a concurrent reader loop (`docker_view_column_change_proof.sh`), double-apply idempotency and missing-role refusal with/without `CREATEROLE` (`docker_double_apply_proof.sh`), verify post-conditions (`docker_verify_step.sh`), and 350+ offline unit/workflow/parity tests.
 - **Not tested live end to end:** Running `.github/workflows/deploy.yml` or `pr-validate.yml` on a GitHub Actions runner against a live workspace; GitHub Actions OIDC workload identity federation; an end-to-end blue/green sync-mode swap on a live table; `lifecycle.prevent_destroy` or `existing_pipeline_id` bundle options; per-consumer-group `WHERE` views; and a fresh from-zero run by a second person outside the author's workspace.
 
