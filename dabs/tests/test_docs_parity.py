@@ -130,3 +130,164 @@ def test_design_notes_documents_branch_per_pr_caveats():
     assert "branch-per-pr" in text, "DESIGN-NOTES missing the Branch-per-PR section"
     assert "own connection endpoint" in text, "missing the per-branch endpoint caveat"
     assert "reference-only" in text, "must state the CI workflows are reference-only"
+
+
+# --- Ticket 08: Docs tell the truth invariants --------------------------------------------------
+
+def _load_doc_texts() -> dict[str, str]:
+    """Read the customer-facing documentation files fresh from disk."""
+    files = [
+        "README.md",
+        "RUNBOOK.md",
+        "CONTRIBUTING.md",
+        "Makefile",
+        "config/README.md",
+        "docs/DESIGN-NOTES.md",
+        "docs/TROUBLESHOOTING.md",
+        "docs/adr/0001-view-based-no-superuser-access.md",
+        ".github/workflows/ci.yml",
+    ]
+    return {rel: (REPO / rel).read_text() for rel in files}
+
+
+def test_no_doc_instructs_hand_editing_generated_changelogs():
+    """D03: No doc may instruct users to hand-edit generated changelogs (deploy.sh and CI run
+    generate_changelogs.py --check and abort on any hand-edit drift).
+
+    Hostile check: inspects README.md, config/README.md, docs/DESIGN-NOTES.md, docs/TROUBLESHOOTING.md,
+    and CONTRIBUTING.md for any positive instruction to edit generated changelog files.
+    """
+    docs = _load_doc_texts()
+    banned_phrases = (
+        "edits its generated changelog",
+        "edit its generated changelog",
+        "edit the generated changelog",
+    )
+    offenders = {}
+    for rel, text in docs.items():
+        lower = text.lower()
+        for phrase in banned_phrases:
+            if phrase in lower:
+                offenders[rel] = phrase
+    assert not offenders, f"D03 contradiction: docs instruct hand-editing generated changelogs: {offenders}"
+
+
+def test_troubleshooting_does_not_make_false_ownership_or_seed_claims():
+    """B23 (Trap 1) & D04: TROUBLESHOOTING.md must not claim 'you can't grant on what you don't own'
+    (the creator holds WITH GRANT OPTION) or that seed_source.sh 'seeds a single demo source table'
+    / 'does not read config/tables.json'."""
+    ts = _load_doc_texts()["docs/TROUBLESHOOTING.md"]
+    lower = ts.lower()
+    assert "can't grant on what you don't own" not in lower, (
+        "Trap 1 / B23: synced table creator holds SELECT WITH GRANT OPTION"
+    )
+    assert "cannot grant on what you do not own" not in lower
+    assert "with grant option" in lower, (
+        "TROUBLESHOOTING.md must explain that the synced table creator holds SELECT WITH GRANT OPTION"
+    )
+    assert "does not read `config/tables.json`" not in ts and "does not read config/tables.json" not in lower, (
+        "D04: seed_source.sh reads config/tables.json"
+    )
+    assert "seeds a single demo source table" not in lower, (
+        "D04: seed_source.sh seeds one demo source table per entry in config/tables.json"
+    )
+
+
+def test_readme_and_design_notes_warn_against_security_invoker():
+    """Trap 9: Both README.md and docs/DESIGN-NOTES.md must explicitly warn not to set
+    security_invoker on the consumer view."""
+    docs = _load_doc_texts()
+    for rel in ("README.md", "docs/DESIGN-NOTES.md"):
+        text = docs[rel].lower()
+        assert "security_invoker" in text, f"Trap 9: {rel} must warn against setting security_invoker on the consumer view"
+
+
+def test_role_guard_sql_described_as_existence_check_not_create_role():
+    """Ticket 09 + 08: role_guard_sql / 001-app-role checks pg_roles and raises an exception if the
+    admin-created role is missing; it never runs CREATE ROLE."""
+    docs = _load_doc_texts()
+    for rel in (
+        "README.md",
+        "RUNBOOK.md",
+        "docs/DESIGN-NOTES.md",
+        "docs/adr/0001-view-based-no-superuser-access.md",
+    ):
+        text = docs[rel]
+        lower = text.lower()
+        assert "creates it with a guarded `create role`" not in lower, f"{rel} still claims job creates role"
+        assert "idempotent `create role` via a `pg_roles` existence guard" not in lower, (
+            f"{rel} parity table still claims role_guard_sql runs CREATE ROLE"
+        )
+        assert "guarded `create role`" not in lower, f"{rel} still claims a guarded CREATE ROLE"
+        assert "migrate fails at `create role`" not in lower, f"{rel} still claims migrate fails at CREATE ROLE"
+    # Parity table in README must describe role_guard_sql as an existence check
+    section = _engines_section().lower()
+    assert "role_guard_sql" in section and "does not exist" in section, (
+        "README parity table must state role_guard_sql checks pg_roles and fails if the role does not exist"
+    )
+
+
+def test_no_doc_claims_not_even_as_a_superuser_or_unqualified_single_transaction():
+    """B26, B18, B12, B24: No doc may overclaim 'not even as a superuser' / 'even as a superuser' /
+    'not even by a superuser', 'This is automatic and cannot be turned off', 'Every claim the README
+    makes is anchored to a test or a live run', or 'the single-transaction reconcile both paths use'."""
+    docs = _load_doc_texts()
+    banned = (
+        "not even as a superuser",
+        "even as a superuser",
+        "not even by a superuser",
+        "this is automatic and cannot be turned off",
+        "every claim the readme makes is anchored to a test or a live run",
+        "the single-transaction reconcile both paths use",
+    )
+    offenders = {}
+    for rel, text in docs.items():
+        lower = text.lower()
+        for phrase in banned:
+            if phrase in lower:
+                offenders[(rel, phrase)] = True
+    assert not offenders, f"Overclaims still present in docs: {list(offenders.keys())}"
+
+
+def test_ci_and_org_repo_disclosures_are_accurate():
+    """C01-C05, C10, M1, M2: README, CONTRIBUTING, RUNBOOK, and ci.yml must state the org-repo
+    GitHub Actions status, reference-workflow status, and accurate CLI version history."""
+    docs = _load_doc_texts()
+    for rel in ("README.md", ".github/workflows/ci.yml"):
+        assert "drop the resource `role_id`" not in docs[rel] and "drop the resource role_id" not in docs[rel], (
+            f"C10: unproven role_id claim still in {rel}"
+        )
+        assert "Older CLIs do not\nsupport the `postgres_synced_tables` resource" not in docs[rel], (
+            f"C10: inaccurate CLI claim still in {rel}"
+        )
+    assert "databricks-solutions" in docs["README.md"] and "databricks-solutions" in docs["CONTRIBUTING.md"], (
+        "C01/C03/M1: README and CONTRIBUTING must disclose org repo Actions/scanning defaults"
+    )
+    assert "GitHub Actions | run that same sequence on push / PR" not in docs["RUNBOOK.md"], (
+        "C05: RUNBOOK must not claim GitHub Actions runs deploy.sh on push/PR"
+    )
+
+
+def test_readme_make_targets_match_makefile_help():
+    """README's documented make targets must match the actual targets in Makefile."""
+    import re
+    import subprocess
+
+    docs = _load_doc_texts()
+    makefile_targets = set(
+        re.findall(r"^([a-zA-Z_-]+):.*?## ", docs["Makefile"], flags=re.MULTILINE)
+    )
+    # Hostile check: verify against real `make help` output (strip ANSI escapes) as well as static regex
+    raw_out = subprocess.check_output(["make", "-s", "help"], cwd=REPO, text=True)
+    clean_out = re.sub(r"\x1b\[[0-9;]*m", "", raw_out)
+    help_targets = set(re.findall(r"^\s+([a-zA-Z_-]+)\s+", clean_out, flags=re.MULTILINE)) - {"Config", "Env"}
+    assert makefile_targets == help_targets == {"help", "validate", "fmt", "seed", "deploy", "branch"}
+    # README repo layout line must list all make targets
+    assert "make help | validate | fmt | seed | deploy | branch" in docs["README.md"], (
+        "README must list all 6 Makefile targets (help | validate | fmt | seed | deploy | branch)"
+    )
+    # D11: plural demo source tables in Makefile, README, RUNBOOK
+    assert "demo Delta source tables" in docs["Makefile"], "D11: Makefile seed description must be plural"
+    assert "demo Delta source table " not in docs["README.md"], "D11: README must use plural demo Delta source tables"
+    assert "demo Delta source table " not in docs["RUNBOOK.md"], "D11: RUNBOOK must use plural demo Delta source tables"
+

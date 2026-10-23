@@ -19,7 +19,7 @@ validate: ## Local checks, no cloud: terraform validate/fmt, bash syntax, tables
 fmt: ## Auto-format Terraform
 	cd terraform && terraform fmt
 
-seed: ## One-time: seed the demo Delta source table + UC schemas
+seed: ## One-time: seed the demo Delta source tables + UC schemas
 	./scripts/seed_source.sh
 
 deploy: ## Run the pipeline: terraform apply -> per table wait-for-ONLINE -> liquibase -> verify

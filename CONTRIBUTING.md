@@ -5,7 +5,10 @@ welcome. Please keep it generic (no workspace-specific values, no secrets).
 
 ## Before you open a PR
 
-Run the full local gate (no cloud needed) — this is what CI enforces:
+Run the full local gate (no cloud needed). `.github/workflows/ci.yml` defines these checks (and
+runs on PRs and pushes where GitHub Actions is enabled; on the `databricks-solutions` org repo,
+GitHub Actions, secret scanning, push protection, and branch protection are disabled by default
+until an org admin enables them, so run the local gate and Docker proofs yourself before opening a PR):
 
 ```bash
 # 1. Terraform + shell + config sanity
@@ -43,9 +46,10 @@ bash scripts/tests/docker_verify_step.sh                # verify step exits non-
 
 ### What each README promise is backed by
 
-Every claim the README makes is anchored to a test or a live run. Docker-proven = asserted against a
-real Postgres in the `docker-proofs` job; offline-proven = the no-database pytest suite; live-proven =
-verified once against a live Lakebase branch (recorded in `docs/DESIGN-NOTES.md`).
+The core pipeline guarantees below are anchored to an automated test or a dated live Lakebase run.
+Docker-proven = asserted against a real Postgres in the `docker-proofs` job; offline-proven = the
+no-database pytest suite; live-proven = verified against a live Lakebase branch (recorded in
+`docs/DESIGN-NOTES.md`).
 
 | Promise | Backed by | Kind |
 |---|---|---|
@@ -71,8 +75,11 @@ python3 -c "import json; json.load(open('config/tables.json'))"
 ## Ground rules
 
 - **No secrets, ever.** No real hostnames, tokens, `*.tfvars`, `*.tfstate`, or credentials. Only
-  `.example` templates are committed. `.gitignore` enforces this; don't bypass it. A **gitleaks**
-  secret scan runs in CI on every PR — run it locally too with `pip install pre-commit && pre-commit install`.
+  `.example` templates are committed. `.gitignore` enforces this; don't bypass it. `.github/workflows/ci.yml`
+  defines a **gitleaks** secret scan (which runs where GitHub Actions is enabled; on the
+  `databricks-solutions` org repo Actions, secret scanning, and push protection are off by default)
+  — always run it locally before pushing with `pip install pre-commit && pre-commit install` (and
+  `pre-commit run --all-files`).
 - **No workspace- or customer-specific values.** Use the placeholders (`<your-...>`, `my_catalog`,
   `cicd_proj`). Keep the demo names neutral.
 - **Keep changesets idempotent.** Grants/indexes/views are `runAlways:true` and must stay safe to

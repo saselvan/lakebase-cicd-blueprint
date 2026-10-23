@@ -55,13 +55,14 @@ synced-table resources and into every job task (`verify_identity_policy`, `migra
 
 `config/tables.json` is the single source of truth. DABs YAML cannot loop a list into many
 resources, so `python -m dabs.generate_resources` reads that file and writes one synced table per
-entry into `dabs/resources/*.yml`. The app role is not written as a `postgres_roles` resource — the
-migration job creates it with a guarded `CREATE ROLE`, so a single owner keeps `bundle destroy` from
-dropping the role out from under grants that consumers still hold. The guarded statement skips a
-role that already exists. In the `prod` target an admin creates each app role first, because the
-deploy service principal has no `CREATEROLE` (see "Run the prod target as a deploy service
-principal"). The generated files are diffable, so re-running codegen after a config edit is a
-clean diff. Do not hand-edit them.
+entry into `dabs/resources/*.yml`. The app role is not written as a `postgres_roles` resource — an
+admin creates each `NOLOGIN` app role once (`CREATE ROLE <app_role> NOLOGIN`) before the first
+deploy (on both `dev` and `prod` targets), and the migration job checks `pg_roles` (`role_guard_sql`)
+and fails loudly with `app role <name> does not exist; an admin must create it` if the role is
+missing. That keeps `bundle destroy` from dropping the role out from under grants that consumers
+still hold, and keeps the deploy service principal free of `CREATEROLE` (see "Run the prod target as
+a deploy service principal"). The generated files are diffable, so re-running codegen after a config
+edit is a clean diff. Do not hand-edit them.
 
 ### How migrations run
 
@@ -70,8 +71,8 @@ small renderer (`dabs/render_ddl.py`) turns `config/tables.json` into idempotent
 is stdlib-only, so there is no Java, no Liquibase, and no migration framework to install in the job.
 
 At run time the job reads `config/tables.json`, waits for every synced table to reach `ONLINE`,
-then applies the database objects in order: the read-only role, explicit grants, indexes, and the
-consumer view. Every statement is idempotent (a `pg_roles`-guarded `CREATE ROLE`, `GRANT`,
+then applies the database objects in order: the read-only role check, explicit grants, indexes, and the
+consumer view. Every statement is idempotent (a `pg_roles` existence check, `GRANT`,
 `CREATE INDEX IF NOT EXISTS`, `DROP VIEW IF EXISTS` + `CREATE OR REPLACE VIEW` in one transaction), and there is no migration version table. If
 a synced table is replaced or its columns change, the job reapplies the objects on the next run. This is reconciliation,
 not one-time setup — re-running is a clean no-op, never a version-bookkeeping conflict.
@@ -131,8 +132,10 @@ GRANT USE CATALOG ON CATALOG my_catalog TO `<sp-application-id>`;
 GRANT USE SCHEMA, SELECT, CREATE TABLE ON SCHEMA my_catalog.cicd_proj TO `<sp-application-id>`;
 ```
 
-Project permission. `CAN_USE` is enough: in the live test, a service principal with only `CAN_USE`
-created the synced table with `bundle deploy`.
+Project permission. `CAN_USE` is enough for the deploy service principal: paired with the Unity
+Catalog grants above, `CAN_USE` allows minting a database token and creating synced tables with
+`bundle deploy` (or Terraform). `CAN_USE` does **not** allow creating, deleting, or unprotecting
+Lakebase branches — those require `CAN_MANAGE` on the project (verified live 2026-10-09).
 
 ```bash
 databricks api patch /api/2.0/permissions/database-projects/$PROJECT -p $ADMIN_PROFILE \
@@ -150,7 +153,10 @@ CREATE ROLE providers_app_ro NOLOGIN;
 ```
 
 **2. Deploy service principal, every deploy.** The same principal runs both commands: the identity
-that creates a synced table is the one that can build the view on it.
+that creates a synced table is the one that can build the view on it (on the Terraform path,
+`deploy.sh` accepts any `PGUSER` env var; if `PGUSER` is not the identity that created the synced
+table and schema, the deploy fails closed at `CREATE VIEW` / `GRANT` with `permission denied for
+schema` or `permission denied for table`).
 
 ```bash
 python -m dabs.generate_resources
@@ -199,9 +205,11 @@ When it fails:
 - **`permission denied for schema`.** A different identity is running the job than the one that
   created the tables. Keep one deploy service principal for the life of the tables ("Who does
   what", below).
-- **migrate fails at `CREATE ROLE`.** The admin step for that app role was skipped. The deploy
-  service principal cannot create roles, by design (`Only roles with the CREATEROLE attribute may
-  create roles`, seen live on the Terraform path). Run the admin's `CREATE ROLE` and rerun.
+- **`migrate` fails with `app role <name> does not exist; an admin must create it`.** The admin
+  step for that app role was skipped. The migration checks `pg_roles` and never runs `CREATE ROLE`
+  (and the deploy service principal has no `CREATEROLE`, by design: `Only roles with the CREATEROLE
+  attribute may create roles`, verified live). Run the admin's `CREATE ROLE <app_role> NOLOGIN;`
+  and rerun.
 - **A replace (a primary key change) stops `bundle deploy` with `dependent objects exist`.** The
   consumer view blocks the delete, so the old table and its grants stay. After reading `bundle plan`,
   drop the view as the deploy service principal, which owns it (another identity gets
@@ -210,8 +218,11 @@ When it fails:
 
 ### Beta status and CLI pin
 
-Lakebase DAB support is Beta. Pin the Databricks CLI to version 1.5.0 or newer. Older CLIs do not
-support the `postgres_synced_tables` resource, so this pin is a correctness requirement.
+Lakebase DAB support (`postgres_synced_table`) is Beta; the bundle docs
+([bundle resources](https://docs.databricks.com/aws/en/dev-tools/bundles/resources), checked
+2026-10-22) list `postgres_synced_table` as added in Databricks CLI `1.0.0`.
+`dabs/scripts/offline_validate.sh` enforces Databricks CLI `>= 1.5.0`, and this repo was tested
+with Databricks CLI `1.17.0` and `1.19.0` (CI pins `1.19.0`).
 
 ### What "all-in on Databricks" does and does not fix for CI
 
@@ -233,7 +244,8 @@ deploy identity applies explicit grants and owns a consumer view that it can gra
 access never depends on a privilege no user can hold.*
 
 Synced tables are created and owned by a managed writer role (`databricks_writer_<dbid>`). You
-cannot join that role or change its default privileges, not even as a superuser. So the usual
+cannot join that role or change its default privileges, not even as the project owner (a member of
+`databricks_superuser`; Lakebase does not grant customers a Postgres superuser role). So the usual
 `ALTER DEFAULT PRIVILEGES` approach is a dead end.
 
 The supported path uses two facts:
@@ -242,11 +254,17 @@ The supported path uses two facts:
   granted `SELECT` on it — in fact `SELECT WITH GRANT OPTION`.
 - That same identity runs the migration, so it can `CREATE OR REPLACE VIEW` over the synced table.
   Because it owns the view, it can grant consumers `SELECT` on the view. The app role gets schema
-  `USAGE` plus `SELECT` on the view only — never a grant on the base table.
+  `USAGE` plus `SELECT` on the view only — never a grant on the base table. (On the Terraform path,
+  `deploy.sh` takes `PGUSER` from the environment; if `PGUSER` is not the identity that created the
+  synced table and schema, the migration fails closed at `CREATE VIEW` / `GRANT`.)
 
 Consumers read the view, not the base table — and this is literally enforced: the app role's
 `SELECT` on the base table is denied, while reads through the view succeed (the view resolves as its
-owner, the deploy identity, which holds base `SELECT`). Access is granted on an object the deploy
+owner, the deploy identity, which holds base `SELECT`). **Do not set `security_invoker = true` on
+the consumer view**: the pattern relies on default PostgreSQL view behavior (views check the
+underlying table as the view owner); with `security_invoker = true`, PostgreSQL checks the base
+synced table as the calling `app_role`, which is denied (`verify`'s real-read check catches this and
+fails closed). Access is granted on an object the deploy
 identity owns. It never depends on a privilege no user can hold, and no `databricks_superuser` is
 needed. A view needs only `SELECT` on the synced table, which its creator is granted. Granting the table itself to the app would also need the grant option.
 
@@ -257,14 +275,16 @@ Split the work across four identities. Each one gets only what its job needs.
 | Identity | Job | What it can do |
 |---|---|---|
 | Admin (a person, once per app role) | Creates each app role before the first deploy; removes extra rights from the deploy SP if the policy guard fails | `CREATEROLE`. Not used by any pipeline. |
-| Deploy service principal (production deploys only) | Creates the synced tables; runs Liquibase (grants, indexes, view) | Owns the view and the Postgres schema it creates. As the synced table's creator it holds `SELECT`, `DELETE` and `TRUNCATE` on it, with grant option. This is automatic and cannot be turned off. |
+| Deploy service principal (production deploys only) | Creates the synced tables; runs Liquibase or the DABs migration job (role check, grants, indexes, view) | Owns the view and the Postgres schema it creates. As the synced table's creator it holds `SELECT`, `DELETE` and `TRUNCATE` on it, with grant option. This is granted automatically at table creation (in our 2026-10-14 live test, a `REVOKE` by the project owner did not remove it). |
 | PR service principal (pull requests only) | Creates and deletes the per-PR branch; runs migrations there | Creating a branch needs **Can Manage** on the project. |
 | App role (`NOLOGIN`) | What the application reads as | `USAGE` on the schema and `SELECT` on the view. Denied the base table. |
 
 Tested live: a deploy service principal with no superuser and no `CREATEROLE` created the synced
-table, the index, the view and the view grant, and re-ran all of it cleanly. Only changeset `001`
-(`CREATE ROLE`) failed, because Postgres needs `CREATEROLE` to create a role. The changeset skips a
-role that already exists, so an admin creates it once and the pipeline never needs that attribute.
+table, the index, the view and the view grant, and re-ran all of it cleanly. Because Postgres needs
+`CREATEROLE` to create a role (`Only roles with the CREATEROLE attribute may create roles`), an
+admin creates each `NOLOGIN` app role once before the first deploy, and changeset `001-app-role`
+(`role_guard_sql`) checks `pg_roles` and fails loudly with `app role <name> does not exist; an admin
+must create it` if the role is missing — the pipeline never runs `CREATE ROLE`.
 
 Keep one deploy service principal for the life of the tables. It owns the Postgres schema, the
 view and the Liquibase tables (`databasechangelog`, `databasechangeloglock`); the writer role owns
@@ -317,7 +337,12 @@ identity out of it and checks that on every prod run (`verify_identity_policy`, 
   target can reach PHI, give dev its own service principal and the same guard.
 - **Audit.** In workspaces with the compliance security profile and the HIPAA standard, Lakebase sends
   its SQL audit events (all statement classes except miscellaneous) to `system.access.audit` under the
-  service name `lakebase`, kept 365 days. Export them first if your retention policy is longer.
+  service name `lakebase`, kept 365 days (docs:
+  [HIPAA audit logging](https://docs.databricks.com/aws/en/oltp/projects/hipaa-audit-logging),
+  updated 2026-09-09; statement logging is active only in workspaces with the compliance security
+  profile and HIPAA enabled — in our non-HIPAA live workspace, `pgaudit.log` was `none` and
+  control-plane events used `service_name = 'postgres'`). Export them first if your retention policy
+  is longer.
 - **When the guard fails.** The deploy service principal cannot change its own roles. An admin (the
   same person who creates the app roles) removes the extra membership, then reruns the job. Remove it
   where it was set: a `membership_roles` entry in a bundle `postgres_roles` resource, or the Lakebase
@@ -330,14 +355,18 @@ identity out of it and checks that on every prod run (`verify_identity_policy`, 
 
 ### One caveat about self-healing
 
-Reapply-on-every-deploy only restores access if the table replace succeeds. For a **sync-mode
-change** on a table that already has a consumer view, it may not: in a live repro the in-place
-change **wedged** the synced table (`SYNCED_TABLE_OFFLINE_FAILED`), a state a redeploy could not
-clear, so the reapply step never ran. A plain redeploy does not self-heal in that case. Use a
-**blue/green swap** for a sync-mode change — stand up the new table beside the old one and cut over.
-Dropping the consumer view first is not a safe workaround: it destroys grants, opens an availability
-gap, and still risks the wedge. See `docs/DESIGN-NOTES.md`, "Changing sync mode: prefer a blue/green
-swap."
+Reapply-on-every-deploy only restores access if the table replace succeeds — and a **primary-key
+replace** behaves differently from an **in-place sync-mode change**:
+
+- On a **primary-key change** (tested live 2026-10-15 on the DABs path), dropping the consumer view
+  first allowed `bundle deploy` to recreate the synced table cleanly (`Recreated
+  postgres_synced_tables.members`), after which the migration restored the view, grants, and indexes.
+- On an **in-place sync-mode change** (`scheduling_policy` transition), all six transitions tested
+  with the consumer view in place **wedged** the synced table (`SYNCED_TABLE_OFFLINE_FAILED` after a
+  platform `DELETE` error), a state a redeploy could not clear, and in-place sync-mode replacement
+  without the view was not re-tested after that wedge. Use a **blue/green swap** (`new
+  synced_table_id` alongside the old one) for a sync-mode change rather than an in-place change. See
+  `docs/DESIGN-NOTES.md`, "Changing sync mode: prefer a blue/green swap."
 
 ---
 
@@ -364,7 +393,7 @@ The pipeline is four ordered steps, run the same way by hand (`scripts/deploy.sh
 3. Liquibase applies the database objects. Each table runs its OWN generated changelog
    (`liquibase/generated/<name>.changelog.sql`, produced from `config/tables.json` by
    `liquibase/generate_changelogs.py`), in order:
-   - `001-app-role` — an idempotent read-only app role.
+   - `001-app-role` — checks `pg_roles` and fails loudly if the admin-created read-only app role is missing.
    - `002-app-grants` — `GRANT USAGE` on the schema for the app role (no base-table grant; the app
      role's `SELECT` is on the view, granted in `004-app-view`).
    - `003-index-<col>` — `CREATE INDEX IF NOT EXISTS`, one changeset per `index_columns` entry, after the load.
@@ -402,11 +431,14 @@ index columns:
 ]
 ```
 
-`terraform apply` runs once and provisions all of them. The deploy loop then generates one
-changelog per table, waits for each table's sync, applies the objects, and verifies access. Every
+`terraform apply` runs once and provisions all of them. The deploy loop then verifies that the
+committed per-table changelogs match `config/tables.json` (`liquibase/generate_changelogs.py --check`),
+waits for each table's sync, applies the objects, and verifies access. Every
 `index_columns` entry becomes its own index changeset (0/1/N — no cap). A table that needs a
-different index shape (composite, partial, a different type) edits its generated changelog or
-extends the generator. Field-by-field reference: `config/README.md`.
+different index shape (composite, partial, a different type) extends the shared SQL helpers in
+`dabs/render_ddl.py` (or `liquibase/generate_changelogs.py`) and regenerates
+`liquibase/generated/*.changelog.sql` and `dabs/resources/*.yml` — never hand-edit the generated
+files. Field-by-field reference: `config/README.md`.
 
 ### Branching (test risky changes safely)
 
@@ -416,8 +448,11 @@ extends the generator. Field-by-field reference: `config/README.md`.
 ```
 
 Two concerns, two tools. For load speed, load first and index after — this reference uses
-`CREATE INDEX IF NOT EXISTS`; it does not use `CREATE INDEX CONCURRENTLY`, which cannot run inside
-the single-transaction reconcile. For a risky rebuild, drop, or move, test on an ephemeral branch,
+`CREATE INDEX IF NOT EXISTS`; it does not use `CREATE INDEX CONCURRENTLY`, because on the DABs path
+`apply_sql_to_lakebase` runs all statements in one non-autocommit `psycopg` transaction
+(`autocommit=False`), and on the Liquibase path each changeset (`001`, `002`, `003-index-<col>`,
+`004`) runs in its own transaction (`runInTransaction:true` by default) — neither allows
+`CREATE INDEX CONCURRENTLY`. For a risky rebuild, drop, or move, test on an ephemeral branch,
 then promote. Do not use one to solve the other.
 
 ### How to run
@@ -435,7 +470,7 @@ $EDITOR config/tables.json
 # 2. copy and edit the shared Terraform vars:
 cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit for your workspace
 
-./scripts/seed_source.sh   # one-time: demo Delta source table + UC schemas
+./scripts/seed_source.sh   # one-time: demo Delta source tables + UC schemas
 ./scripts/deploy.sh        # the pipeline: terraform apply -> resolve branch endpoint + mint -> per table wait sync -> liquibase -> verify
 ```
 
@@ -480,7 +515,7 @@ The renderer's output and the Liquibase changelog line up one to one:
 
 | Liquibase changeset (generated per table) | Renderer equivalent (`dabs/render_ddl.py`) |
 |---|---|
-| `001-app-role` | `role_guard_sql` — idempotent `CREATE ROLE` via a `pg_roles` existence guard |
+| `001-app-role` | `role_guard_sql` — checks `pg_roles` and raises `app role <name> does not exist; an admin must create it` if missing (never runs `CREATE ROLE`) |
 | `002-app-grants` | `grant_statements` — `GRANT USAGE` on the schema only (no base-table SELECT; the app role reads through the view) |
 | `003-indexes` (generated as one `003-index-<col>` changeset per `index_columns` entry) | `index_statements` — `CREATE INDEX IF NOT EXISTS` per `index_columns` (handles 0/1/N) |
 | `004-app-view` | `view_statements` — `DROP VIEW IF EXISTS` + `CREATE OR REPLACE VIEW` + `GRANT SELECT` on the view (atomic in one transaction) |
@@ -499,9 +534,14 @@ How each path stays idempotent (the reapply-on-every-deploy behavior) is explain
 
 ## Key findings
 
-Verified end to end on the Autoscaling projects model — two synced tables in one shared schema,
-exercised through both the DABs and the Terraform + Liquibase paths against real Lakebase synced
-tables (PostgreSQL 16, Databricks Terraform provider v1.132.0, Terraform v1.16.2, Liquibase 4.33.0):
+Exercised on the Autoscaling projects model (PostgreSQL 16, Databricks CLI v1.17.0 / v1.19.0,
+Terraform v1.16.2, Databricks Terraform provider v1.132.0, Liquibase 4.33.0): live on Lakebase, one
+3-row synced table (`members`) was exercised end to end through both the DABs path (2026-10-15) and
+the Terraform + Liquibase path (2026-10-14) as a non-superuser deploy service principal, and two
+tables (`members` and `providers` in one shared schema, 16/16 verify checks) were verified live on a
+Lakebase child branch (`1-8 CU`, 2026-10-19). Two shared-schema tables with a `view_name` override
+through Liquibase 4.33.0 and the DABs renderer also run against Docker PostgreSQL 16
+(`docker_multitable_proof.sh`, `docker_double_apply_proof.sh`, `docker_view_column_change_proof.sh`):
 
 - `terraform apply` does NOT block until the sync is `ONLINE`. The resource returns once the synced
   table is created. The initial load runs in the background. Use the `wait_for_sync.sh` gate before
@@ -533,7 +573,7 @@ scripts/            seed_source.sh, wait_for_sync.sh, deploy.sh, branch_test.sh
 docs/               DESIGN-NOTES.md (design reasoning), TROUBLESHOOTING.md, pipeline + access-model diagrams
 docs/adr/           architecture decision records — the load-bearing "why"s
 examples/           read_via_view.py — a consumer reading a synced table through its view
-Makefile            one-command entrypoint for the Terraform path: make help | validate | seed | deploy | branch
+Makefile            one-command entrypoint for the Terraform path: make help | validate | fmt | seed | deploy | branch
 CONTRIBUTING.md     local checks + ground rules   |   LICENSE (MIT)
 ```
 
@@ -548,22 +588,22 @@ Shared:
 
 - A Databricks workspace with a Lakebase Autoscaling project and a `production` branch.
 - Databricks CLI, authenticated to your workspace (a named CLI profile).
-- A SQL warehouse (for seeding the demo source table) and an existing UC (Unity Catalog) catalog
+- A SQL warehouse (for seeding the demo Delta source tables) and an existing UC (Unity Catalog) catalog
   and schema.
 
 For the DABs path:
 
-- Databricks CLI 1.5.0 or newer (Lakebase DAB support is Beta).
+- Databricks CLI 1.5.0 or newer (`dabs/scripts/offline_validate.sh` enforces `>= 1.5.0`; tested with `1.17.0` and `1.19.0`, and Lakebase DAB support is Beta).
 - The bundle uses the Autoscaling resource `postgres_synced_tables`. If your existing bundle still
   declares the Provisioned resources (`database_instances`, `synced_database_tables`), move it first
   with [Update your bundle to use Autoscaling resources](https://docs.databricks.com/aws/en/oltp/update-to-autoscaling-dabs).
 
 For the Terraform path:
 
-- Terraform and the `databricks/databricks` provider. This reference was built and tested with
-  Terraform 1.16.2 and provider 1.132.0. Use those or newer. The `databricks_postgres_*` resources
-  are recent, so do not pin older.
-- Liquibase (OSS) 4.33 or newer, and `psql`.
+- Terraform and the `databricks/databricks` provider. This reference was built and tested live on
+  2026-10-14 with Terraform 1.16.2 and `databricks/databricks` provider 1.132.0. Use those or newer.
+  The `databricks_postgres_*` resources are recent, so do not pin older.
+- Liquibase (OSS) 4.33.0 or newer, and `psql`.
 
 ---
 
@@ -577,10 +617,18 @@ For the Terraform path:
 - No secrets in the repo. `.gitignore` excludes `*.tfstate*`, `*.tfvars`, `*.env`, and
   `liquibase.properties`. Only `.example` templates are committed.
 - Terraform state is gitignored. Keep it in a secure remote backend for real use.
-- Recommended CI auth is OIDC (OpenID Connect) / Workload Identity Federation, so no long-lived
-  secret is stored in GitHub. See `RUNBOOK.md`, "CI auth".
-- The included deploy workflows are reference-only and manual-trigger. Wire them up once auth and
-  network access are in place. The `ci.yml` no-cloud checks run on every PR with no secrets.
+- Recommended CI auth is OIDC (OpenID Connect) / Workload Identity Federation
+  ([Configure a federation policy](https://docs.databricks.com/aws/en/dev-tools/auth/oauth-federation),
+  checked 2026-10-22; docs — not tested in this repo), so no long-lived secret is stored in GitHub.
+  See `RUNBOOK.md`, "CI auth".
+- The included `deploy.yml` and `pr-validate.yml` workflows are reference-only `workflow_dispatch`
+  templates and were not executed end to end on a live workspace in GitHub Actions (`deploy.sh` and
+  the steps were tested locally and via offline env-replay/stub tests). `.github/workflows/ci.yml`
+  defines the no-cloud checks (and runs on PRs and pushes where GitHub Actions is enabled); on the
+  `databricks-solutions` org repo, GitHub Actions, secret scanning, push protection, and branch
+  protection are disabled by default until an org admin enables them, so run the local gate
+  (`make validate`, `pytest`, `pre-commit` / `gitleaks`, and the Docker proofs in `CONTRIBUTING.md`)
+  yourself before opening a PR.
 
 ---
 

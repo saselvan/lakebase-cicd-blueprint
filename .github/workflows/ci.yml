@@ -1,7 +1,9 @@
 name: CI (no-cloud checks)
 
-# Runs on every PR and on pushes to main. No secrets, no Databricks workspace —
-# just static validation so the repo stays correct and any fork can run it.
+# Defines the no-cloud checks (runs on PRs and pushes to main where GitHub Actions is enabled;
+# on the databricks-solutions org repo Actions is disabled by default until an org admin enables
+# it, so run the local gate in CONTRIBUTING.md before opening a PR). No secrets, no Databricks
+# workspace — just static validation and Docker proofs so any fork can run it.
 
 on:
   pull_request:
@@ -82,9 +84,10 @@ jobs:
   # Runs the codegen, then validates the generated bundle (dev + prod, --strict)
   # against a localhost workspace stub so any fork can run it without cloud access.
   #
-  # CLI PIN: Databricks CLI >= 1.5.0 is required. Lakebase DABs resources
-  # (postgres_synced_tables / postgres_roles) are BETA; CLIs older than 1.5.0 drop the
-  # resource `role_id`, so the pin is a correctness requirement, not just hygiene.
+  # CLI PIN: dabs/scripts/offline_validate.sh enforces Databricks CLI >= 1.5.0.
+  # The bundle resources docs (https://docs.databricks.com/aws/en/dev-tools/bundles/resources,
+  # checked 2026-10-22) list postgres_synced_table (Beta) as added in CLI 1.0.0; this repo was
+  # tested with CLI 1.17.0 and 1.19.0, and CI pins 1.19.0 below.
   dabs-validate:
     runs-on: ubuntu-latest
     steps:

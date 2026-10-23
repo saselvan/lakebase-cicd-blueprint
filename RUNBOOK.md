@@ -16,7 +16,7 @@ drop/replace still has a gap — it is not zero-downtime: measured live at about
 | Terraform | create/own the synced table (Delta → Lakebase Postgres) | `terraform/` |
 | Liquibase | app role, explicit grants, indexes, consumer view (one generated changelog per table) | `liquibase/generated/` (from `liquibase/generate_changelogs.py`) |
 | Orchestration | run them in the right order, wait for the sync | `scripts/deploy.sh` |
-| GitHub Actions | run that same sequence on push / PR | `.github/workflows/` |
+| GitHub Actions | reference workflows (`deploy.yml` and `pr-validate.yml` are `workflow_dispatch` manual templates, not executed end to end on a live workspace in GitHub Actions; `ci.yml` defines the no-cloud checks) | `.github/workflows/` |
 
 ## Run it yourself (the exact commands, in order)
 
@@ -28,10 +28,10 @@ export PROJECT=<your-lakebase-project-id>   # deploy is branch-driven; default m
 export BRANCH=<branch-to-deploy-to>         # default production
 export PGUSER=<your-databricks-username>   # your login email; for a service principal, its application id
 
-# 0. one-time: create the demo Delta source table the sync reads from
+# 0. one-time: create the demo Delta source tables the sync reads from
 ./scripts/seed_source.sh
 
-# 1-4. the whole pipeline (what CI runs), locally:
+# 1-4. the whole pipeline (what deploy.yml models), locally:
 ./scripts/deploy.sh
 ```
 
@@ -46,11 +46,13 @@ asks `terraform console`, which follows Terraform's variable precedence: `variab
    no-op because Terraform owns the state.
 2. `scripts/wait_for_sync.sh` — polls `databricks postgres get-synced-table` until `detailed_state`
    contains `ONLINE` and not `FAILED` or `ERROR` (failure is checked first). This is what guarantees indexes go on **after** the load, not during it.
-3. generate per-table changelogs (`liquibase/generate_changelogs.py`), then `liquibase update`
-   against each table's OWN changelog (`generated/<name>.changelog.sql`): create role → grant
-   USAGE/SELECT → create indexes (one per `index_columns` entry) → create the consumer view + grant.
-   A distinct changelog file per table gives each changeset a distinct identity, so shared-schema
-   tables never collide in `DATABASECHANGELOG`. Reruns reapply the `runAlways` changesets.
+3. verify that the committed per-table changelogs (`liquibase/generate_changelogs.py --check`) match
+   `config/tables.json`, then run `liquibase update` against each table's OWN changelog
+   (`generated/<name>.changelog.sql`): check that the admin-created app role exists → grant schema
+   USAGE → create indexes (one per `index_columns` entry) → drop and recreate the consumer view +
+   grant `SELECT` on the view. A distinct changelog file per table gives each changeset a distinct
+   identity, so shared-schema tables never collide in `DATABASECHANGELOG`. Reruns reapply the
+   `runAlways` changesets.
 4. verify (`scripts/verify_table.sh`) — asserts the role and view exist, the app role has `SELECT`
    on the view and `USAGE` on the schema, a real read through the view works, the app role is denied
    on the base synced table by every route, and every `idx_<table>_<col>` exists; exits non-zero
@@ -79,8 +81,9 @@ asks `terraform console`, which follows Terraform's variable precedence: `variab
 
 1. **`spec` is an attribute, not a block** in the Terraform provider: `spec = { ... }`, not `spec { }`.
 2. **Liquibase splits on `;`** — a `DO $$ ... $$` block needs `splitStatements:false` on the changeset.
-3. **`ALTER DEFAULT PRIVILEGES FOR ROLE databricks_writer_<dbid>` is denied** even as a superuser.
-   Don't try it. Use explicit grants (and a consumer view) instead.
+3. **`ALTER DEFAULT PRIVILEGES FOR ROLE databricks_writer_<dbid>` is denied** not even as the
+   project owner (a member of `databricks_superuser`; Lakebase does not grant customers a Postgres
+   superuser role). Don't try it. Use explicit grants (and a consumer view) instead.
 4. **`CREATE CATALOG` needs the privilege on your metastore** — if you can't register a dedicated
    database catalog, target an existing standard UC catalog instead. Both work with the synced-table
    resource.
@@ -141,8 +144,8 @@ deploy still fails on that table's index changeset.
    `terraform state rm 'databricks_postgres_synced_table.t["<name>"]'`.
 4. Run `deploy.sh` as the new SP (`PGUSER=<new-sp application id>`, profile/tfvars for the new SP).
    Observed live with one table: `Resources: 1 added`, ONLINE in about 30 s, Liquibase
-   `Previously run: 1` (the changelog history carried over), verify 5/5. With N tables, expect
-   `Resources: N added`.
+   `Previously run: 1` (the changelog history carried over), verify (5/5 checks in that 2026-10-14
+   run; verify now runs 8 checks per table). With N tables, expect `Resources: N added`.
 
 ## Project facts
 
@@ -155,7 +158,9 @@ deploy still fails on that table's index changeset.
 
 **Most secure = OIDC / Workload Identity Federation → NO secret stored anywhere.** GitHub Actions
 mints a short-lived token per run; Databricks trusts it via a federation policy scoped to this repo.
-Databricks officially supports this for GitHub Actions.
+Databricks documents this for GitHub Actions ([Configure a federation policy](https://docs.databricks.com/aws/en/dev-tools/auth/oauth-federation),
+checked 2026-10-22; docs — not tested in this repo, and `deploy.yml` / `pr-validate.yml` were not
+executed end to end on a live workspace in GitHub Actions).
 
 Prefer this over storing a long-lived client secret in GitHub. The database password is always
 minted at runtime (`databricks postgres generate-database-credential <endpoint>`, ~1h TTL) from the
