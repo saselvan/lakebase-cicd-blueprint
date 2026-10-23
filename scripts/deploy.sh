@@ -17,7 +17,7 @@
 # Set the shared environment variables below for your workspace (or export them beforehand):
 #   PROFILE  Databricks CLI profile                              (default DEFAULT)
 #   PROJECT  Lakebase project id                                 (default my-lakebase-project)
-#   BRANCH   branch to deploy to, within that project            (default main)
+#   BRANCH   branch to deploy to, within that project            (default production)
 #   PGUSER   your Databricks username (email); when deploying as a service
 #            principal, the SP's application id                 (required)
 # The deploy is BRANCH-DRIVEN: it resolves projects/$PROJECT/branches/$BRANCH to that branch's
@@ -26,13 +26,33 @@
 # from the resolved endpoint, so nothing can point the deploy at the production branch by mistake.
 set -euo pipefail
 
-PROFILE="${PROFILE:-DEFAULT}"
+# Record whether the caller explicitly supplied PROFILE, PROJECT, or BRANCH in the environment
+# before applying defaults, so we can:
+#   (1) forward explicit env settings into Terraform via TF_VAR_*,
+#   (2) adopt Terraform's resolved outputs when env vars were unset (e.g. configured via *.tfvars),
+#   (3) fail closed if a *.tfvars file overrode an explicit env setting or left project_id and
+#       branch inconsistent.
+USER_SET_PROFILE="${PROFILE+1}"
+USER_SET_PROJECT="${PROJECT+1}"
+USER_SET_BRANCH="${BRANCH+1}"
+
+PROFILE="${PROFILE-DEFAULT}"
 PROJECT="${PROJECT:-my-lakebase-project}"
-BRANCH="${BRANCH:-main}"
+BRANCH="${BRANCH:-production}"
 PGUSER="${PGUSER:?set PGUSER to your Databricks username (email), or the service principal application id when deploying as an SP}"
 LAKEBASE_BRANCH="projects/$PROJECT/branches/$BRANCH"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG="$ROOT/config/tables.json"
+
+if [ -n "$USER_SET_PROFILE" ]; then
+  export TF_VAR_databricks_profile="${TF_VAR_databricks_profile-$PROFILE}"
+fi
+if [ -n "$USER_SET_PROJECT" ]; then
+  export TF_VAR_project_id="${TF_VAR_project_id-$PROJECT}"
+fi
+if [ -n "$USER_SET_PROJECT" ] || [ -n "$USER_SET_BRANCH" ]; then
+  export TF_VAR_branch="${TF_VAR_branch-$LAKEBASE_BRANCH}"
+fi
 
 # Shared resolve+mint: select the branch's READ_WRITE endpoint and mint an OAuth token FROM it.
 # shellcheck source=scripts/resolve_endpoint.sh
@@ -47,6 +67,48 @@ echo "== 1. terraform apply (for_each creates all tables in config/tables.json) 
 ( cd "$ROOT/terraform" && terraform init -input=false >/dev/null && terraform apply -auto-approve -input=false )
 DB="$(terraform -chdir="$ROOT/terraform" output -raw logical_database)"
 lakebase_validate_database "$DB"
+
+TF_PROJECT="$(terraform -chdir="$ROOT/terraform" output -raw project_id)"
+TF_BRANCH="$(terraform -chdir="$ROOT/terraform" output -raw branch)"
+TF_PROFILE="$(terraform -chdir="$ROOT/terraform" output -raw databricks_profile)"
+
+if [ -n "$TF_PROJECT" ] && [ -n "$TF_BRANCH" ]; then
+  case "$TF_BRANCH" in
+    "projects/$TF_PROJECT/branches/"*) ;;
+    *)
+      printf 'target mismatch: Terraform project_id (%s) disagrees with branch (%s); expected projects/%s/branches/<branch>\n' \
+        "$TF_PROJECT" "$TF_BRANCH" "$TF_PROJECT" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+if [ -n "$USER_SET_PROJECT" ] && [ -n "$TF_PROJECT" ] && [ "$TF_PROJECT" != "$PROJECT" ]; then
+  printf 'target mismatch: env PROJECT=%q conflicts with Terraform resolved project_id=%q\n' \
+    "$PROJECT" "$TF_PROJECT" >&2
+  exit 1
+fi
+if [ -n "$USER_SET_BRANCH" ] && [ -n "$TF_BRANCH" ] && [ "$TF_BRANCH" != "projects/${TF_PROJECT:-$PROJECT}/branches/$BRANCH" ]; then
+  printf 'target mismatch: env BRANCH=%q conflicts with Terraform resolved branch=%q\n' \
+    "$BRANCH" "$TF_BRANCH" >&2
+  exit 1
+fi
+if [ -n "$USER_SET_PROFILE" ] && [ "$TF_PROFILE" != "$PROFILE" ]; then
+  printf 'target mismatch: env PROFILE=%q conflicts with Terraform resolved databricks_profile=%q\n' \
+    "$PROFILE" "$TF_PROFILE" >&2
+  exit 1
+fi
+
+[ -n "$TF_PROJECT" ] && PROJECT="$TF_PROJECT"
+if [ -n "$TF_BRANCH" ]; then
+  LAKEBASE_BRANCH="$TF_BRANCH"
+  BRANCH="${TF_BRANCH##*/}"
+else
+  LAKEBASE_BRANCH="projects/$PROJECT/branches/$BRANCH"
+fi
+if [ -z "$USER_SET_PROFILE" ] && [ -n "$TF_PROFILE" ]; then
+  PROFILE="$TF_PROFILE"
+fi
 
 echo "== 1b. verify committed per-table Liquibase changelogs are in sync with config/tables.json =="
 # Do NOT regenerate at deploy time — that could apply something other than the reviewed, committed
@@ -115,9 +177,9 @@ PY
   # swallowed the way the old `2>&1`-and-ignore inline psql checks were.
   # ${#T_IDX[@]} guards the empty-array expansion for a table with zero index_columns (bash 3.2).
   if [ "${#T_IDX[@]}" -gt 0 ]; then
-    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW" "${T_IDX[@]}"
+    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW" "${T_IDX[@]}" </dev/null || exit 1
   else
-    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW"
+    verify_table "$T_ROLE" "$T_SCHEMA" "$PG_TABLE" "$T_VIEW" </dev/null || exit 1
   fi
 done
 

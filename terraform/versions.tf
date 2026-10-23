@@ -11,5 +11,5 @@ terraform {
 }
 
 provider "databricks" {
-  profile = var.databricks_profile
+  profile = var.databricks_profile != "" ? var.databricks_profile : null
 }

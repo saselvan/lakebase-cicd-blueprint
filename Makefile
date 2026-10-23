@@ -19,7 +19,7 @@ validate: ## Local checks, no cloud: terraform validate/fmt, bash syntax, tables
 fmt: ## Auto-format Terraform
 	cd terraform && terraform fmt
 
-seed: ## One-time: seed the demo Delta source table + UC schemas
+seed: ## One-time: seed the demo Delta source tables + UC schemas
 	./scripts/seed_source.sh
 
 deploy: ## Run the pipeline: terraform apply -> per table wait-for-ONLINE -> liquibase -> verify
@@ -27,4 +27,4 @@ deploy: ## Run the pipeline: terraform apply -> per table wait-for-ONLINE -> liq
 
 branch: ## Ephemeral branch test: make branch PROJECT=<id> NAME=pr-123
 	@test -n "$(PROJECT)" || { echo "set PROJECT=<project-id> (and optionally NAME=<branch>)"; exit 1; }
-	./scripts/branch_test.sh $(PROJECT) $(or $(NAME),pr-test)
+	./scripts/branch_test.sh $(PROJECT) $(or $(NAME),pr-test) $(or $(PROFILE),DEFAULT)

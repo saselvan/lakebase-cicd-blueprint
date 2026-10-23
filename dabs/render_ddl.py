@@ -1,8 +1,9 @@
 """Single source of the idempotent reconciling DDL — the DABs migration renderer.
 
 `config/tables.json` in, idempotent SQL out. For every configured table this emits the SAME four
-object groups the Liquibase changelog does — a guarded app role, explicit grants, one index per
-`index_columns` entry, and a no-superuser consumer view — as plain, re-runnable Postgres DDL.
+object groups the Liquibase changelog does — an app-role existence check, explicit grants, one
+index per `index_columns` entry, and a no-superuser consumer view — as plain, re-runnable Postgres
+DDL.
 
 This module is the ONE home for the SQL-building helpers. Both migration paths consume it:
 
@@ -17,7 +18,7 @@ It is also runnable standalone, piping the idempotent reconciling DDL straight i
     python -m dabs.render_ddl [--config config/tables.json] | psql "$LAKEBASE_CONNINFO"
 
 Why there is no version table. This renderer emits NO migration-version bookkeeping at all: every
-statement is idempotent (guarded CREATE ROLE, idempotent GRANT, CREATE INDEX IF NOT EXISTS,
+statement is idempotent (a `pg_roles` existence check, idempotent GRANT, CREATE INDEX IF NOT EXISTS,
 CREATE OR REPLACE VIEW), so re-running is a clean reconciling no-op — exactly what a synced-table
 replace needs, and there is no revision state a second apply could collide with. (The rationale for
 this design is recorded in docs/adr/0006-dabs-variant-mechanics.md.)
@@ -38,21 +39,23 @@ from pathlib import Path
 _HEADER = (
     "-- GENERATED idempotent reconciling DDL for the Lakebase CI/CD reference (DABs path).\n"
     "-- Source of truth: config/tables.json. Emitted by dabs/render_ddl.py — DO NOT EDIT BY HAND.\n"
-    "-- Re-runnable by construction: a pg_roles-guarded CREATE ROLE, idempotent GRANT,\n"
-    "-- CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE VIEW. There is NO migration version\n"
-    "-- table — the whole point is to reconcile the object layer on every deploy (a synced-table\n"
-    "-- replace drops grants/indexes/view; re-applying this DDL restores them).\n"
+    "-- Re-runnable by construction: a pg_roles existence check (an admin creates each app role),\n"
+    "-- idempotent GRANT, CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE VIEW. There is NO\n"
+    "-- migration version table — the whole point is to reconcile the object layer on every deploy\n"
+    "-- (a synced-table replace drops grants/indexes/view; re-applying this DDL restores them).\n"
 )
 
 
 # --- config loading -----------------------------------------------------------------------------
 
 def load_tables(config_path: str | Path) -> list[dict]:
-    """Read the single-source-of-truth tables config as a list of dicts."""
+    """Read the single-source-of-truth tables config as a list of dicts, enforcing unique table
+    names across rows."""
     with Path(config_path).open() as fh:
         tables = json.load(fh)
     if not isinstance(tables, list):
         raise ValueError(f"{config_path}: expected a JSON array of table objects")
+    validate_table_names_unique(tables)
     return tables
 
 
@@ -174,13 +177,16 @@ def pg_table_name(table: dict) -> str:
 # This keeps ONE definition of each statement's shape for both paths.
 
 def role_guard_sql(app_role: str) -> str:
-    """Idempotent CREATE ROLE, guarded by a `pg_roles` existence check (Postgres has no
-    `CREATE ROLE IF NOT EXISTS`). NOLOGIN: a read-only app role consumers are GRANTed into."""
+    """Check that the admin-created `app_role` exists in `pg_roles`; raise a clear error if missing.
+
+    Separation of duties: only an admin creates app roles (`CREATE ROLE <app_role> NOLOGIN`); the
+    migration never creates a role (even when the caller holds `CREATEROLE`)."""
+    role = validate_identifier(app_role, "app_role")
     return (
         "DO $$\n"
         "BEGIN\n"
-        f"  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{app_role}') THEN\n"
-        f"    CREATE ROLE {app_role} NOLOGIN;\n"
+        f"  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
+        f"    RAISE EXCEPTION 'app role {role} does not exist; an admin must create it';\n"
         "  END IF;\n"
         "END $$"
     )
@@ -244,6 +250,34 @@ def resolve_view_name(table: dict, synced_table: str) -> str:
     return validate_derived_name(f"{synced_table}_v", "view name", "the synced table name")
 
 
+def validate_table_names_unique(tables: list[dict]) -> None:
+    """Fail loud when two config entries share the same `name` (exact or case-insensitive).
+
+    Each row's `name` is the per-table handle that drives the Liquibase changelog filename
+    (``<name>.changelog.sql``) and the DABs synced-table resource file/key (``<name>.yml``).
+    If two rows share a `name` (for example across different schemas, or differing only in case),
+    `write_changelogs` / `write_resources` would overwrite the first file with the second (dropping
+    the first table's role, grants, indexes, and view), and `check_drift`'s dict keyed by filename
+    would collapse the duplicate and report no drift.
+    """
+    seen: dict[str, str] = {}
+    for table in tables:
+        if "name" not in table:
+            continue
+        raw_name = table["name"]
+        if not isinstance(raw_name, str) or not raw_name.strip():
+            validate_identifier(raw_name, "name")
+        key = raw_name.strip().lower()
+        if key in seen:
+            raise ValueError(
+                f"duplicate table name {raw_name!r} (collides with {seen[key]!r}): each entry in "
+                f"config/tables.json must have a unique 'name' (case-insensitive) because it "
+                f"determines the per-table changelog and bundle resource filename."
+            )
+        seen[key] = raw_name
+        validate_identifier(raw_name, "name")
+
+
 def validate_view_names_unique(tables: list[dict]) -> None:
     """Fail loud when two config entries resolve to the SAME (app_schema, view_name) (shared seam).
 
@@ -261,6 +295,7 @@ def validate_view_names_unique(tables: list[dict]) -> None:
     ``liquibase/generate_changelogs.py``) and ``render_ddl`` call it at generation time, so every
     path inherits the guard. Resolving each name also runs it through the per-name identifier seam.
     """
+    validate_table_names_unique(tables)
     seen: dict[tuple[str, str], str] = {}
     for table in tables:
         schema = validate_identifier(table["app_schema"], "app_schema")
@@ -281,8 +316,16 @@ def validate_view_names_unique(tables: list[dict]) -> None:
 def view_statements(app_schema: str, app_role: str, synced_table: str, view_name: str) -> list[str]:
     """Consumer view + grant — the no-superuser access path. The managed writer role owns the
     synced base table; the deploy identity holds SELECT on that base table and OWNS this view over
-    it, so it can grant consumers SELECT on the VIEW. CREATE OR REPLACE so the view self-heals after
-    a synced-table replace.
+    it, so it can grant consumers SELECT on the VIEW.
+
+    Emits `DROP VIEW IF EXISTS` before `CREATE OR REPLACE VIEW` and re-grants `SELECT` on the view.
+    Why: Postgres `CREATE OR REPLACE VIEW ... SELECT *` expands to the base table's columns at
+    creation time and refuses to drop, rename, reorder, or mid-insert columns (`cannot drop columns
+    from view` / `cannot change name of view column`). Dropping and recreating the view + re-granting
+    `SELECT` inside one transaction (one changeset on the Liquibase path; `autocommit=False` on the
+    DABs path) makes any base-table column change succeed with zero missing-view or ungranted-view
+    window for concurrent readers, while keeping the view in place between deploys so the replace
+    dependency interlock still blocks an uncoordinated `DROP TABLE`.
 
     `view_name` is the ALREADY-RESOLVED, already-validated consumer-view name (from
     `resolve_view_name`: the config override or the derived ``<tbl>_v``). Passing it in keeps ONE
@@ -293,6 +336,7 @@ def view_statements(app_schema: str, app_role: str, synced_table: str, view_name
     is an independent unit, so it self-contains its schema grant). In this single linear render it
     repeats the USAGE grant emitted by `grant_statements`, which is harmless — GRANT is idempotent."""
     return [
+        f"DROP VIEW IF EXISTS {app_schema}.{view_name}",
         f"CREATE OR REPLACE VIEW {app_schema}.{view_name} AS\n  SELECT * FROM {app_schema}.{synced_table}",
         f"GRANT USAGE  ON SCHEMA {app_schema}                 TO {app_role}",
         f"GRANT SELECT ON {app_schema}.{view_name}                TO {app_role}",

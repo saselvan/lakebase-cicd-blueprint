@@ -8,6 +8,7 @@ check can never pass quietly.
 
 verify, per configured table:
   * the app role exists and the consumer view exists;
+  * the consumer view does not have security_invoker enabled in pg_class.reloptions;
   * the app role can SELECT the view and has USAGE on the schema;
   * a real read through the view succeeds (as the deploy identity, which owns the view);
   * the app role is DENIED on the base synced table by every route: table, column, PUBLIC and
@@ -92,6 +93,20 @@ def table_checks(
         (f"role {role} exists", f"SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = '{role}')"),
         (f"consumer view {schema}.{view} exists",
          f"SELECT EXISTS(SELECT 1 FROM pg_views WHERE schemaname = '{schema}' AND viewname = '{view}')"),
+        # With security_invoker enabled on the consumer view, PostgreSQL checks privileges on the
+        # base synced table as the calling app_role (which is denied by design), even though the
+        # real-read check below runs as the deploy identity (the view owner) and still succeeds.
+        # Require the view row to exist in pg_class and have no truthy security_invoker in reloptions.
+        (f"consumer view {schema}.{view} does not have security_invoker enabled",
+         f"SELECT EXISTS ("
+         f"SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+         f" WHERE n.nspname = '{schema}' AND c.relname = '{view}' AND c.relkind = 'v')"
+         f" AND NOT EXISTS ("
+         f"SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace"
+         f" CROSS JOIN LATERAL unnest(COALESCE(c.reloptions, ARRAY[]::text[])) AS opt"
+         f" WHERE n.nspname = '{schema}' AND c.relname = '{view}' AND c.relkind = 'v'"
+         f" AND lower(btrim(split_part(opt, '=', 1))) = 'security_invoker'"
+         f" AND lower(btrim(split_part(opt, '=', 2))) NOT IN ('false', 'off', '0', 'no'))"),
         (f"role {role} can SELECT {schema}.{view}",
          f"SELECT has_table_privilege('{role}', '{schema}.{view}', 'SELECT')"),
         (f"role {role} has USAGE on schema {schema}",

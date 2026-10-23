@@ -222,20 +222,139 @@ def test_zero_index_column_table_emits_no_index_changeset(tmp_path):
 
 
 def test_changesets_are_idempotent_and_runalways(tmp_path):
-    """Grants, indexes and the view are runAlways (reapplied after a synced-table replace); the role
-    is guarded; the view is CREATE OR REPLACE; indexes are CREATE INDEX IF NOT EXISTS."""
+    """Role check, grants, indexes and the view are runAlways (reapplied on every deploy and after
+    a synced-table replace); the role changeset checks `pg_roles` and raises the clear error
+    `app role <name> does not exist; an admin must create it` (never `CREATE ROLE`); the view is
+    CREATE OR REPLACE; indexes are CREATE INDEX IF NOT EXISTS."""
     out = _generate(tmp_path)
     m = out["by_name"]["members"]
     cs = {c["id"]: c for c in m["changesets"]}
 
+    assert "runAlways:true" in cs["001-app-role"]["attrs"], cs["001-app-role"]["attrs"]
     assert "runAlways:true" in cs["002-app-grants"]["attrs"]
     assert "runAlways:true" in cs["004-app-view"]["attrs"]
     for c in _index_changesets(m):
         assert "runAlways:true" in c["attrs"], f"index changeset {c['id']} must be runAlways"
 
-    assert "IF NOT EXISTS" in cs["001-app-role"]["body"] and "CREATE ROLE" in cs["001-app-role"]["body"]
+    role_body = cs["001-app-role"]["body"]
+    active_role_sql = "\n".join(ln for ln in role_body.splitlines() if not ln.lstrip().startswith("--"))
+    assert "IF NOT EXISTS" in role_body, role_body
+    assert "RAISE EXCEPTION 'app role members_app_ro does not exist; an admin must create it';" in role_body, role_body
+    assert not re.search(r"\bCREATE\s+ROLE\b", active_role_sql, re.IGNORECASE), (
+        f"001-app-role must check the role, never CREATE ROLE:\n{role_body}"
+    )
+    assert not re.search(r"--rollback\s+DROP\s+ROLE\b", role_body, re.IGNORECASE), (
+        f"001-app-role rollback must not DROP the admin-created role:\n{role_body}"
+    )
+    assert "DROP VIEW IF EXISTS" in cs["004-app-view"]["body"], (
+        f"004-app-view must DROP VIEW IF EXISTS before CREATE so column changes succeed:\n{cs['004-app-view']['body']}"
+    )
     assert "CREATE OR REPLACE VIEW" in cs["004-app-view"]["body"]
+    assert cs["004-app-view"]["body"].index("DROP VIEW IF EXISTS") < cs["004-app-view"]["body"].index("CREATE OR REPLACE VIEW")
     assert "CREATE INDEX IF NOT EXISTS" in m["text"]
+
+
+def _strip_quotes(ident: str) -> str:
+    return ".".join(part.strip().strip('"').lower() for part in ident.split("."))
+
+
+_GRANT_RE = re.compile(
+    r"\bGRANT\s+(?P<priv>[A-Za-z_,\s]+?)\s+ON\s+(?:(?P<kind>SCHEMA|TABLE)\s+)?(?P<target>(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*))?)\s+TO\s+(?P<role>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_REVOKE_RE = re.compile(
+    r"\bREVOKE\s+(?P<priv>[A-Za-z_,\s]+?)\s+ON\s+(?:(?P<kind>SCHEMA|TABLE)\s+)?(?P<target>(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)(?:\s*\.\s*(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*))?)\s+FROM\s+(?P<role>\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_grants(sql: str) -> list[dict]:
+    """Parse every GRANT statement (active SQL lines, ignoring `-- ` comments) into normalized
+    {priv, kind, target, role} dicts."""
+    active_lines = [
+        ln for ln in sql.splitlines()
+        if not ln.lstrip().startswith("--")
+    ]
+    active_sql = "\n".join(active_lines)
+    grants = []
+    for m in _GRANT_RE.finditer(active_sql):
+        priv = " ".join(m.group("priv").upper().split())
+        kind = (m.group("kind") or "").upper()
+        target = _strip_quotes(re.sub(r"\s*\.\s*", ".", m.group("target")))
+        role = _strip_quotes(m.group("role"))
+        grants.append({"priv": priv, "kind": kind, "target": target, "role": role, "raw": m.group(0)})
+    return grants
+
+
+def _extract_revokes(sql: str, include_rollback_comments: bool = True) -> list[dict]:
+    """Parse every REVOKE statement (including `--rollback REVOKE ...` lines when requested) into
+    normalized {priv, kind, target, role} dicts."""
+    lines = []
+    for ln in sql.splitlines():
+        stripped = ln.lstrip()
+        if include_rollback_comments and stripped.lower().startswith("--rollback"):
+            lines.append(re.sub(r"^--rollback\s+", "", stripped, flags=re.IGNORECASE))
+        elif not stripped.startswith("--"):
+            lines.append(ln)
+    active_sql = "\n".join(lines)
+    revokes = []
+    for m in _REVOKE_RE.finditer(active_sql):
+        priv = " ".join(m.group("priv").upper().split())
+        kind = (m.group("kind") or "").upper()
+        target = _strip_quotes(re.sub(r"\s*\.\s*", ".", m.group("target")))
+        role = _strip_quotes(m.group("role"))
+        revokes.append({"priv": priv, "kind": kind, "target": target, "role": role, "raw": m.group(0)})
+    return revokes
+
+
+def _assert_002_least_privilege(body: str, schema: str, role: str, name: str = "table") -> None:
+    """Assert changeset 002 grants/revokes ONLY schema USAGE and zero SELECT grants/revokes."""
+    grants = _extract_grants(body)
+    revokes = _extract_revokes(body, include_rollback_comments=True)
+    assert grants, f"{name}: 002 must contain at least one GRANT:\n{body}"
+    for g in grants:
+        assert "SELECT" not in g["priv"].split(), (
+            f"{name}: 002 must not grant SELECT (least privilege), found {g['raw']!r} targeting {g['target']!r}"
+        )
+        assert g["priv"] == "USAGE" and g["kind"] == "SCHEMA" and g["target"] == schema.lower() and g["role"] == role.lower(), (
+            f"{name}: 002 unexpected grant {g}"
+        )
+    assert revokes, f"{name}: 002 must contain at least one rollback REVOKE:\n{body}"
+    for r in revokes:
+        assert "SELECT" not in r["priv"].split(), (
+            f"{name}: 002 rollback must not revoke SELECT on base table, found {r['raw']!r} targeting {r['target']!r}"
+        )
+        assert r["priv"] == "USAGE" and r["kind"] == "SCHEMA" and r["target"] == schema.lower() and r["role"] == role.lower(), (
+            f"{name}: 002 unexpected rollback revoke {r}"
+        )
+
+
+def _assert_changelog_select_targets_only_view(text: str, expected_view_fqn: str, expected_role: str, name: str = "table") -> None:
+    """Assert across the whole changelog that every GRANT SELECT or REVOKE SELECT targets ONLY
+    `<app_schema>.<view_name>` (and zero base-table SELECT grants/revokes exist in any spelling)."""
+    grants = _extract_grants(text)
+    select_grants = [g for g in grants if "SELECT" in g["priv"].split()]
+    assert len(select_grants) == 1, (
+        f"{name}: expected exactly 1 GRANT SELECT (in 004 on {expected_view_fqn}), found {len(select_grants)}: {select_grants}"
+    )
+    for g in select_grants:
+        assert g["kind"] != "TABLE", (
+            f"{name}: GRANT SELECT must not use ON TABLE ({g['raw']!r})"
+        )
+        assert g["target"] == expected_view_fqn.lower(), (
+            f"{name}: GRANT SELECT target {g['target']!r} != expected consumer view {expected_view_fqn.lower()!r} ({g['raw']!r})"
+        )
+        assert g["role"] == expected_role.lower(), (
+            f"{name}: GRANT SELECT role {g['role']!r} != expected {expected_role.lower()!r}"
+        )
+
+    revokes = _extract_revokes(text, include_rollback_comments=True)
+    select_revokes = [r for r in revokes if "SELECT" in r["priv"].split()]
+    for r in select_revokes:
+        assert r["kind"] != "TABLE" and r["target"] == expected_view_fqn.lower(), (
+            f"{name}: REVOKE SELECT target {r['target']!r} (kind={r['kind']!r}) != consumer view {expected_view_fqn.lower()!r} ({r['raw']!r})"
+        )
 
 
 def test_grants_changeset_is_usage_only_no_base_table_select(tmp_path):
@@ -243,48 +362,113 @@ def test_grants_changeset_is_usage_only_no_base_table_select(tmp_path):
     table (the app role reads only through the consumer view, whose owner holds the base-table
     privilege). Its rollback revokes USAGE only — there is no base-table grant to revoke.
 
-    MUTATION GATE: re-add the base-table SELECT grant (and its REVOKE) and this goes RED.
+    MUTATION GATE: re-add the base-table SELECT grant (and its REVOKE) in any SQL spelling and this goes RED.
     """
     out = _generate(tmp_path)
+    rows_by_name = {r["name"]: r for r in _fixture_rows()}
     for name, entry in out["by_name"].items():
+        row = rows_by_name[name]
         cs = {c["id"]: c for c in entry["changesets"]}
         body = cs["002-app-grants"]["body"]
-        assert "GRANT USAGE" in body, f"{name}: 002 must still grant schema USAGE:\n{body}"
-        assert "GRANT SELECT ON TABLE" not in body, (
-            f"{name}: 002 must not grant SELECT on the base table (least privilege):\n{body}"
-        )
-        assert "REVOKE SELECT ON TABLE" not in body, (
-            f"{name}: 002 rollback must not revoke a base-table SELECT that is no longer granted:\n{body}"
-        )
+        _assert_002_least_privilege(body, row["app_schema"], row["app_role"], name=name)
 
 
 def test_only_view_select_is_granted_across_changelog(tmp_path):
-    """Across a table's whole changelog, every `GRANT SELECT` targets the consumer view (…_v /
-    override) — never `GRANT SELECT ON TABLE` on the base synced table. MUTATION GATE: re-add the
-    base-table SELECT grant and this goes RED."""
+    """Across a table's whole changelog, every `GRANT SELECT` (and any `REVOKE SELECT`) targets the
+    resolved consumer view (`<app_schema>.<view_name>`) — never the base synced table in any
+    spelling (with/without TABLE keyword, quoted identifiers, multiline/extra whitespace, lowercase).
+    MUTATION GATE: re-add the base-table SELECT grant or rollback REVOKE and this goes RED."""
     out = _generate(tmp_path)
+    rows_by_name = {r["name"]: r for r in _fixture_rows()}
     for name, entry in out["by_name"].items():
-        for line in entry["text"].splitlines():
-            if line.strip().startswith("GRANT SELECT"):
-                assert "ON TABLE" not in line, f"{name}: a GRANT SELECT targets a base table:\n{line}"
+        row = rows_by_name[name]
+        pg_tbl = gen.pg_table_name(row)
+        view = gen.resolve_view_name(row, pg_tbl)
+        expected_view_fqn = f"{row['app_schema']}.{view}"
+        _assert_changelog_select_targets_only_view(
+            entry["text"], expected_view_fqn, row["app_role"], name=name
+        )
+
+
+@pytest.mark.parametrize(
+    "spelling_id,grant_sql",
+    [
+        ("3a_no_table_kw", "GRANT SELECT ON shared_schema.members_synced TO members_app_ro;"),
+        ("3b_with_table_kw", "GRANT SELECT ON TABLE shared_schema.members_synced TO members_app_ro;"),
+        ("3c_quoted_idents", 'GRANT SELECT ON "shared_schema"."members_synced" TO "members_app_ro";'),
+        ("3d_multiline_ws", "GRANT   SELECT\n  ON\n  shared_schema.members_synced TO members_app_ro;"),
+        ("3e_lowercase", "grant select on shared_schema.members_synced to members_app_ro;"),
+    ],
+)
+def test_least_privilege_parser_catches_all_five_grant_select_spellings(tmp_path, spelling_id, grant_sql):
+    """Attacker 3a-3e: injecting a base-table GRANT SELECT into changeset 002 in any of the 5 SQL
+    spellings is caught by both _assert_002_least_privilege and _assert_changelog_select_targets_only_view."""
+    out = _generate(tmp_path)
+    entry = out["by_name"]["members"]
+    cs_002 = next(c for c in entry["changesets"] if c["id"] == "002-app-grants")
+    mutated_002 = cs_002["body"] + "\n" + grant_sql
+    mutated_text = entry["text"] + "\n" + grant_sql
+
+    with pytest.raises(AssertionError, match="SELECT"):
+        _assert_002_least_privilege(mutated_002, "shared_schema", "members_app_ro", name=spelling_id)
+
+    with pytest.raises(AssertionError, match="SELECT"):
+        _assert_changelog_select_targets_only_view(
+            mutated_text, "shared_schema.members_synced_v", "members_app_ro", name=spelling_id
+        )
+
+
+@pytest.mark.parametrize(
+    "spelling_id,revoke_sql",
+    [
+        ("4a_no_table_kw", "--rollback REVOKE SELECT ON shared_schema.members_synced FROM members_app_ro;"),
+        ("4b_with_table_kw", "--rollback REVOKE SELECT ON TABLE shared_schema.members_synced FROM members_app_ro;"),
+        ("4c_quoted_idents", '--rollback REVOKE SELECT ON "shared_schema"."members_synced" FROM "members_app_ro";'),
+        ("4d_multiline_ws", "REVOKE   SELECT\n  ON\n  shared_schema.members_synced FROM members_app_ro;"),
+        ("4e_lowercase", "--rollback revoke select on shared_schema.members_synced from members_app_ro;"),
+    ],
+)
+def test_least_privilege_parser_catches_all_five_revoke_select_spellings(tmp_path, spelling_id, revoke_sql):
+    """Attacker 4a-4e: injecting a base-table REVOKE SELECT into changeset 002 rollback (or body)
+    in any of the 5 SQL spellings is caught by both _assert_002_least_privilege and
+    _assert_changelog_select_targets_only_view."""
+    out = _generate(tmp_path)
+    entry = out["by_name"]["members"]
+    cs_002 = next(c for c in entry["changesets"] if c["id"] == "002-app-grants")
+    mutated_002 = cs_002["body"] + "\n" + revoke_sql
+    mutated_text = entry["text"] + "\n" + revoke_sql
+
+    with pytest.raises(AssertionError, match="SELECT"):
+        _assert_002_least_privilege(mutated_002, "shared_schema", "members_app_ro", name=spelling_id)
+
+    with pytest.raises(AssertionError, match="SELECT"):
+        _assert_changelog_select_targets_only_view(
+            mutated_text, "shared_schema.members_synced_v", "members_app_ro", name=spelling_id
+        )
 
 
 def test_role_changeset_is_runonchange(tmp_path):
-    """R3: the 001-app-role changeset MUST be runOnChange:true.
+    """R3 & Attacker 4: the 001-app-role changeset MUST carry `runAlways:true runOnChange:true splitStatements:false`.
 
-    Liquibase folds a formatted-SQL changeset's body — INCLUDING its `-- ` comment lines — into the
-    changeset checksum. The guard body (role_guard_sql) and its comments are the most likely thing
-    to be reworded over time; with the default runOnChange:false, ANY such wording change flips the
-    checksum and every EXISTING deploy fails validation on `001-app-role`. The guard is idempotent
-    (CREATE ROLE wrapped in a pg_roles existence check), so re-running it is safe -> runOnChange:true
-    is correct. splitStatements:false must be preserved (the DO block has internal semicolons).
+    `runAlways:true` ensures Liquibase checks `pg_roles` on every deploy (even if an admin dropped
+    a role after deploy 1). `runOnChange:true` ensures a future rewording of the guard body or its
+    comments re-runs cleanly instead of failing checksum validation on existing deploys.
+    `splitStatements:false` sends the DO block as one statement. And its body must check the role
+    via RAISE EXCEPTION (never CREATE ROLE) and its rollback must never DROP ROLE.
 
-    MUTATION GATE: revert the role changeset to runOnChange:false and this goes RED.
+    MUTATION GATE: revert `001-app-role` to `CREATE ROLE` or drop `runAlways:true` / `runOnChange:true`
+    and this goes RED.
     """
     out = _generate(tmp_path)
+    rows_by_name = {r["name"]: r for r in _fixture_rows()}
     for name, entry in out["by_name"].items():
+        row = rows_by_name[name]
+        app_role = row["app_role"]
         cs = {c["id"]: c for c in entry["changesets"]}
         role = cs["001-app-role"]
+        assert "runAlways:true" in role["attrs"], (
+            f"{name}: 001-app-role must be runAlways:true so every deploy checks the role, got attrs={role['attrs']!r}"
+        )
         assert "runOnChange:true" in role["attrs"], (
             f"{name}: 001-app-role must be runOnChange:true, got attrs={role['attrs']!r}"
         )
@@ -295,19 +479,42 @@ def test_role_changeset_is_runonchange(tmp_path):
         assert "splitStatements:false" in role["attrs"], (
             f"{name}: 001-app-role must keep splitStatements:false: {role['attrs']!r}"
         )
+        expected_err = f"RAISE EXCEPTION 'app role {app_role} does not exist; an admin must create it';"
+        assert expected_err in role["body"], (
+            f"{name}: 001-app-role missing exact error message {expected_err!r}:\n{role['body']}"
+        )
+        active_sql = "\n".join(ln for ln in role["body"].splitlines() if not ln.lstrip().startswith("--"))
+        assert not re.search(r"\bCREATE\s+ROLE\b", active_sql, re.IGNORECASE), (
+            f"{name}: 001-app-role must not CREATE ROLE:\n{role['body']}"
+        )
+        assert not re.search(r"--rollback\s+DROP\s+ROLE\b", role["body"], re.IGNORECASE), (
+            f"{name}: 001-app-role rollback must not DROP ROLE:\n{role['body']}"
+        )
 
 
 def test_committed_role_changeset_is_runonchange():
-    """R3, committed artifact: the checked-in generated changelogs carry runOnChange:true on
-    001-app-role (so the drift check and CI reflect the fix, not just a fresh generation)."""
-    role_lines = []
+    """R3 & Attacker 4/5, committed artifact: the checked-in generated changelogs carry
+    `runAlways:true` and `runOnChange:true` on `001-app-role`, emit the exact `RAISE EXCEPTION`
+    message, and contain no `CREATE ROLE` or `DROP ROLE`."""
+    role_entries = []
     for f in sorted(COMMITTED_GENERATED.glob("*.changelog.sql")):
         for cs in _parse_changesets(f.read_text()):
             if cs["id"] == "001-app-role":
-                role_lines.append((f.name, cs["attrs"]))
-    assert role_lines, "no committed 001-app-role changeset found"
-    for fname, attrs in role_lines:
+                role_entries.append((f.name, cs["attrs"], cs["body"]))
+    assert role_entries, "no committed 001-app-role changeset found"
+    for fname, attrs, body in role_entries:
+        assert "runAlways:true" in attrs, f"{fname}: committed 001-app-role not runAlways:true ({attrs!r})"
         assert "runOnChange:true" in attrs, f"{fname}: committed 001-app-role not runOnChange:true ({attrs!r})"
+        assert "does not exist; an admin must create it" in body, (
+            f"{fname}: committed 001-app-role missing clear error message:\n{body}"
+        )
+        active_sql = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("--"))
+        assert not re.search(r"\bCREATE\s+ROLE\b", active_sql, re.IGNORECASE), (
+            f"{fname}: committed 001-app-role still contains CREATE ROLE:\n{body}"
+        )
+        assert not re.search(r"--rollback\s+DROP\s+ROLE\b", body, re.IGNORECASE), (
+            f"{fname}: committed 001-app-role rollback still contains DROP ROLE:\n{body}"
+        )
 
 
 def test_generated_changelog_has_no_property_placeholders(tmp_path):
@@ -657,3 +864,95 @@ def test_duplicate_resolved_view_names_are_rejected(tmp_path):
     msg = str(exc.value)
     assert "alpha" in msg and "beta" in msg, f"error must name both colliding entries: {msg}"
     assert "members_v" in msg, f"error must name the colliding view: {msg}"
+
+
+# --- 5g. cross-entry table-name uniqueness (exact + case-insensitive) ---------------------------
+#
+# Each table row's `name` drives the changelog filename (`<name>.changelog.sql`) and the DABs
+# resource key (`<name>.yml` / `postgres_synced_tables.<name>`). Two rows with the same `name`
+# (even across different schemas, or differing only in case) would silently overwrite the first
+# changelog and collapse in `check_drift`'s dict keyed by filename. Both generators + `load_tables`
+# must reject duplicate `name` values and name the duplicate.
+
+def _dup_name_rows(second_name: str = "members") -> list[dict]:
+    """Two config rows with the same (or case-colliding) `name` in different schemas."""
+    return [
+        {
+            "name": "members",
+            "synced_table_id": "cat_a.s1.members_a",
+            "source_table_full_name": "cat_a.raw.members_a_src",
+            "primary_key_columns": ["id"],
+            "app_schema": "s1",
+            "app_role": "members_s1_ro",
+            "index_columns": [],
+        },
+        {
+            "name": second_name,
+            "synced_table_id": "cat_a.s2.members_b",
+            "source_table_full_name": "cat_a.raw.members_b_src",
+            "primary_key_columns": ["id"],
+            "app_schema": "s2",
+            "app_role": "members_s2_ro",
+            "index_columns": [],
+        },
+    ]
+
+
+@pytest.mark.parametrize("second_name", ["members", "MEMBERS", "Members"])
+def test_duplicate_table_names_rejected_in_write_changelogs_and_load_tables(tmp_path, second_name):
+    """Attacker 1 & 2: Two rows with the same `name` (exact or case-insensitive) and different
+    schemas are rejected by `write_changelogs` and `load_tables`, naming the duplicate as a
+    duplicate table name."""
+    rows = _dup_name_rows(second_name)
+    with pytest.raises(ValueError) as exc_write:
+        gen.write_changelogs(rows, tmp_path / "out")
+    msg_write = str(exc_write.value).lower()
+    assert "members" in msg_write and "duplicate" in msg_write, (
+        f"write_changelogs error must name the duplicate 'members': {exc_write.value}"
+    )
+
+    cfg = tmp_path / "dup_name.json"
+    cfg.write_text(json.dumps(rows))
+    with pytest.raises(ValueError) as exc_load:
+        gen.load_tables(cfg)
+    msg_load = str(exc_load.value).lower()
+    assert "members" in msg_load and "duplicate" in msg_load, (
+        f"load_tables error must name the duplicate 'members': {exc_load.value}"
+    )
+
+
+@pytest.mark.parametrize("second_name", ["members", "MEMBERS", "Members"])
+def test_duplicate_table_names_rejected_in_check_drift_and_cli(tmp_path, second_name):
+    """Attacker 1 & 2: `check_drift` and `generate_changelogs.py --check` reject a config with
+    duplicate `name` (exact or case-insensitive) instead of collapsing the dict by filename."""
+    rows = _dup_name_rows(second_name)
+    cfg = tmp_path / "dup_name.json"
+    cfg.write_text(json.dumps(rows))
+
+    with pytest.raises(ValueError) as exc_drift:
+        gen.check_drift(cfg, COMMITTED_GENERATED)
+    msg_drift = str(exc_drift.value).lower()
+    assert "members" in msg_drift and "duplicate" in msg_drift, (
+        f"check_drift error must name the duplicate 'members': {exc_drift.value}"
+    )
+
+    res_check = subprocess.run(
+        [sys.executable, str(GEN_PATH), "--check", "--config", str(cfg), "--out", str(COMMITTED_GENERATED)],
+        capture_output=True, text=True,
+    )
+    assert res_check.returncode != 0, f"--check exited 0 on duplicate name {second_name!r}"
+    out_check = (res_check.stderr + res_check.stdout).lower()
+    assert "members" in out_check and "duplicate" in out_check, (
+        f"--check output did not name duplicate 'members':\n{res_check.stderr}\n{res_check.stdout}"
+    )
+
+    res_gen = subprocess.run(
+        [sys.executable, str(GEN_PATH), "--config", str(cfg), "--out", str(tmp_path / "gen_out")],
+        capture_output=True, text=True,
+    )
+    assert res_gen.returncode != 0, f"generate CLI exited 0 on duplicate name {second_name!r}"
+    out_gen = (res_gen.stderr + res_gen.stdout).lower()
+    assert "members" in out_gen and "duplicate" in out_gen, (
+        f"generate CLI output did not name duplicate 'members':\n{res_gen.stderr}\n{res_gen.stdout}"
+    )
+

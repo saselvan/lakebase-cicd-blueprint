@@ -175,6 +175,99 @@ else
 fi
 expect nonzero "view owner without base SELECT -> non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
 
+echo ""; echo "===== NEGATIVE: consumer view has security_invoker enabled (Attackers 1, 2, 3, 4, 5) ====="
+# Restore valid view ownership + least-privilege grants first.
+psql -v ON_ERROR_STOP=1 -q \
+  -c "ALTER VIEW $SCHEMA.$VIEW OWNER TO postgres;" \
+  -c "GRANT USAGE ON SCHEMA $SCHEMA TO $ROLE;" \
+  -c "GRANT SELECT ON $SCHEMA.$VIEW TO $ROLE;" \
+  -c "REVOKE ALL ON $SCHEMA.$TABLE FROM $ROLE;"
+
+# Attacker 1: ALTER VIEW ... SET (security_invoker = true) fails both verify_table and dabs/checks.py
+psql -v ON_ERROR_STOP=1 -q -c "ALTER VIEW $SCHEMA.$VIEW SET (security_invoker = true);"
+sec_out="$(set +e; verify_table "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code 2>&1; set -e)"
+if printf '%s\n' "$sec_out" | grep -q "FAIL consumer view $SCHEMA.$VIEW does not have security_invoker enabled"; then
+  echo "  OK   verify_table emitted FAIL line naming $SCHEMA.$VIEW and security_invoker"
+else
+  echo "  FAIL verify_table did not emit expected security_invoker FAIL line"; fail=1
+fi
+expect nonzero "security_invoker = true -> verify_table non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+
+# Attacker 2: other truthy spellings (on, 1, yes) and Attacker 4 (alongside security_barrier = true)
+for spell in "security_invoker = on" "security_invoker = 1" "security_invoker = yes" "security_barrier = true, security_invoker = true"; do
+  psql -v ON_ERROR_STOP=1 -q -c "ALTER VIEW $SCHEMA.$VIEW SET ($spell);"
+  expect nonzero "$spell -> verify_table non-zero exit" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+done
+
+# Attacker 3 & 5: security_invoker = false / RESET and another schema's view with security_invoker = true
+psql -v ON_ERROR_STOP=1 -q \
+  -c "CREATE SCHEMA IF NOT EXISTS other_sch;" \
+  -c "CREATE OR REPLACE VIEW other_sch.$VIEW WITH (security_invoker = true) AS SELECT 1 AS id;" \
+  -c "ALTER VIEW $SCHEMA.$VIEW SET (security_invoker = false);"
+expect 0 "security_invoker = false (with other_sch.$VIEW security_invoker = true) -> exit 0" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+psql -v ON_ERROR_STOP=1 -q \
+  -c "ALTER VIEW $SCHEMA.$VIEW RESET (security_invoker, security_barrier);" \
+  -c "DROP SCHEMA other_sch CASCADE;"
+expect 0 "RESET (security_invoker) -> exit 0" "$ROLE" "$SCHEMA" "$TABLE" "$VIEW" member_id plan_code
+
+echo ""; echo "===== PR-VALIDATE WORKFLOW PATH: verify_table_from_row on config/tables.json row ====="
+# Restore valid view ownership + least-privilege grants, then exercise the exact helper function
+# (.github/workflows/pr-validate.yml -> verify_table_from_row "$ROW") against real Postgres 16.
+psql -v ON_ERROR_STOP=1 -q \
+  -c "ALTER VIEW $SCHEMA.$VIEW OWNER TO postgres;" \
+  -c "GRANT USAGE ON SCHEMA $SCHEMA TO $ROLE;" \
+  -c "GRANT SELECT ON $SCHEMA.$VIEW TO $ROLE;" \
+  -c "REVOKE ALL ON $SCHEMA.$TABLE FROM $ROLE;"
+MEMBERS_ROW="$(python3 -c "import json; print(json.dumps(json.load(open('$REPO_ROOT/config/tables.json'))[0], separators=(',',':')))")"
+run_verify_row() { set +e; verify_table_from_row "$1"; local rc=$?; set -e; return "$rc"; }
+expect_row() {
+  local want="$1" label="$2" row="$3" rc=0
+  run_verify_row "$row" || rc=$?
+  if { [ "$want" = 0 ] && [ "$rc" -eq 0 ]; } || { [ "$want" = nonzero ] && [ "$rc" -ne 0 ]; }; then
+    echo "  OK   $label (rc=$rc)"
+  else
+    echo "  FAIL $label (rc=$rc, wanted $want)"; fail=1
+  fi
+}
+expect_row 0 "pr-validate verify_table_from_row: all post-conditions met -> exit 0" "$MEMBERS_ROW"
+
+psql -v ON_ERROR_STOP=1 -q -c "REVOKE SELECT ON $SCHEMA.$VIEW FROM $ROLE;"
+expect_row nonzero "pr-validate verify_table_from_row: missing view SELECT grant -> non-zero exit" "$MEMBERS_ROW"
+
+psql -v ON_ERROR_STOP=1 -q \
+  -c "GRANT SELECT ON $SCHEMA.$VIEW TO $ROLE;" \
+  -c "GRANT SELECT ON $SCHEMA.$TABLE TO $ROLE;"
+expect_row nonzero "pr-validate verify_table_from_row: base-table SELECT grant -> non-zero exit" "$MEMBERS_ROW"
+psql -v ON_ERROR_STOP=1 -q -c "REVOKE ALL ON $SCHEMA.$TABLE FROM $ROLE;"
+
+psql -v ON_ERROR_STOP=1 -q -c "ALTER VIEW $SCHEMA.$VIEW SET (security_invoker = true);"
+expect_row nonzero "pr-validate verify_table_from_row: security_invoker = true -> non-zero exit" "$MEMBERS_ROW"
+psql -v ON_ERROR_STOP=1 -q -c "ALTER VIEW $SCHEMA.$VIEW RESET (security_invoker);"
+expect_row 0 "pr-validate verify_table_from_row: security_invoker reset -> exit 0" "$MEMBERS_ROW"
+
+echo ""; echo "===== MUTATED CHANGELOG: GRANT SELECT on base table in 002 fails verify ====="
+mut_dir="$(mktemp -d "${TMPDIR:-/tmp}/verify_mut_cl.XXXXXX")"
+python3 - "$REPO_ROOT/liquibase/generated/members.changelog.sql" "$mut_dir/members.mutated.sql" <<'PY'
+import sys
+from pathlib import Path
+src = Path(sys.argv[1]).read_text()
+# Inject base-table SELECT grant into changeset 002 (no TABLE keyword — matches offline Attacker 3a)
+target = "--changeset cicd:002-app-grants runAlways:true\n"
+assert target in src
+mut = src.replace(
+    target,
+    target + "GRANT SELECT ON cicd_proj.members TO members_app_ro;\n",
+    1,
+)
+assert "GRANT SELECT ON cicd_proj.members TO members_app_ro;" in mut
+Path(sys.argv[2]).write_text(mut)
+PY
+# Apply the active SQL of the mutated changelog against Docker PG16, then run verify_table_from_row:
+grep -v '^--' "$mut_dir/members.mutated.sql" | psql -v ON_ERROR_STOP=1 -q >/dev/null
+expect_row nonzero "mutated changelog with GRANT SELECT ON cicd_proj.members -> verify fails" "$MEMBERS_ROW"
+psql -v ON_ERROR_STOP=1 -q -c "REVOKE ALL ON $SCHEMA.$TABLE FROM $ROLE;"
+rm -rf "$mut_dir"
+
 echo ""
 if [ "$fail" = 0 ]; then
   echo "VERDICT: PASS — verify exits 0 only when the app role can read the view AND all indexes exist."

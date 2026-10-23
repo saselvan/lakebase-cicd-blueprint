@@ -6,6 +6,9 @@ name: pr-cleanup
 on:
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 jobs:
   cleanup:
     runs-on: ubuntu-latest
@@ -15,8 +18,12 @@ jobs:
       DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
       PROJECT: my-lakebase-project
     steps:
-      - name: Install Databricks CLI
-        run: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+      - name: Set up Databricks CLI
+        uses: databricks/setup-cli@9230f12203ef173d0b901846f62a55ce997efef7 # v1.19.0
+        with:
+          version: "1.19.0"
       - name: Delete branch
+        env:
+          PR_NUMBER: ${{ github.event.number }}
         run: |
-          databricks postgres delete-branch "projects/$PROJECT/branches/pr-${{ github.event.number }}" || true
+          databricks postgres delete-branch "projects/$PROJECT/branches/pr-${PR_NUMBER}" || true

@@ -105,15 +105,30 @@ def test_run_checks_runs_every_check_after_a_failure():
 # --- pure: which checks exist --------------------------------------------------------------------
 
 def test_verify_checks_cover_every_table_and_index():
-    """Every configured table gets the access checks, the denied-on-table check and one check per
-    index column (hostile: two tables, two indexes each — a hardcoded first table fails)."""
+    """Every configured table gets the access checks, the no-security_invoker check, the
+    denied-on-table check and one check per index column (hostile: two tables, two indexes each,
+    plus a custom view_name override — a hardcoded first table or default view_v fails)."""
     labels = [label for label, _ in checks.verify_checks(TABLES)]
     for t in TABLES:
         tbl = t["synced_table_id"].split(".")[-1]
+        schema = t["app_schema"]
+        view = t.get("view_name") or f"{tbl}_v"
         role = t["app_role"]
         assert any(role in lb and "denied" in lb and tbl in lb for lb in labels), (role, labels)
+        assert f"consumer view {schema}.{view} does not have security_invoker enabled" in labels, (
+            view,
+            labels,
+        )
         for col in t["index_columns"]:
             assert any(f"idx_{tbl}_{col}" in lb for lb in labels), (col, labels)
+
+    # Hostile element (Attacker 8): custom view_name override must be checked for security_invoker
+    custom_tables = [dict(TABLES[0], view_name="members_custom_v"), TABLES[1]]
+    custom_labels = [label for label, _ in checks.verify_checks(custom_tables)]
+    assert (
+        "consumer view cicd_proj.members_custom_v does not have security_invoker enabled"
+        in custom_labels
+    ), custom_labels
 
 
 @pytest.mark.parametrize("bad", ["", "  ", "PLACEHOLDER_SERVICE_PRINCIPAL_APPLICATION_ID",
@@ -277,11 +292,128 @@ def test_terraform_verify_table_fails_when_app_role_can_reach_synced_table(deplo
 
 @_needs_pg
 def test_verify_fails_when_the_view_is_gone(deployed):
-    """A replace leaves no view: verify fails (the view checks), and a missing base table does not
-    crash the run."""
+    """A replace leaves no view: verify fails (the view checks, including the security_invoker
+    check), and a missing base table does not crash the run."""
     res = deployed("DROP VIEW cicd_proj.members_v;")
     assert res.returncode == 0, res.stderr
-    assert _verify_failures(deployed), "verify passed with the consumer view dropped"
+    fails = _verify_failures(deployed)
+    assert fails, "verify passed with the consumer view dropped"
+    assert any(
+        "consumer view cicd_proj.members_v does not have security_invoker enabled" in f
+        for f in fails
+    ), f"dropped view must also fail the security_invoker check rather than vacuously passing: {fails}"
+
+
+@_needs_pg
+@pytest.mark.parametrize(
+    "alter_sql,expected_view",
+    [
+        # Attacker 1: canonical security_invoker = true on table 1 view
+        ("ALTER VIEW cicd_proj.members_v SET (security_invoker = true)", "cicd_proj.members_v"),
+        # Attacker 2: other truthy spellings PostgreSQL 16 accepts (on, 1, yes)
+        ("ALTER VIEW cicd_proj.members_v SET (security_invoker = on)", "cicd_proj.members_v"),
+        ("ALTER VIEW cicd_proj.members_v SET (security_invoker = 1)", "cicd_proj.members_v"),
+        ("ALTER VIEW cicd_proj.members_v SET (security_invoker = yes)", "cicd_proj.members_v"),
+        # Attacker 4: a second option (security_barrier = true) next to security_invoker = true
+        (
+            "ALTER VIEW cicd_proj.members_v SET (security_barrier = true, security_invoker = true)",
+            "cicd_proj.members_v",
+        ),
+        # Attacker 9: hostile second table (providers_v) has security_invoker = true while members_v is clean
+        ("ALTER VIEW cicd_proj.providers_v SET (security_invoker = true)", "cicd_proj.providers_v"),
+    ],
+)
+def test_verify_fails_when_consumer_view_has_security_invoker_enabled(
+    deployed, alter_sql, expected_view
+):
+    """Attackers 1, 2, 4, 9: when security_invoker is set to any truthy value on the consumer view
+    (even alongside security_barrier = true, and even though the deploy identity's own real-read
+    SELECT still succeeds), both DABs verify and scripts/verify_table.sh must fail on the check
+    naming that view and security_invoker."""
+    res = deployed(f"{alter_sql};")
+    assert res.returncode == 0, res.stderr
+
+    # 1) DABs verify path (dabs/checks.py)
+    fails = _verify_failures(deployed)
+    assert len(fails) == 1, (
+        f"expected exactly 1 failure (the security_invoker check on {expected_view}), got: {fails}"
+    )
+    assert f"FAIL consumer view {expected_view} does not have security_invoker enabled" in fails[0], (
+        fails
+    )
+
+    # 2) Terraform verify path (scripts/verify_table.sh) for that table
+    verify_sh = REPO_ROOT / "scripts" / "verify_table.sh"
+    if expected_view.endswith("members_v"):
+        args = ["members_app_ro", "cicd_proj", "members", "members_v", "member_id", "plan_code"]
+    else:
+        args = [
+            "providers_app_ro",
+            "cicd_proj",
+            "providers",
+            "providers_v",
+            "provider_id",
+            "specialty_code",
+        ]
+    r = subprocess.run(
+        ["bash", str(verify_sh), *args],
+        env=deployed.env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert (
+        f"FAIL consumer view {expected_view} does not have security_invoker enabled" in r.stdout
+    ), r.stdout + r.stderr
+
+
+@_needs_pg
+def test_verify_passes_when_security_invoker_is_false_or_on_other_schema_view(deployed):
+    """Attackers 3, 4, 5:
+    - Hostile row 1 (Attacker 5): another schema (`other_sch`) has a view with the SAME name
+      `members_v` and `security_invoker = true` -> must NOT false-FAIL `cicd_proj.members_v`.
+    - Hostile row 2 (Attacker 3 & 4): `cicd_proj.members_v` has `security_barrier = true` and
+      explicit falsy `security_invoker` (`false`, `off`, `0`, `no`) or `RESET (security_invoker)` ->
+      verify passes on both paths."""
+    res = deployed(
+        "CREATE SCHEMA other_sch;\n"
+        "CREATE VIEW other_sch.members_v WITH (security_invoker = true) AS SELECT 1 AS id;\n"
+    )
+    assert res.returncode == 0, res.stderr
+    assert _verify_failures(deployed) == []
+
+    for falsy_stmt in (
+        "ALTER VIEW cicd_proj.members_v SET (security_invoker = false)",
+        "ALTER VIEW cicd_proj.members_v SET (security_invoker = off)",
+        "ALTER VIEW cicd_proj.members_v SET (security_invoker = 0)",
+        "ALTER VIEW cicd_proj.members_v SET (security_invoker = no)",
+        "ALTER VIEW cicd_proj.members_v SET (security_barrier = true, security_invoker = false)",
+        "ALTER VIEW cicd_proj.members_v RESET (security_invoker)",
+    ):
+        res = deployed(f"{falsy_stmt};")
+        assert res.returncode == 0, res.stderr
+        assert _verify_failures(deployed) == [], f"false FAIL after {falsy_stmt}"
+
+    verify_sh = REPO_ROOT / "scripts" / "verify_table.sh"
+    r = subprocess.run(
+        [
+            "bash",
+            str(verify_sh),
+            "members_app_ro",
+            "cicd_proj",
+            "members",
+            "members_v",
+            "member_id",
+            "plan_code",
+        ],
+        env=deployed.env,
+        capture_output=True,
+        text=True,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (
+        "PASS consumer view cicd_proj.members_v does not have security_invoker enabled" in r.stdout
+    ), r.stdout
 
 
 @_needs_pg
@@ -368,6 +500,7 @@ print(json.dumps({"count": len(v_checks), "labels": [c[0] for c in v_checks]}))
         f"STDOUT:{proc.stdout}\nSTDERR:{proc.stderr}"
     )
     out = json.loads(proc.stdout.strip().splitlines()[-1])
-    assert out["count"] == 16, out
+    assert out["count"] == 18, out
     assert any("is denied on synced table" in lbl for lbl in out["labels"]), out
+    assert any("does not have security_invoker enabled" in lbl for lbl in out["labels"]), out
 

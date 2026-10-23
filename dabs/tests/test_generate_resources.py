@@ -478,3 +478,65 @@ def test_distinct_view_names_in_one_schema_still_generate(tmp_path):
     cfg.write_text(json.dumps(rows))
     written = write_resources(load_tables(cfg), tmp_path / "out")
     assert written, "distinct view names should generate resources"
+
+
+def _dup_table_name_rows(second_name: str = "members") -> list[dict]:
+    return [
+        {
+            "name": "members",
+            "synced_table_id": "cat_a.s1.members_a",
+            "source_table_full_name": "cat_a.raw.members_a_src",
+            "primary_key_columns": ["id"],
+            "app_schema": "s1",
+            "app_role": "members_s1_ro",
+            "index_columns": [],
+        },
+        {
+            "name": second_name,
+            "synced_table_id": "cat_a.s2.members_b",
+            "source_table_full_name": "cat_a.raw.members_b_src",
+            "primary_key_columns": ["id"],
+            "app_schema": "s2",
+            "app_role": "members_s2_ro",
+            "index_columns": [],
+        },
+    ]
+
+
+@pytest.mark.parametrize("second_name", ["members", "MEMBERS", "Members"])
+def test_duplicate_table_names_rejected_in_dabs_generator(tmp_path, second_name):
+    """Attacker 1 & 2: Two config rows with the same `name` (exact or case-insensitive) and
+    different schemas are rejected by `write_resources`, `check_drift`, `load_tables`, and CLI
+    `--check`, naming the duplicate."""
+    from dabs.generate_resources import check_drift, load_tables, write_resources
+
+    rows = _dup_table_name_rows(second_name)
+    with pytest.raises(ValueError) as exc_write:
+        write_resources(rows, tmp_path / "out")
+    assert "members" in str(exc_write.value).lower(), (
+        f"write_resources error must name duplicate 'members': {exc_write.value}"
+    )
+
+    cfg = tmp_path / "dup_name.json"
+    cfg.write_text(json.dumps(rows))
+    with pytest.raises(ValueError) as exc_load:
+        load_tables(cfg)
+    assert "members" in str(exc_load.value).lower(), (
+        f"load_tables error must name duplicate 'members': {exc_load.value}"
+    )
+
+    with pytest.raises(ValueError) as exc_drift:
+        check_drift(cfg, COMMITTED_RESOURCES)
+    assert "members" in str(exc_drift.value).lower(), (
+        f"check_drift error must name duplicate 'members': {exc_drift.value}"
+    )
+
+    res_check = subprocess.run(
+        [sys.executable, "-m", "dabs.generate_resources", "--check", "--config", str(cfg), "--out", str(COMMITTED_RESOURCES)],
+        cwd=str(REPO_ROOT), capture_output=True, text=True,
+    )
+    assert res_check.returncode != 0, f"dabs generate_resources --check exited 0 on duplicate name {second_name!r}"
+    assert "members" in (res_check.stderr + res_check.stdout).lower(), (
+        f"--check output did not name duplicate 'members':\n{res_check.stderr}\n{res_check.stdout}"
+    )
+

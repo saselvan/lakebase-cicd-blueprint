@@ -52,6 +52,7 @@ from dabs.render_ddl import (  # noqa: E402  (path insertion must precede this i
     resolve_view_name,
     role_guard_sql,
     validate_identifier,
+    validate_table_names_unique,
     validate_view_names_unique,
     view_statements,
 )
@@ -150,25 +151,25 @@ def build_changesets(table: dict) -> list[Changeset]:
 
     changesets: list[Changeset] = []
 
-    # 001 — app role. Guarded so a fresh instance rebuild is safe. splitStatements:false: the DO
-    # block has internal semicolons and must be sent as ONE statement. runOnChange:true here:
-    # Liquibase folds this formatted-SQL body — INCLUDING its `-- ` comment lines — into the
-    # changeset checksum, so any future reword of role_guard_sql or these comments would flip the
-    # checksum and fail validation on every EXISTING deploy under the default runOnChange:false.
-    # The guard is idempotent (pg_roles existence check around CREATE ROLE), so re-running on a
-    # body change is safe.
+    # 001 — app role check. Separation of duties: only an admin creates app roles; the migration
+    # checks `pg_roles` and raises a clear error if missing, never running `CREATE ROLE`.
+    # splitStatements:false: the DO block has internal semicolons and must be sent as ONE statement.
+    # runAlways:true: check on every deploy (even if an admin dropped a role after deploy 1).
+    # runOnChange:true: Liquibase folds this formatted-SQL body — INCLUDING its `-- ` comment lines
+    # — into the changeset checksum, so any future reword of role_guard_sql or these comments
+    # re-runs cleanly instead of failing checksum validation on existing deploys.
     changesets.append(
         Changeset(
             author="cicd",
             id="001-app-role",
-            attrs="runOnChange:true splitStatements:false",
+            attrs="runAlways:true runOnChange:true splitStatements:false",
             comment=(
-                "App-specific read-only role. Idempotent (guarded) so a fresh rebuild is safe.\n"
-                "runOnChange:true: the guard body is part of the Liquibase checksum, so a reword\n"
-                "must re-run (idempotent), not fail validation on existing deploys."
+                "App-specific read-only role check (admin creates the role once; migration never\n"
+                "runs CREATE ROLE). runAlways:true + runOnChange:true: checks on every deploy and\n"
+                "re-runs cleanly if the guard body or comments are reworded."
             ),
             sql=_one_statement(role_guard_sql(role)),
-            rollback=[f"DROP ROLE IF EXISTS {role};"],
+            rollback=["SELECT 1;"],
         )
     )
 
@@ -250,6 +251,7 @@ def write_changelogs(tables: list[dict], out_dir: str | Path) -> list[Path]:
 
     Fully deterministic (no timestamps/ids) so re-running is a clean diff.
     """
+    validate_table_names_unique(tables)  # cross-entry: two entries must not share a table name
     validate_view_names_unique(tables)  # cross-entry: two entries must not resolve to one view
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -271,6 +273,7 @@ def check_drift(config_path: str | Path, generated_dir: str | Path) -> list[str]
       - a committed .changelog.sql that no config row generates (orphan/leftover).
     """
     tables = load_tables(config_path)
+    validate_table_names_unique(tables)  # cross-entry: two entries must not share a table name
     validate_view_names_unique(tables)  # cross-entry: two entries must not resolve to one view
     expected = {changelog_filename(t): render_changelog(t) for t in tables}
     generated = Path(generated_dir)

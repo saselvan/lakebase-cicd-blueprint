@@ -27,6 +27,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RESOLVE_HELPER = REPO_ROOT / "scripts" / "resolve_endpoint.sh"
 BRANCH_TEST_SH = REPO_ROOT / "scripts" / "branch_test.sh"
@@ -110,6 +112,278 @@ def test_helper_selects_read_write_and_mints_from_endpoint(tmp_path):
     assert "database generate-database-credential" not in calls, calls
     assert "instance_names" not in calls, calls
     assert "FORBIDDEN" not in calls, calls
+
+
+# Redacted live `databricks postgres list-endpoints` response from `projects/lakebase-cicd-ref`.
+_LIVE_REDACTED_ENDPOINTS = [
+    {
+        "create_time": "2026-09-16T16:16:56Z",
+        "endpoint_id": "primary",
+        "name": "projects/lakebase-cicd-ref/branches/production/endpoints/primary",
+        "parent": "projects/lakebase-cicd-ref/branches/production",
+        "status": {
+            "autoscaling_limit_max_cu": 8,
+            "autoscaling_limit_min_cu": 4,
+            "current_state": "ACTIVE",
+            "disabled": False,
+            "endpoint_id": "primary",
+            "endpoint_type": "ENDPOINT_TYPE_READ_WRITE",
+            "group": {"enable_readable_secondaries": False, "max": 1, "min": 1},
+            "hosts": {
+                "host": "ep-live-fixture-rw.database.cloud.databricks.com",
+                "read_write_pooled_host": "ep-live-fixture-pooler.database.us-east-1.cloud.databricks.com",
+            },
+            "last_active_time": "2026-10-21T11:33:21Z",
+            "settings": {},
+        },
+        "uid": "00000000-0000-0000-0000-000000000001",
+        "update_time": "2026-10-21T11:33:33Z",
+    }
+]
+
+_ENDPOINT_ATTACKER_CASES = [
+    (
+        "1_only_read_only_with_hosts",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/ro-1",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_ONLY", "hosts": {"host": "ro1.example"}},
+            },
+            {
+                "name": "projects/p/branches/b/endpoints/ro-2",
+                "status": {"endpoint_type": "READ_ONLY", "hosts": {"host": "ro2.example"}},
+            },
+        ],
+        None,
+        "no compute endpoint",
+    ),
+    (
+        "2_no_endpoint_has_host",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/rw",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": None}},
+            },
+            {
+                "name": "projects/p/branches/b/endpoints/ro",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_ONLY", "hosts": {"host": ""}},
+            },
+        ],
+        None,
+        "no compute endpoint",
+    ),
+    (
+        "3_read_write_no_host_plus_read_only_with_host",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/rw",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": None}},
+            },
+            {
+                "name": "projects/p/branches/b/endpoints/ro",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_ONLY", "hosts": {"host": "ro-ready.example"}},
+            },
+        ],
+        None,
+        "no compute endpoint",
+    ),
+    (
+        "4a_read_write_with_host_and_empty_name",
+        [
+            {
+                "name": "",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "rw.example"}},
+            },
+        ],
+        None,
+        "no resource name",
+    ),
+    (
+        "4b_read_write_with_host_and_missing_name",
+        [
+            {
+                "name": None,
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "rw.example"}},
+            },
+        ],
+        None,
+        "no resource name",
+    ),
+    (
+        "5_read_only_first_read_write_second",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/ro",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_ONLY", "hosts": {"host": "ro.example"}},
+            },
+            {
+                "name": "projects/p/branches/b/endpoints/rw",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "rw.example"}},
+            },
+        ],
+        ("rw.example", "projects/p/branches/b/endpoints/rw"),
+        None,
+    ),
+    (
+        "6_empty_endpoint_list",
+        [],
+        None,
+        "no compute endpoint",
+    ),
+    (
+        "7_live_redacted_lakebase_cicd_ref",
+        _LIVE_REDACTED_ENDPOINTS,
+        (
+            "ep-live-fixture-rw.database.cloud.databricks.com",
+            "projects/lakebase-cicd-ref/branches/production/endpoints/primary",
+        ),
+        None,
+    ),
+    (
+        "8_whitespace_only_host_and_name",
+        [
+            {
+                "name": "   ",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "rw.example"}},
+            },
+        ],
+        None,
+        "no resource name",
+    ),
+    (
+        "8b_whitespace_only_host",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/rw",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "   "}},
+            },
+        ],
+        None,
+        "no compute endpoint",
+    ),
+    (
+        "8c_padded_host",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/rw",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_READ_WRITE", "hosts": {"host": "  rw.example  "}},
+            },
+        ],
+        ("rw.example", "projects/p/branches/b/endpoints/rw"),
+        None,
+    ),
+    (
+        "9_unspecified_endpoint_type_with_host",
+        [
+            {
+                "name": "projects/p/branches/b/endpoints/unspec",
+                "status": {"endpoint_type": "ENDPOINT_TYPE_UNSPECIFIED", "hosts": {"host": "unspec.example"}},
+            },
+        ],
+        None,
+        "no compute endpoint",
+    ),
+]
+
+
+def _run_shell_resolve(tmp_path: Path, case_id: str, raw_eps: list[dict]) -> tuple[int, str, str, str]:
+    """Run `lakebase_resolve_and_mint` in a subshell with STUB_ENDPOINTS_JSON set to `raw_eps`."""
+    case_dir = tmp_path / case_id
+    case_dir.mkdir(parents=True, exist_ok=True)
+    env, call_log = _stub_env(case_dir)
+    (case_dir / "endpoints.json").write_text(json.dumps(raw_eps))
+    harness = (
+        'set -euo pipefail; '
+        f'. "{RESOLVE_HELPER}"; '
+        'lakebase_resolve_and_mint "projects/p/branches/b" DEFAULT; '
+        'printf "HOST=%s\\nENDPOINT=%s\\nTOKEN=%s\\n" "$LB_HOST" "$LB_ENDPOINT" "$LB_TOKEN"'
+    )
+    res = subprocess.run(["bash", "-c", harness], env=env, capture_output=True, text=True)
+    calls = call_log.read_text() if call_log.exists() else ""
+    return res.returncode, res.stdout, res.stderr, calls
+
+
+@pytest.mark.parametrize(
+    "case_id,raw_eps,expected,err_substr",
+    _ENDPOINT_ATTACKER_CASES,
+    ids=[c[0] for c in _ENDPOINT_ATTACKER_CASES],
+)
+def test_shell_and_dabs_endpoint_parity_matrix(tmp_path, case_id, raw_eps, expected, err_substr):
+    """Parity + Attacker matrix (items 1-9 + live fixture): feed the exact same endpoint lists to
+    BOTH `scripts/resolve_endpoint.sh` (`lakebase_resolve_and_mint`) and `dabs/migration_job.py`
+    (`_select_endpoint` / `_lakebase_conninfo`), asserting identical outcomes and zero credential
+    mints on every failure case.
+
+    MUTATION GATES:
+      - Mutation A (allow READ_ONLY fallback): cases 1, 3, 9 go RED.
+      - Mutation B (drop the no-name check): cases 4a, 4b, 8 go RED.
+    """
+    import enum
+    import sys
+    import types
+
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    from dabs import migration_job as mj
+
+    class _EndpointType(enum.Enum):
+        ENDPOINT_TYPE_READ_ONLY = "ENDPOINT_TYPE_READ_ONLY"
+        ENDPOINT_TYPE_READ_WRITE = "ENDPOINT_TYPE_READ_WRITE"
+        ENDPOINT_TYPE_UNSPECIFIED = "ENDPOINT_TYPE_UNSPECIFIED"
+
+    def to_sdk(d: dict):
+        status_d = d.get("status") or {}
+        hosts_d = status_d.get("hosts") or {}
+        raw_etype = status_d.get("endpoint_type")
+        etype = _EndpointType(raw_etype) if raw_etype in _EndpointType._value2member_map_ else raw_etype
+        return types.SimpleNamespace(
+            name=d.get("name"),
+            status=types.SimpleNamespace(
+                endpoint_type=etype,
+                hosts=types.SimpleNamespace(host=hosts_d.get("host")),
+            ),
+        )
+
+    rc, out, err, calls = _run_shell_resolve(tmp_path, case_id, raw_eps)
+    sdk_eps = [to_sdk(ep) for ep in raw_eps]
+    dabs_cred_calls: list[str] = []
+
+    if expected is not None:
+        exp_host, exp_name = expected
+        assert rc == 0, f"{case_id}: shell failed (rc={rc}):\n{out}\n{err}"
+        assert f"HOST={exp_host}" in out, f"{case_id}: {out}"
+        assert f"ENDPOINT={exp_name}" in out, f"{case_id}: {out}"
+        assert f"TOKEN={STUB_TOKEN}" in out, f"{case_id}: {out}"
+        assert f"postgres generate-database-credential {exp_name}" in calls, f"{case_id}: {calls}"
+
+        ep = mj._select_endpoint(sdk_eps)
+        assert mj._endpoint_host(ep) == exp_host, case_id
+        assert mj._endpoint_name(ep) == exp_name, case_id
+        conninfo = mj._lakebase_conninfo(
+            branch="projects/p/branches/b",
+            resolve_endpoint=lambda b, _eps=sdk_eps: mj._select_endpoint(_eps),
+            credential_source=lambda e: (dabs_cred_calls.append(e), ("u", STUB_TOKEN))[1],
+        )
+        fields = dict(kv.split("=", 1) for kv in conninfo.split())
+        assert fields["host"] == exp_host, case_id
+        assert dabs_cred_calls == [exp_name], case_id
+    else:
+        assert rc != 0, f"{case_id}: shell unexpectedly succeeded:\n{out}"
+        assert err_substr in err, f"{case_id}: expected {err_substr!r} in stderr, got {err!r}"
+        assert "generate-database-credential" not in calls, (
+            f"{case_id}: shell minted a credential on error:\n{calls}"
+        )
+        with pytest.raises(RuntimeError, match=err_substr):
+            mj._select_endpoint(sdk_eps)
+        with pytest.raises(RuntimeError, match=err_substr):
+            mj._lakebase_conninfo(
+                branch="projects/p/branches/b",
+                resolve_endpoint=lambda b, _eps=sdk_eps: mj._select_endpoint(_eps),
+                credential_source=lambda e: (dabs_cred_calls.append(e), ("u", STUB_TOKEN))[1],
+            )
+        assert dabs_cred_calls == [], (
+            f"{case_id}: DABs minted a credential on error: {dabs_cred_calls}"
+        )
 
 
 def test_branch_test_script_resolves_via_endpoint(tmp_path):

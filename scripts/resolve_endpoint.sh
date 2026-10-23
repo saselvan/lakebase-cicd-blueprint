@@ -5,10 +5,11 @@
 # endpoint. Mirrors dabs/migration_job.py::_select_endpoint.
 #
 # Why the READ_WRITE endpoint: a migration WRITES. A branch has one READ_WRITE endpoint; it may
-# also list read-only endpoints. We prefer the READ_WRITE endpoint that exposes a connection host,
-# and only fall back to the first endpoint with a host -- stricter than a blind JSON[0] pick, so it
-# stays correct even if a read-only endpoint is listed first. BOTH the connection host AND the
-# credential-minting endpoint name are derived from that one chosen endpoint.
+# also list read-only endpoints. We require the READ_WRITE endpoint that exposes a connection host
+# and a non-empty resource name, and never fall back to a READ_ONLY endpoint -- stricter than a
+# blind JSON[0] pick, so it stays correct even if a read-only endpoint is listed first or the
+# read-write host is still provisioning. BOTH the connection host AND the credential-minting
+# endpoint name are derived from that one chosen endpoint.
 #
 # Projects API (no database-instance name anywhere):
 #   databricks postgres list-endpoints projects/<proj>/branches/<branch> -o json
@@ -24,7 +25,7 @@
 #   lakebase_resolve_and_mint "projects/<proj>/branches/<branch>" [profile]
 
 # Read `list-endpoints` JSON on stdin and print "<host><TAB><endpoint-name>" for the READ_WRITE
-# endpoint (fallback: the first endpoint that exposes a host). Non-zero if none has a host/name.
+# endpoint. Non-zero if no READ_WRITE endpoint has a ready host or resource name.
 # NB: the program is passed via `python3 -c` (not a `python3 - <<HEREDOC`, which would make the
 # heredoc python's PROGRAM via `-` and swallow the piped JSON on stdin).
 _lakebase_select_endpoint() {
@@ -34,7 +35,8 @@ import json, sys
 eps = json.load(sys.stdin)
 
 def host(ep):
-    return ((((ep or {}).get("status") or {}).get("hosts") or {}).get("host")) or ""
+    raw = (((ep or {}).get("status") or {}).get("hosts") or {}).get("host")
+    return raw.strip() if isinstance(raw, str) else ""
 
 def is_read_write(ep):
     etype = ((ep or {}).get("status") or {}).get("endpoint_type")
@@ -46,15 +48,11 @@ for ep in eps:
         chosen = ep
         break
 if chosen is None:
-    for ep in eps:
-        if host(ep):
-            chosen = ep
-            break
-if chosen is None:
     sys.stderr.write("no compute endpoint with a connection host found for the branch\n")
     sys.exit(1)
 
-name = (chosen.get("name") or "")
+raw_name = chosen.get("name")
+name = raw_name.strip() if isinstance(raw_name, str) else ""
 if not name:
     sys.stderr.write("resolved compute endpoint has no resource name to mint a credential from\n")
     sys.exit(1)

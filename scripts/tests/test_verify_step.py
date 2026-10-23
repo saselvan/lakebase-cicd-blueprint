@@ -35,6 +35,7 @@ _STUB_PSQL = r"""#!/usr/bin/env bash
 sql="${@: -1}"
 case "$sql" in
   *NOT\ has_any_column_privilege*) printf '%s\n' "${STUB_BASE_DENIED-t}" ;;
+  *reloptions*)           printf '%s\n' "${STUB_NO_SECURITY_INVOKER-t}" ;;
   *pg_roles*)             printf '%s\n' "${STUB_ROLE_EXISTS-t}" ;;
   *pg_views*)             printf '%s\n' "${STUB_VIEW_EXISTS-t}" ;;
   *has_table_privilege*)  printf '%s\n' "${STUB_CAN_SELECT-t}" ;;
@@ -219,6 +220,17 @@ def test_base_table_grant_exits_nonzero(tmp_path):
     assert "FAIL role members_app_ro is denied on synced table cicd_proj.members" in r.stdout
 
 
+def test_security_invoker_enabled_exits_nonzero(tmp_path):
+    # Attacker 1: consumer view has security_invoker enabled in pg_class.reloptions, while every
+    # other check (including the deploy identity's own real-read check) returns 't'.
+    # verify_table.sh must run the security_invoker check from dabs/checks.py and exit non-zero.
+    r = _run_verify(tmp_path, {"STUB_NO_SECURITY_INVOKER": "f"}, _OK_ARGS)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert (
+        "FAIL consumer view cicd_proj.members_v does not have security_invoker enabled" in r.stdout
+    ), r.stdout + r.stderr
+
+
 def test_verify_table_fails_closed_when_checks_cli_errors_or_prints_zero_checks(tmp_path):
     # verify_table.sh calls python3 dabs/checks.py --table-checks ...; if the CLI exits non-zero
     # or emits 0 check lines, verify_table.sh must fail closed (non-zero exit), never pass with 0
@@ -252,4 +264,30 @@ def test_verify_table_fails_closed_when_checks_cli_errors_or_prints_zero_checks(
     )
     assert r_empty.returncode != 0, r_empty.stdout + r_empty.stderr
     assert "0 checks" in (r_empty.stdout + r_empty.stderr) or "failed" in (r_empty.stdout + r_empty.stderr).lower()
+
+
+def test_verify_table_from_row_fails_closed_on_malformed_or_incomplete_row(tmp_path):
+    """verify_table_from_row must exit non-zero and never call psql when given invalid JSON or a
+    row missing required keys (app_role / synced_table_id / app_schema)."""
+    psql_log = tmp_path / "psql_calls.log"
+    stub_psql = tmp_path / "psql"
+    stub_psql.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{psql_log}"\nprintf "t\\n"\n')
+    stub_psql.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{tmp_path}{os.pathsep}{env.get('PATH', '')}"
+
+    for bad_row in ("not-json", '{"name":"x"}', ""):
+        r = subprocess.run(
+            ["bash", "-c", f'. "{VERIFY_SH}"; verify_table_from_row "$1"', "bash", bad_row],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert r.returncode != 0, f"verify_table_from_row succeeded on {bad_row!r}: {r.stdout}"
+        if bad_row:
+            assert "could not parse table config row" in r.stderr, r.stderr
+        assert not psql_log.exists() or psql_log.read_text() == "", (
+            f"psql was called on malformed row {bad_row!r}: {psql_log.read_text()}"
+        )
+
 

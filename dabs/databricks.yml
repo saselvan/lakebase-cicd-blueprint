@@ -2,8 +2,8 @@
 #
 # REQUIRES Databricks CLI >= 1.5.0. The Lakebase DAB resource used here (postgres_synced_tables)
 # is BETA and older CLIs do not support it, so this pin is a correctness requirement. (No
-# postgres_roles resource is emitted — the migration owns the app role via a guarded CREATE ROLE,
-# so bundle destroy cannot drop the role out from under existing grants.) The offline PR CI
+# postgres_roles resource is emitted — an admin creates each app role once and the migration checks
+# for it, so bundle destroy cannot drop the role out from under existing grants.) The offline PR CI
 # (ci.yml, `dabs-validate` job) installs a pinned CLI and runs `bundle validate` with no secrets.
 #
 # Resources are GENERATED from the single source of truth config/tables.json by

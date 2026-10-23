@@ -31,6 +31,7 @@ CID=$(docker run -d --rm -e POSTGRES_PASSWORD=pw -p "127.0.0.1:$PORT:5432" postg
 export PGHOST=127.0.0.1 PGPORT="$PORT" PGDATABASE=postgres PGUSER=postgres PGPASSWORD=pw
 for _ in $(seq 1 60); do psql -qtAc "SELECT 1" >/dev/null 2>&1 && break; sleep 0.5; done
 psql -v ON_ERROR_STOP=1 -q \
+  -c "CREATE ROLE members_app_ro NOLOGIN;" \
   -c "CREATE SCHEMA IF NOT EXISTS $SCHEMA;" \
   -c "CREATE TABLE $SCHEMA.members (id bigint primary key, member_id text, plan_code text);" \
   -c "INSERT INTO $SCHEMA.members VALUES (1,'m1','A'),(2,'m2','B'),(3,'m3','A');"

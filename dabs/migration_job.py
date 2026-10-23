@@ -11,11 +11,12 @@ in dabs/databricks.yml). On a run it:
   4. applies it to Lakebase using a RUNTIME OAuth token minted inside the workspace (no stored
      secret; consistent with the repo's no-secret posture).
 
-Re-running is a reconciling no-op: the renderer emits a pg_roles-guarded CREATE ROLE, idempotent
-GRANT, CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE VIEW (ADR 0002). There is no
-version-tracking table — so there is no version bookkeeping to collide with, and nothing to roll
-back on a 2nd apply. A synced-table replace therefore self-heals: every run re-applies the object
-DDL cleanly. (Why the version-tracking variant was dropped: docs/adr/0006-dabs-variant-mechanics.md.)
+Re-running is a reconciling no-op: the renderer emits a `pg_roles` existence check (an admin
+creates each app role once), idempotent GRANT, CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE
+VIEW (ADR 0002). There is no version-tracking table — so there is no version bookkeeping to collide
+with, and nothing to roll back on a 2nd apply. A synced-table replace therefore self-heals: every
+run re-applies the object DDL cleanly. (Why the version-tracking variant was dropped:
+docs/adr/0006-dabs-variant-mechanics.md.)
 
 Design constraints that keep this OFFLINE-UNIT-TESTABLE (the live apply runs against a real
 Lakebase branch):
@@ -105,9 +106,8 @@ def tables_config_path(config_path: str | Path | None = None) -> Path:
 
 
 def load_tables(config_path: str | Path | None = None) -> list[dict]:
-    """Read the single-source-of-truth tables config as a list of dicts."""
-    with tables_config_path(config_path).open() as fh:
-        return json.load(fh)
+    """Read the single-source-of-truth tables config as a list of dicts (validated for unique table names)."""
+    return _load_render_ddl().load_tables(tables_config_path(config_path))
 
 
 def synced_table_ids(tables: list[dict]) -> list[str]:
@@ -213,10 +213,10 @@ def render_migration_sql(*, config_path: str | Path | None = None) -> str:
 
     Delegates to ``dabs/render_ddl.py`` — the SAME "config in, idempotent SQL out" the Liquibase
     generator consumes. The result (what ``--dry-run`` prints AND what ``apply_sql_to_lakebase``
-    executes) is a pg_roles-guarded CREATE ROLE + idempotent GRANT + CREATE INDEX IF NOT EXISTS +
-    CREATE OR REPLACE VIEW, per table. There is no version-tracking table, so applying this SQL a
-    second time — e.g. after a synced-table replace — is a clean reconciling no-op, never a
-    version-bookkeeping rollback. Returns the SQL.
+    executes) is a `pg_roles` existence check (raising if the admin-created app role is missing) +
+    idempotent GRANT + CREATE INDEX IF NOT EXISTS + CREATE OR REPLACE VIEW, per table. There is no
+    version-tracking table, so applying this SQL a second time — e.g. after a synced-table replace
+    — is a clean reconciling no-op, never a version-bookkeeping rollback. Returns the SQL.
     """
     render = _load_render_ddl()
     path = config_path if config_path else tables_config_path()
@@ -260,13 +260,13 @@ def sdk_status_source() -> Callable[[str], str]:
 def _select_endpoint(endpoints: object) -> object:
     """Pick a branch's READ_WRITE compute endpoint OBJECT (pure, no SDK/network).
 
-    A migration WRITES, so it must target the branch's READ_WRITE endpoint; a branch has exactly
-    one. We prefer the READ_WRITE endpoint (identified by its `status.endpoint_type`) that exposes a
-    `status.hosts.host`, and only fall back to the first endpoint with a host — stricter than the
-    proven-live `JSON[0]` pick in scripts/branch_test.sh (correct only because a fresh branch has a
-    single endpoint), so it stays correct even if a read-only endpoint is listed first. Returns the
-    endpoint object so callers can derive BOTH its host (for the conninfo) and its resource name
-    (for credential minting) from the SAME chosen endpoint. Duck-typed so a mock needs no SDK types.
+    A migration WRITES, so it must target the branch's READ_WRITE endpoint; a branch has one
+    READ_WRITE endpoint and may also list READ_ONLY replicas. We require a READ_WRITE endpoint
+    (identified by its `status.endpoint_type`) that exposes a non-empty `status.hosts.host` and a
+    non-empty resource `name`, and NEVER fall back to a READ_ONLY endpoint (which would fail late
+    on DDL or verify the wrong endpoint). Returns the endpoint object so callers can derive BOTH
+    its host (for the conninfo) and its resource name (for credential minting) from the SAME
+    chosen endpoint. Duck-typed so a mock needs no SDK types.
     """
     eps = list(endpoints)
 
@@ -280,9 +280,7 @@ def _select_endpoint(endpoints: object) -> object:
 
     for ep in eps:
         if _is_read_write(ep) and _has_host(ep):
-            return ep
-    for ep in eps:
-        if _has_host(ep):
+            _endpoint_name(ep)
             return ep
     raise RuntimeError("no compute endpoint with a connection host found for the branch")
 
@@ -292,7 +290,11 @@ def _endpoint_host_or_none(ep: object) -> str | None:
     script reads. Duck-typed."""
     status = getattr(ep, "status", None)
     hosts = getattr(status, "hosts", None)
-    return getattr(hosts, "host", None)
+    raw = getattr(hosts, "host", None)
+    if not isinstance(raw, str):
+        return None
+    stripped = raw.strip()
+    return stripped or None
 
 
 def _endpoint_host(ep: object) -> str:
@@ -306,7 +308,8 @@ def _endpoint_host(ep: object) -> str:
 def _endpoint_name(ep: object) -> str:
     """The chosen endpoint's RESOURCE NAME (projects/<p>/branches/<b>/endpoints/<e>) — the value
     `generate_database_credential(endpoint=...)` mints against. Raise if absent."""
-    name = getattr(ep, "name", None)
+    raw = getattr(ep, "name", None)
+    name = raw.strip() if isinstance(raw, str) else ""
     if not name:
         raise RuntimeError(
             "resolved compute endpoint has no resource name to mint a database credential from"
@@ -422,9 +425,9 @@ def apply_sql_to_lakebase(
     raises there. No instance name is needed on this path.
 
     `sql` is the output of render_migration_sql (the shared Python renderer), which is RE-RUNNABLE
-    by construction (guarded CREATE ROLE / idempotent GRANT / CREATE INDEX IF NOT EXISTS / CREATE
-    OR REPLACE VIEW, and no version-tracking table), so executing this blob a second time — e.g.
-    after a synced-table replace — is a clean reconciling no-op.
+    by construction (`pg_roles` existence check / idempotent GRANT / CREATE INDEX IF NOT EXISTS /
+    CREATE OR REPLACE VIEW, and no version-tracking table), so executing this blob a second time —
+    e.g. after a synced-table replace — is a clean reconciling no-op.
 
     Live path — exercised by the live apply against a real Lakebase branch, not by offline unit
     tests. psycopg is
@@ -437,7 +440,7 @@ def apply_sql_to_lakebase(
         if database is None
         else _lakebase_conninfo(branch=branch, database=database)
     )
-    with psycopg.connect(conninfo, autocommit=True) as conn:
+    with psycopg.connect(conninfo, autocommit=False) as conn:
         with conn.cursor() as cur:
             cur.execute(sql)
 

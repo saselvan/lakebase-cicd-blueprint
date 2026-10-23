@@ -11,7 +11,7 @@ set -euo pipefail
 
 PROJECT="${1:?project_id required (e.g. my-lakebase-project)}"
 BRANCH="${2:?branch_id required (e.g. pr-123)}"
-PROFILE="${3:-DEFAULT}"
+PROFILE="${3:-${PROFILE:-DEFAULT}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Shared resolve+mint: pick the branch's READ_WRITE endpoint and mint an OAuth token FROM it

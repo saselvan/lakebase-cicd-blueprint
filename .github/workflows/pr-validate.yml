@@ -7,6 +7,9 @@ name: pr-validate
 on:
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -16,21 +19,28 @@ jobs:
       DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
       PROJECT: my-lakebase-project
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: "1.16.2"
           terraform_wrapper: false
-      - uses: liquibase/setup-liquibase@v1
-        with: { version: "4.33.0", edition: "oss" }
-      - name: Install Databricks CLI
-        run: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+      - uses: liquibase/setup-liquibase@9bd28bc8b31bd5a1651b34c7856569d5392ee869 # v3.0.0
+        with:
+          version: "4.33.0"
+          edition: "community"
+      - name: Set up Databricks CLI
+        uses: databricks/setup-cli@9230f12203ef173d0b901846f62a55ce997efef7 # v1.19.0
+        with:
+          version: "1.19.0"
       - name: Branch slug from PR
-        run: echo "BRANCH=pr-${{ github.event.number }}" >> "$GITHUB_ENV"
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+        run: echo "BRANCH=pr-${PR_NUMBER}" >> "$GITHUB_ENV"
       - name: Create ephemeral CoW branch + run migrations on it
         run: |
           set -euo pipefail
           . scripts/resolve_endpoint.sh
+          . scripts/verify_table.sh
           DB="$(lakebase_resolve_database "$PWD")"
           lakebase_validate_database "$DB"
           databricks postgres create-branch "projects/$PROJECT" "$BRANCH" \
@@ -42,19 +52,22 @@ jobs:
           lakebase_resolve_and_mint "projects/$PROJECT/branches/$BRANCH" ""
           HOST="$LB_HOST"
           TOKEN="$LB_TOKEN"
+          export PGHOST="$HOST" PGPORT=5432 PGDATABASE="$DB" PGSSLMODE=require \
+            PGUSER="${PGUSER:-${DATABRICKS_CLIENT_ID:?DATABRICKS_CLIENT_ID must be set}}" \
+            PGPASSWORD="$TOKEN"
           # Generate one changelog per table from config/tables.json, then run EACH table's own
           # changelog (distinct FILENAME => distinct changeset identity, so shared-schema tables do
           # not collide in one DATABASECHANGELOG). Mirrors scripts/deploy.sh.
           python3 liquibase/generate_changelogs.py
           URL="jdbc:postgresql://$HOST:5432/$DB?sslmode=require"
           cd liquibase
-          TABLES="$(python3 -c "import json;[print(t['name'],t['app_schema']) for t in json.load(open('../config/tables.json'))]")"
-          while read -r NAME SCHEMA; do
+          TABLES="$(python3 -c "import json;[print(t['name'],t['app_schema'],json.dumps(t,separators=(',',':'))) for t in json.load(open('../config/tables.json'))]")"
+          while read -r NAME SCHEMA ROW; do
             [ -z "$NAME" ] && continue
             liquibase update \
               --changeLogFile="generated/$NAME.changelog.sql" \
               --url="$URL" \
-              --username="${{ secrets.DATABRICKS_CLIENT_ID }}" --password="$TOKEN" \
+              --username="$PGUSER" --password="$TOKEN" \
               --liquibase-schema-name="$SCHEMA" </dev/null || exit 1
+            verify_table_from_row "$ROW" </dev/null || exit 1
           done <<< "$TABLES"
-          # add pytest/psycopg validation here -- it runs against the branch, not prod

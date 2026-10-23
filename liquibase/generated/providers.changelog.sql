@@ -6,17 +6,17 @@
 -- logicalFilePath pins the recorded filename so identity is stable regardless of cwd
 -- (deploy.sh runs from liquibase/, CI may run from repo-root with --search-path).
 
---changeset cicd:001-app-role runOnChange:true splitStatements:false
--- App-specific read-only role. Idempotent (guarded) so a fresh rebuild is safe.
--- runOnChange:true: the guard body is part of the Liquibase checksum, so a reword
--- must re-run (idempotent), not fail validation on existing deploys.
+--changeset cicd:001-app-role runAlways:true runOnChange:true splitStatements:false
+-- App-specific read-only role check (admin creates the role once; migration never
+-- runs CREATE ROLE). runAlways:true + runOnChange:true: checks on every deploy and
+-- re-runs cleanly if the guard body or comments are reworded.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'providers_app_ro') THEN
-    CREATE ROLE providers_app_ro NOLOGIN;
+    RAISE EXCEPTION 'app role providers_app_ro does not exist; an admin must create it';
   END IF;
 END $$;
---rollback DROP ROLE IF EXISTS providers_app_ro;
+--rollback SELECT 1;
 
 --changeset cicd:002-app-grants runAlways:true
 -- Schema USAGE only (least privilege), reapplied after each synced-table create/replace.
@@ -40,6 +40,7 @@ CREATE INDEX IF NOT EXISTS idx_providers_specialty_code ON cicd_proj.providers (
 --changeset cicd:004-app-view runAlways:true
 -- No-superuser consumer pattern: the deploy identity owns this view over the synced
 -- table and grants consumers SELECT on the VIEW. runAlways so it survives a replace.
+DROP VIEW IF EXISTS cicd_proj.providers_v;
 CREATE OR REPLACE VIEW cicd_proj.providers_v AS
   SELECT * FROM cicd_proj.providers;
 GRANT USAGE  ON SCHEMA cicd_proj                 TO providers_app_ro;
