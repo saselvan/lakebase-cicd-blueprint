@@ -656,6 +656,27 @@ For the Terraform path:
 
 ---
 
+## Third-party software
+
+This repository does not include third-party code; it uses these tools, which you install or which CI downloads:
+
+| library | description | license | source |
+|---|---|---|---|
+| Databricks CLI 1.19.0 | Bundle validation/deploy and Lakebase CLI | Apache-2.0 | https://github.com/databricks/cli |
+| Liquibase 4.33.0 | Postgres changelogs (Terraform path) | Apache-2.0 (5.0 and later: FSL-1.1-ALv2; stay on 4.x) | https://github.com/liquibase/liquibase |
+| Terraform 1.16.2 | Terraform path | BUSL-1.1 (1.6 and later) | https://github.com/hashicorp/terraform |
+| Databricks Terraform provider 1.132.0 | Terraform path | Apache-2.0 | https://github.com/databricks/terraform-provider-databricks |
+| psycopg 3.3.3 | Postgres client in the migration job and the example | LGPL-3.0 | https://github.com/psycopg/psycopg |
+| PyYAML 6.0.2 | Bundle code generation | MIT | https://github.com/yaml/pyyaml |
+| pytest 9.1.1 | Offline tests | MIT | https://github.com/pytest-dev/pytest |
+| actions/checkout, actions/setup-python | CI | MIT | https://github.com/actions |
+| databricks/setup-cli | CI | Databricks License | https://github.com/databricks/setup-cli |
+| hashicorp/setup-terraform | CI | MPL-2.0 | https://github.com/hashicorp/setup-terraform |
+| liquibase/setup-liquibase | CI | FSL-1.1-ALv2 (current release) | https://github.com/liquibase/setup-liquibase |
+| gitleaks 8.30.1 (CLI) | CI secret scan | MIT | https://github.com/gitleaks/gitleaks |
+
+---
+
 ## Credits
 
 Built and maintained by Samuel Selvan — https://github.com/saselvan. Licensed under MIT.

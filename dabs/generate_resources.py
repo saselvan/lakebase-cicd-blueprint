@@ -30,11 +30,11 @@ Schema mapping (field names verified against `databricks bundle schema`, CLI v1.
                                  (default SNAPSHOT; enum CONTINUOUS|TRIGGERED|SNAPSHOT). The
                                  synced-table CREATE API rejects a missing policy, so it always emits.
   app_role, app_schema,       -> variables.migration_targets.default[]  (see note; the migration job
-    index_columns                creates the role + applies grants/indexes/view)
+    index_columns                checks the role + applies grants/indexes/view)
 
 `postgres_synced_tables` declares `additionalProperties: false` in the bundle schema, so there is NO
 native resource field for a synced table's index columns, its target schema, or its app role. Those
-are consumed by the migration job (which creates the role and renders + applies the grants, indexes
+are consumed by the migration job (which checks that the admin-created role exists and renders + applies the grants, indexes
 and consumer view), so they are carried as a bundle `variables` complex default (`migration_targets`)
 — a bundle-legal location that `databricks bundle validate` accepts and the job task can read.
 This keeps index columns "carried through" in full (no fixed-count truncation) without inventing
@@ -152,8 +152,8 @@ def build_bundle_fragments(tables: list[dict]) -> dict[str, dict]:
     Emits one per-table resource file (`<name>.yml`) carrying that table's synced table, plus a
     single `migration_targets.yml` carrying the per-table migration metadata (app role, schema,
     index columns) as a bundle complex variable. The app role is intentionally NOT a
-    `postgres_roles` DAB resource — the migration job owns it — so it travels only via
-    `migration_targets`. Fully deterministic — no timestamps or ids — so re-running is a clean diff.
+    `postgres_roles` DAB resource — an admin creates it once and the migration job checks for it —
+    so it travels only via `migration_targets`. Fully deterministic — no timestamps or ids — so re-running is a clean diff.
     """
     validate_table_names_unique(tables)  # cross-entry: two entries must not share a table name
     validate_view_names_unique(tables)  # cross-entry: two entries must not resolve to one view
