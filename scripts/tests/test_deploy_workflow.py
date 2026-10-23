@@ -390,3 +390,176 @@ def test_attacker_5_terraform_provider_maps_empty_profile_to_null():
         "terraform/versions.tf must map empty var.databricks_profile to null so CI env-var auth works:\n"
         + versions_tf
     )
+
+
+def _check_workflows_supply_chain(workflow_paths: list[Path]) -> None:
+    """Validate supply-chain pinning, tool version parity, least-privilege permissions, and no
+    curl/wget pipe to shell across the given workflow YAML files."""
+    assert len(workflow_paths) >= 4, f"expected >= 4 workflow files, got {workflow_paths}"
+
+    uses_sha_re = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
+    raw_uses_line_re = re.compile(
+        r"^\s*(?:-\s*)?uses:\s*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40})\s+#\s*v\d+\.\d+(?:\.\d+)?\b"
+    )
+    pipe_shell_re = re.compile(
+        r"\b(?:curl|wget)\b[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z|da|k)?sh\b"
+    )
+    gha_interpolation_re = re.compile(r"\$\{\{.*?\}\}")
+
+    shas_by_action: dict[str, set[str]] = {}
+    counts_by_action: dict[str, int] = {}
+
+    for wf_path in workflow_paths:
+        raw_text = wf_path.read_text()
+        doc = yaml.safe_load(raw_text)
+
+        # Attacker 4: Least-privilege top-level permissions: {contents: read} and no job-level write
+        top_perms = doc.get("permissions")
+        assert top_perms == {"contents": "read"}, (
+            f"{wf_path.name} must set top-level `permissions: {{contents: read}}`, got {top_perms!r}"
+        )
+
+        # Raw line check for every `uses:` line to ensure `# vX.Y.Z` version comment is present
+        raw_uses_lines = [
+            (lineno, line)
+            for lineno, line in enumerate(raw_text.splitlines(), start=1)
+            if re.match(r"^\s*(?:-\s*)?uses:\s*", line)
+        ]
+        assert len(raw_uses_lines) >= 1, f"{wf_path.name} has no `uses:` lines"
+        for lineno, line in raw_uses_lines:
+            assert raw_uses_line_re.match(line), (
+                f"{wf_path.name}:{lineno} `uses:` must be pinned to a 40-char SHA with `# vX.Y.Z` comment, "
+                f"got: {line.strip()!r}"
+            )
+
+        jobs = doc.get("jobs") or {}
+        assert jobs, f"{wf_path.name} has no jobs"
+        for job_name, job in jobs.items():
+            job_perms = job.get("permissions")
+            if job_perms is not None:
+                assert job_perms == {"contents": "read"}, (
+                    f"{wf_path.name} job {job_name!r} must not broaden permissions beyond contents: read, "
+                    f"got {job_perms!r}"
+                )
+
+            for idx, step in enumerate(job.get("steps") or []):
+                uses = step.get("uses")
+                if uses is not None:
+                    uses_str = str(uses).strip()
+                    assert uses_sha_re.match(uses_str), (
+                        f"{wf_path.name} job {job_name!r} step #{idx + 1} `uses:` must match "
+                        f"<owner>/<repo>@<40-hex-sha>, got {uses_str!r}"
+                    )
+                    action_repo, sha = uses_str.split("@", 1)
+                    shas_by_action.setdefault(action_repo, set()).add(sha)
+                    counts_by_action[action_repo] = counts_by_action.get(action_repo, 0) + 1
+
+                    with_block = step.get("with") or {}
+                    if action_repo == "hashicorp/setup-terraform":
+                        assert with_block.get("terraform_version") == "1.16.2", (
+                            f"{wf_path.name} job {job_name!r} step #{idx + 1} must set "
+                            f'terraform_version: "1.16.2", got {with_block.get("terraform_version")!r}'
+                        )
+                        assert with_block.get("terraform_wrapper") is False, (
+                            f"{wf_path.name} job {job_name!r} step #{idx + 1} must set "
+                            f"terraform_wrapper: false, got {with_block.get('terraform_wrapper')!r}"
+                        )
+                    elif action_repo == "liquibase/setup-liquibase":
+                        assert with_block.get("version") == "4.33.0", (
+                            f"{wf_path.name} job {job_name!r} step #{idx + 1} must set "
+                            f'liquibase version: "4.33.0", got {with_block.get("version")!r}'
+                        )
+                        assert with_block.get("edition") == "community", (
+                            f"{wf_path.name} job {job_name!r} step #{idx + 1} must set "
+                            f'liquibase edition: "community", got {with_block.get("edition")!r}'
+                        )
+                    elif action_repo == "databricks/setup-cli":
+                        assert with_block.get("version") == "1.19.0", (
+                            f"{wf_path.name} job {job_name!r} step #{idx + 1} must set "
+                            f'databricks/setup-cli version: "1.19.0", got {with_block.get("version")!r}'
+                        )
+                    elif action_repo == "actions/setup-python":
+                        assert with_block.get("python-version") == "3.11", (
+                            f"{wf_path.name} job {job_name!r} step #{idx + 1} must set "
+                            f'python-version: "3.11", got {with_block.get("python-version")!r}'
+                        )
+
+                run_script = step.get("run")
+                if run_script is not None:
+                    run_str = str(run_script)
+                    assert not pipe_shell_re.search(run_str), (
+                        f"{wf_path.name} job {job_name!r} step #{idx + 1} pipes curl/wget to shell:\n{run_str}"
+                    )
+                    assert not gha_interpolation_re.search(run_str), (
+                        f"{wf_path.name} job {job_name!r} step #{idx + 1} interpolates `${{{{ ... }}}}` "
+                        f"directly inside `run:` (move to `env:` to prevent script injection and "
+                        f"semgrep PartialParsing):\n{run_str}"
+                    )
+
+    # Attacker 3: Every workflow uses the exact same commit SHA for each action repository
+    expected_min_counts = {
+        "actions/checkout": 6,
+        "actions/setup-python": 2,
+        "hashicorp/setup-terraform": 4,
+        "liquibase/setup-liquibase": 3,
+        "databricks/setup-cli": 4,
+    }
+    for action_repo, min_count in expected_min_counts.items():
+        actual_count = counts_by_action.get(action_repo, 0)
+        assert actual_count >= min_count, (
+            f"expected at least {min_count} `{action_repo}` steps across workflows, found {actual_count}"
+        )
+        shas = shas_by_action.get(action_repo, set())
+        assert len(shas) == 1, (
+            f"SHA drift across workflows for `{action_repo}`: found multiple SHAs {sorted(shas)}"
+        )
+
+
+def test_attacker_6_ci_supply_chain_sha_pinning_no_curl_pipe_sh_version_parity_and_permissions(tmp_path):
+    """Issue 11 (Attacker items 1-5):
+    1. Every `uses:` in `.github/workflows/*.yml` is pinned to a 40-character lowercase hex SHA
+       with a `# vX.Y.Z` version comment on the YAML line.
+    2. Zero `curl ... | sh` or `wget ... | sh` anywhere in `.github/workflows/*.yml`; gitleaks in
+       `ci.yml` verifies `GITLEAKS_SHA256` with `sha256sum -c -`.
+    3. Tool version parity across all workflows:
+       - `actions/checkout`: identical 40-char SHA everywhere
+       - `actions/setup-python`: identical 40-char SHA + `python-version: "3.11"` everywhere
+       - `hashicorp/setup-terraform`: identical 40-char SHA + `terraform_version: "1.16.2"` +
+         `terraform_wrapper: false` everywhere
+       - `liquibase/setup-liquibase`: identical 40-char SHA + `version: "4.33.0"` +
+         `edition: "community"` everywhere (`ci.yml`, `deploy.yml`, `pr-validate.yml`)
+       - `databricks/setup-cli`: identical 40-char SHA + `version: "1.19.0"` everywhere
+         (`ci.yml`, `deploy.yml`, `pr-validate.yml`, `pr-cleanup.yml`)
+    4. Every workflow has top-level `permissions: {contents: read}` and no job-level write
+       permissions.
+    5. Zero `${{ ... }}` template expressions interpolated inside `run:` scripts."""
+    workflow_files = sorted(WORKFLOWS_DIR.glob("*.yml"))
+    _check_workflows_supply_chain(workflow_files)
+
+    # Also verify ci.yml's secret-scan job uses the checksum-verified gitleaks 8.30.1 CLI binary
+    ci_doc = yaml.safe_load((WORKFLOWS_DIR / "ci.yml").read_text())
+    secret_steps = ci_doc["jobs"]["secret-scan"]["steps"]
+    gitleaks_step = next((s for s in secret_steps if s.get("name") == "gitleaks"), None)
+    assert gitleaks_step is not None, "ci.yml secret-scan job must have a `gitleaks` step"
+    assert "uses" not in gitleaks_step, "gitleaks step must run checksum-verified binary, not gitleaks-action"
+    gl_env = gitleaks_step.get("env") or {}
+    assert gl_env.get("GITLEAKS_VERSION") == "8.30.1", gl_env
+    assert gl_env.get("GITLEAKS_SHA256") == (
+        "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    ), gl_env
+    assert "sha256sum -c -" in str(gitleaks_step.get("run") or ""), gitleaks_step
+
+    # Hostile fixture check: prove _check_workflows_supply_chain rejects each class of violation
+    # Hostile element 1: mutable tag (`@v4`) on a realistic workflow copy
+    bad_dir = tmp_path / "hostile_mutable_tag"
+    shutil.copytree(WORKFLOWS_DIR, bad_dir)
+    deploy_copy = bad_dir / "deploy.yml"
+    deploy_copy.write_text(
+        deploy_copy.read_text().replace(
+            "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2",
+            "actions/checkout@v4",
+        )
+    )
+    with pytest.raises(AssertionError, match="40-char SHA"):
+        _check_workflows_supply_chain(sorted(bad_dir.glob("*.yml")))
+
