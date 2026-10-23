@@ -67,14 +67,40 @@ def test_render_has_no_alembic_version_bookkeeping():
 # --- 2. the four idempotent object groups, per table -------------------------------------------
 
 def test_render_emits_guarded_role_per_table():
-    """Each app role is created via a `pg_roles` existence guard (idempotent CREATE ROLE)."""
+    """Each app role is checked (not created) via a `pg_roles` existence guard that raises the
+    clear error `app role <name> does not exist; an admin must create it` when missing."""
     sql = _render()
+    active_sql = "\n".join(ln for ln in sql.splitlines() if not ln.lstrip().startswith("--"))
+    assert not re.search(r"\bCREATE\s+ROLE\b", active_sql, re.IGNORECASE), (
+        f"renderer must check the app role, never CREATE ROLE:\n{active_sql}"
+    )
     for row in _fixture_rows():
         role = row["app_role"]
         assert re.search(
             rf"IF NOT EXISTS \(SELECT 1 FROM pg_roles WHERE rolname = '{role}'\)", sql
         ), f"role {role} not guarded by a pg_roles existence check:\n{sql}"
-        assert f"CREATE ROLE {role} NOLOGIN" in sql, f"role {role} not created NOLOGIN:\n{sql}"
+        expected_err = f"RAISE EXCEPTION 'app role {role} does not exist; an admin must create it';"
+        assert expected_err in sql, (
+            f"role guard for {role} missing exact error message {expected_err!r}:\n{sql}"
+        )
+
+
+def test_role_guard_sql_validates_identifier_and_emits_raise_exception():
+    """Attacker 5 & 6: `role_guard_sql` validates its `app_role` argument against `validate_identifier`
+    (rejecting SQL-injection/unsafe identifiers even on direct call) and emits `RAISE EXCEPTION`
+    with `app role <name> does not exist; an admin must create it`, with zero `CREATE ROLE`.
+
+    MUTATION GATE: put `CREATE ROLE {app_role} NOLOGIN;` back in `role_guard_sql` and this goes RED.
+    """
+    sql = rd.role_guard_sql("members_app_ro")
+    assert not re.search(r"\bCREATE\s+ROLE\b", sql, re.IGNORECASE), (
+        f"role_guard_sql must never emit CREATE ROLE:\n{sql}"
+    )
+    assert "IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'members_app_ro') THEN" in sql, sql
+    assert "RAISE EXCEPTION 'app role members_app_ro does not exist; an admin must create it';" in sql, sql
+    for bad in ["bad-role", "role'); DROP TABLE x; --", "", "user"]:
+        with pytest.raises(ValueError):
+            rd.role_guard_sql(bad)
 
 
 def _strip_quotes(ident: str) -> str:

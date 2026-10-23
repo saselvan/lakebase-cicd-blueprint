@@ -54,22 +54,69 @@ CID=$(docker run -d --rm -e POSTGRES_PASSWORD=pw -p "127.0.0.1:$PORT:5432" postg
 export PGHOST=127.0.0.1 PGPORT="$PORT" PGDATABASE=postgres PGUSER=postgres PGPASSWORD=pw
 for _ in $(seq 1 60); do pg_isready -q && break; sleep 0.5; done
 
-echo "== stand in for two synced tables in ONE schema ($SCHEMA) =="
+echo "== stand in for two synced tables in ONE schema ($SCHEMA) + deploy identity =="
 psql -v ON_ERROR_STOP=1 -q \
-  -c "CREATE SCHEMA IF NOT EXISTS $SCHEMA;" \
+  -c "CREATE ROLE deploy_sp LOGIN PASSWORD 'pw' CREATEROLE;" \
+  -c "CREATE SCHEMA IF NOT EXISTS $SCHEMA AUTHORIZATION deploy_sp;" \
   -c "CREATE TABLE IF NOT EXISTS $SCHEMA.members   (id bigint primary key, member_id text, plan_code text);" \
-  -c "CREATE TABLE IF NOT EXISTS $SCHEMA.providers (id bigint primary key, provider_id text, specialty_code text);"
+  -c "CREATE TABLE IF NOT EXISTS $SCHEMA.providers (id bigint primary key, provider_id text, specialty_code text);" \
+  -c "ALTER TABLE $SCHEMA.members OWNER TO deploy_sp;" \
+  -c "ALTER TABLE $SCHEMA.providers OWNER TO deploy_sp;"
 
 URL="jdbc:postgresql://127.0.0.1:$PORT/postgres"
 # Liquibase resolves --changeLogFile relative to cwd, so run from the fixture out-dir's parent and
 # pass generated/<name>.changelog.sql (as deploy.sh does from liquibase/). logicalFilePath is baked
 # as generated/<name>.changelog.sql in each header, so identity is stable regardless.
 cd "$WORKDIR"
-run_cl() { # $1 = table name; runs that table's OWN generated changelog (from the fixture out-dir).
+run_cl() { # $1 = table name; runs that table's OWN generated changelog as deploy_sp.
   liquibase update --changeLogFile="generated/$1.changelog.sql" \
-    --url="$URL" --username="$PGUSER" --password="$PGPASSWORD" \
+    --url="$URL" --username="deploy_sp" --password="$PGPASSWORD" \
     --liquibase-schema-name="$SCHEMA"   # SHARED DATABASECHANGELOG in cicd_proj — the collision case
 }
+
+echo ""; echo "===== ATTACKER 1 (Liquibase): role missing, deploy identity WITH CREATEROLE ====="
+EXPECTED_ERR="app role members_app_ro does not exist; an admin must create it"
+set +e
+lb_err_cr="$(run_cl members 2>&1)"
+lb_rc_cr=$?
+set -e
+if [ "$lb_rc_cr" -eq 0 ]; then
+  echo "  FAIL Attacker 1: Liquibase update WITH CREATEROLE succeeded when members_app_ro was missing!" >&2
+  exit 1
+fi
+if ! printf '%s' "$lb_err_cr" | grep -qF "$EXPECTED_ERR"; then
+  echo "  FAIL Attacker 1: Liquibase update WITH CREATEROLE did not emit '$EXPECTED_ERR':" >&2
+  echo "$lb_err_cr" >&2
+  exit 1
+fi
+role_after_cr="$(psql -tAc "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='members_app_ro')" | tr -d '[:space:]')"
+if [ "$role_after_cr" != "f" ]; then
+  echo "  FAIL Attacker 1: pg_roles contains members_app_ro after failed Liquibase deploy!" >&2
+  exit 1
+fi
+echo "  OK   Attacker 1 (Liquibase WITH CREATEROLE): failed non-zero with exact message; pg_roles has no members_app_ro"
+
+echo ""; echo "===== ATTACKER 2 (Liquibase): role missing, deploy identity WITHOUT CREATEROLE ====="
+psql -v ON_ERROR_STOP=1 -q -c "ALTER ROLE deploy_sp NOCREATEROLE;"
+set +e
+lb_err_nocr="$(run_cl members 2>&1)"
+lb_rc_nocr=$?
+set -e
+if [ "$lb_rc_nocr" -eq 0 ]; then
+  echo "  FAIL Attacker 2: Liquibase update WITHOUT CREATEROLE succeeded when members_app_ro was missing!" >&2
+  exit 1
+fi
+if ! printf '%s' "$lb_err_nocr" | grep -qF "$EXPECTED_ERR"; then
+  echo "  FAIL Attacker 2: Liquibase update WITHOUT CREATEROLE did not emit '$EXPECTED_ERR':" >&2
+  echo "$lb_err_nocr" >&2
+  exit 1
+fi
+echo "  OK   Attacker 2 (Liquibase WITHOUT CREATEROLE): failed non-zero with exact message"
+
+echo ""; echo "===== ADMIN SETUP: pre-create app roles (members_app_ro, providers_app_ro) ====="
+psql -v ON_ERROR_STOP=1 -q \
+  -c "CREATE ROLE members_app_ro NOLOGIN;" \
+  -c "CREATE ROLE providers_app_ro NOLOGIN;"
 
 echo ""; echo "===== RUN 1: members.changelog.sql ====="
 run_cl members

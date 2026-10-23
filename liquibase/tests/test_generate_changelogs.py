@@ -222,18 +222,30 @@ def test_zero_index_column_table_emits_no_index_changeset(tmp_path):
 
 
 def test_changesets_are_idempotent_and_runalways(tmp_path):
-    """Grants, indexes and the view are runAlways (reapplied after a synced-table replace); the role
-    is guarded; the view is CREATE OR REPLACE; indexes are CREATE INDEX IF NOT EXISTS."""
+    """Role check, grants, indexes and the view are runAlways (reapplied on every deploy and after
+    a synced-table replace); the role changeset checks `pg_roles` and raises the clear error
+    `app role <name> does not exist; an admin must create it` (never `CREATE ROLE`); the view is
+    CREATE OR REPLACE; indexes are CREATE INDEX IF NOT EXISTS."""
     out = _generate(tmp_path)
     m = out["by_name"]["members"]
     cs = {c["id"]: c for c in m["changesets"]}
 
+    assert "runAlways:true" in cs["001-app-role"]["attrs"], cs["001-app-role"]["attrs"]
     assert "runAlways:true" in cs["002-app-grants"]["attrs"]
     assert "runAlways:true" in cs["004-app-view"]["attrs"]
     for c in _index_changesets(m):
         assert "runAlways:true" in c["attrs"], f"index changeset {c['id']} must be runAlways"
 
-    assert "IF NOT EXISTS" in cs["001-app-role"]["body"] and "CREATE ROLE" in cs["001-app-role"]["body"]
+    role_body = cs["001-app-role"]["body"]
+    active_role_sql = "\n".join(ln for ln in role_body.splitlines() if not ln.lstrip().startswith("--"))
+    assert "IF NOT EXISTS" in role_body, role_body
+    assert "RAISE EXCEPTION 'app role members_app_ro does not exist; an admin must create it';" in role_body, role_body
+    assert not re.search(r"\bCREATE\s+ROLE\b", active_role_sql, re.IGNORECASE), (
+        f"001-app-role must check the role, never CREATE ROLE:\n{role_body}"
+    )
+    assert not re.search(r"--rollback\s+DROP\s+ROLE\b", role_body, re.IGNORECASE), (
+        f"001-app-role rollback must not DROP the admin-created role:\n{role_body}"
+    )
     assert "DROP VIEW IF EXISTS" in cs["004-app-view"]["body"], (
         f"004-app-view must DROP VIEW IF EXISTS before CREATE so column changes succeed:\n{cs['004-app-view']['body']}"
     )
@@ -436,21 +448,27 @@ def test_least_privilege_parser_catches_all_five_revoke_select_spellings(tmp_pat
 
 
 def test_role_changeset_is_runonchange(tmp_path):
-    """R3: the 001-app-role changeset MUST be runOnChange:true.
+    """R3 & Attacker 4: the 001-app-role changeset MUST carry `runAlways:true runOnChange:true splitStatements:false`.
 
-    Liquibase folds a formatted-SQL changeset's body — INCLUDING its `-- ` comment lines — into the
-    changeset checksum. The guard body (role_guard_sql) and its comments are the most likely thing
-    to be reworded over time; with the default runOnChange:false, ANY such wording change flips the
-    checksum and every EXISTING deploy fails validation on `001-app-role`. The guard is idempotent
-    (CREATE ROLE wrapped in a pg_roles existence check), so re-running it is safe -> runOnChange:true
-    is correct. splitStatements:false must be preserved (the DO block has internal semicolons).
+    `runAlways:true` ensures Liquibase checks `pg_roles` on every deploy (even if an admin dropped
+    a role after deploy 1). `runOnChange:true` ensures a future rewording of the guard body or its
+    comments re-runs cleanly instead of failing checksum validation on existing deploys.
+    `splitStatements:false` sends the DO block as one statement. And its body must check the role
+    via RAISE EXCEPTION (never CREATE ROLE) and its rollback must never DROP ROLE.
 
-    MUTATION GATE: revert the role changeset to runOnChange:false and this goes RED.
+    MUTATION GATE: revert `001-app-role` to `CREATE ROLE` or drop `runAlways:true` / `runOnChange:true`
+    and this goes RED.
     """
     out = _generate(tmp_path)
+    rows_by_name = {r["name"]: r for r in _fixture_rows()}
     for name, entry in out["by_name"].items():
+        row = rows_by_name[name]
+        app_role = row["app_role"]
         cs = {c["id"]: c for c in entry["changesets"]}
         role = cs["001-app-role"]
+        assert "runAlways:true" in role["attrs"], (
+            f"{name}: 001-app-role must be runAlways:true so every deploy checks the role, got attrs={role['attrs']!r}"
+        )
         assert "runOnChange:true" in role["attrs"], (
             f"{name}: 001-app-role must be runOnChange:true, got attrs={role['attrs']!r}"
         )
@@ -461,19 +479,42 @@ def test_role_changeset_is_runonchange(tmp_path):
         assert "splitStatements:false" in role["attrs"], (
             f"{name}: 001-app-role must keep splitStatements:false: {role['attrs']!r}"
         )
+        expected_err = f"RAISE EXCEPTION 'app role {app_role} does not exist; an admin must create it';"
+        assert expected_err in role["body"], (
+            f"{name}: 001-app-role missing exact error message {expected_err!r}:\n{role['body']}"
+        )
+        active_sql = "\n".join(ln for ln in role["body"].splitlines() if not ln.lstrip().startswith("--"))
+        assert not re.search(r"\bCREATE\s+ROLE\b", active_sql, re.IGNORECASE), (
+            f"{name}: 001-app-role must not CREATE ROLE:\n{role['body']}"
+        )
+        assert not re.search(r"--rollback\s+DROP\s+ROLE\b", role["body"], re.IGNORECASE), (
+            f"{name}: 001-app-role rollback must not DROP ROLE:\n{role['body']}"
+        )
 
 
 def test_committed_role_changeset_is_runonchange():
-    """R3, committed artifact: the checked-in generated changelogs carry runOnChange:true on
-    001-app-role (so the drift check and CI reflect the fix, not just a fresh generation)."""
-    role_lines = []
+    """R3 & Attacker 4/5, committed artifact: the checked-in generated changelogs carry
+    `runAlways:true` and `runOnChange:true` on `001-app-role`, emit the exact `RAISE EXCEPTION`
+    message, and contain no `CREATE ROLE` or `DROP ROLE`."""
+    role_entries = []
     for f in sorted(COMMITTED_GENERATED.glob("*.changelog.sql")):
         for cs in _parse_changesets(f.read_text()):
             if cs["id"] == "001-app-role":
-                role_lines.append((f.name, cs["attrs"]))
-    assert role_lines, "no committed 001-app-role changeset found"
-    for fname, attrs in role_lines:
+                role_entries.append((f.name, cs["attrs"], cs["body"]))
+    assert role_entries, "no committed 001-app-role changeset found"
+    for fname, attrs, body in role_entries:
+        assert "runAlways:true" in attrs, f"{fname}: committed 001-app-role not runAlways:true ({attrs!r})"
         assert "runOnChange:true" in attrs, f"{fname}: committed 001-app-role not runOnChange:true ({attrs!r})"
+        assert "does not exist; an admin must create it" in body, (
+            f"{fname}: committed 001-app-role missing clear error message:\n{body}"
+        )
+        active_sql = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("--"))
+        assert not re.search(r"\bCREATE\s+ROLE\b", active_sql, re.IGNORECASE), (
+            f"{fname}: committed 001-app-role still contains CREATE ROLE:\n{body}"
+        )
+        assert not re.search(r"--rollback\s+DROP\s+ROLE\b", body, re.IGNORECASE), (
+            f"{fname}: committed 001-app-role rollback still contains DROP ROLE:\n{body}"
+        )
 
 
 def test_generated_changelog_has_no_property_placeholders(tmp_path):

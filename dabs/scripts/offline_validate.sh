@@ -77,8 +77,8 @@ for target in dev prod; do
 done
 
 # --- 4) Count check: the bundle must carry one synced table per config row and NO role resource.
-# The migration owns the app role (guarded CREATE ROLE), so no postgres_roles resource is emitted;
-# a re-introduced role resource fails this check by design.
+# An admin creates each app role once and the migration checks for it, so no postgres_roles resource
+# is emitted; a re-introduced role resource fails this check by design.
 expected="$(python3 -c "import json,sys; print(len(json.load(open('$CONFIG'))))")"
 json="$(cd "$BUNDLE" && databricks bundle validate --target dev -o json 2>/dev/null)"
 read -r n_synced n_roles < <(python3 - "$expected" <<PY

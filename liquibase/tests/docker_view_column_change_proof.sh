@@ -64,6 +64,7 @@ done
 psql_super() {
   docker exec -i "$CID" psql -h 127.0.0.1 -v ON_ERROR_STOP=1 -U postgres -d postgres -tA "$@"
 }
+psql_super -c "CREATE ROLE $ROLE NOLOGIN;" >/dev/null
 
 # Run Liquibase either via host binary (if installed) or via the official liquibase:4.33 container.
 run_liquibase_update() {

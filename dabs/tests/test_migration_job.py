@@ -466,11 +466,15 @@ def test_invoked_migration_is_idempotent_reconciling():
 
 @_needs_pg
 def test_rendered_migration_double_apply_reconciles(hermetic_pg):
-    """Proven on a real Postgres: apply the rendered SQL TWICE against a throwaway cluster and
-    assert the 2nd apply does NOT error AND the reconciling object DDL re-took effect after a
-    (simulated) synced-table replace wiped it.
-
-    The renderer has no version table, so the 2nd apply is a clean reconciling no-op.
+    """Proven on a real Postgres:
+      - Attacker 1 (role missing, deploy identity WITH CREATEROLE): applying the rendered SQL
+        BEFORE the admin creates `alpha_reader` / `beta_reader` fails non-zero with the exact
+        message `app role alpha_reader does not exist; an admin must create it`, and `pg_roles`
+        still does NOT contain `alpha_reader` (even though `postgres` holds SUPERUSER/CREATEROLE).
+      - Attacker 2 (role missing, deploy identity WITHOUT CREATEROLE): applying as a NOCREATEROLE
+        role fails non-zero with the same exact message `app role alpha_reader does not exist; an admin must create it`.
+      - Attacker 3 (role present): after an admin pre-creates the app roles, apply #1 and apply #2
+        (after a simulated synced-table replace wiping the view and index) both succeed cleanly.
     """
     run = hermetic_pg
     # The synced tables the migration grants on / builds a view over exist at run time.
@@ -478,10 +482,39 @@ def test_rendered_migration_double_apply_reconciles(hermetic_pg):
         "CREATE SCHEMA sch_alpha; CREATE SCHEMA sch_beta;"
         " CREATE TABLE sch_alpha.alpha (id int, region_key text);"
         " CREATE TABLE sch_beta.beta (id int);"
+        " CREATE ROLE deploy_no_createrole LOGIN NOCREATEROLE;"
+        " GRANT ALL ON SCHEMA sch_alpha, sch_beta TO deploy_no_createrole;"
+        " GRANT SELECT ON sch_alpha.alpha, sch_beta.beta TO deploy_no_createrole WITH GRANT OPTION;"
     )
     assert setup.returncode == 0, f"fixture setup failed:\n{setup.stderr}"
 
     sql = mj.render_migration_sql(config_path=RENDER_FIXTURE)  # exactly what apply executes
+
+    # Attacker 1: role missing, deploy identity WITH CREATEROLE (postgres superuser)
+    missing_with_cr = run(sql)
+    assert missing_with_cr.returncode != 0, (
+        "Attacker 1: migration succeeded when app role was missing (did it CREATE ROLE instead of checking?)"
+    )
+    assert "app role alpha_reader does not exist; an admin must create it" in missing_with_cr.stderr, (
+        f"Attacker 1: missing exact error message in stderr:\n{missing_with_cr.stderr}"
+    )
+    role_created = run("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'alpha_reader');")
+    assert role_created.stdout.strip() == "f", (
+        f"Attacker 1: failed deploy must NOT create alpha_reader in pg_roles, got {role_created.stdout!r}"
+    )
+
+    # Attacker 2: role missing, deploy identity WITHOUT CREATEROLE
+    missing_no_cr = run("SET ROLE deploy_no_createrole;\n" + sql)
+    assert missing_no_cr.returncode != 0, (
+        "Attacker 2: migration succeeded as NOCREATEROLE when app role was missing"
+    )
+    assert "app role alpha_reader does not exist; an admin must create it" in missing_no_cr.stderr, (
+        f"Attacker 2: missing exact error message for NOCREATEROLE in stderr:\n{missing_no_cr.stderr}"
+    )
+
+    # Admin pre-creates the app roles (one-time admin setup).
+    admin_roles = run("CREATE ROLE alpha_reader NOLOGIN; CREATE ROLE beta_reporting_ro NOLOGIN;")
+    assert admin_roles.returncode == 0, f"admin role setup failed:\n{admin_roles.stderr}"
 
     first = run(sql)
     assert first.returncode == 0, f"1st apply failed:\n{first.stderr}"

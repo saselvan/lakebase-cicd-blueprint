@@ -6,12 +6,12 @@ into N resources, so this generator emits, per table, one `postgres_synced_table
 transparent, diffable artifact rather than a hidden mutator (ADR 0006 / D2/D3). Adding a table
 stays a one-line `config/tables.json` edit.
 
-The app role is deliberately NOT emitted as a `postgres_roles` DAB resource. The migration
-already creates it via a guarded `CREATE ROLE` (see `dabs/render_ddl.py role_guard_sql`), so a
-`postgres_roles` resource would be a SECOND owner of the same object. Keeping the migration as the
-sole owner means `bundle destroy` can never drop the role out from under grants that consumers still
-hold, and the two migration paths (DABs renderer + Liquibase) produce identical role objects with no
-DAB resource to drift against. The role name still flows through to the migration via
+The app role is deliberately NOT emitted as a `postgres_roles` DAB resource. An admin creates each
+app role once (`CREATE ROLE <app_role> NOLOGIN`), and the migration checks `pg_roles` for it (see
+`dabs/render_ddl.py role_guard_sql`) rather than creating or owning it. Keeping the role outside the
+bundle means `bundle destroy` can never drop the role out from under grants that consumers still
+hold, and the two migration paths (DABs renderer + Liquibase) check the same admin-managed role with
+no DAB resource to drift against. The role name still flows through to the migration via
 `migration_targets` below.
 
 Schema mapping (field names verified against `databricks bundle schema`, CLI v1.14.1):

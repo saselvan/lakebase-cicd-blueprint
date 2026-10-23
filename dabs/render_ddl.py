@@ -1,8 +1,9 @@
 """Single source of the idempotent reconciling DDL — the DABs migration renderer.
 
 `config/tables.json` in, idempotent SQL out. For every configured table this emits the SAME four
-object groups the Liquibase changelog does — a guarded app role, explicit grants, one index per
-`index_columns` entry, and a no-superuser consumer view — as plain, re-runnable Postgres DDL.
+object groups the Liquibase changelog does — an app-role existence check, explicit grants, one
+index per `index_columns` entry, and a no-superuser consumer view — as plain, re-runnable Postgres
+DDL.
 
 This module is the ONE home for the SQL-building helpers. Both migration paths consume it:
 
@@ -17,7 +18,7 @@ It is also runnable standalone, piping the idempotent reconciling DDL straight i
     python -m dabs.render_ddl [--config config/tables.json] | psql "$LAKEBASE_CONNINFO"
 
 Why there is no version table. This renderer emits NO migration-version bookkeeping at all: every
-statement is idempotent (guarded CREATE ROLE, idempotent GRANT, CREATE INDEX IF NOT EXISTS,
+statement is idempotent (a `pg_roles` existence check, idempotent GRANT, CREATE INDEX IF NOT EXISTS,
 CREATE OR REPLACE VIEW), so re-running is a clean reconciling no-op — exactly what a synced-table
 replace needs, and there is no revision state a second apply could collide with. (The rationale for
 this design is recorded in docs/adr/0006-dabs-variant-mechanics.md.)
@@ -38,10 +39,10 @@ from pathlib import Path
 _HEADER = (
     "-- GENERATED idempotent reconciling DDL for the Lakebase CI/CD reference (DABs path).\n"
     "-- Source of truth: config/tables.json. Emitted by dabs/render_ddl.py — DO NOT EDIT BY HAND.\n"
-    "-- Re-runnable by construction: a pg_roles-guarded CREATE ROLE, idempotent GRANT,\n"
-    "-- CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE VIEW. There is NO migration version\n"
-    "-- table — the whole point is to reconcile the object layer on every deploy (a synced-table\n"
-    "-- replace drops grants/indexes/view; re-applying this DDL restores them).\n"
+    "-- Re-runnable by construction: a pg_roles existence check (an admin creates each app role),\n"
+    "-- idempotent GRANT, CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE VIEW. There is NO\n"
+    "-- migration version table — the whole point is to reconcile the object layer on every deploy\n"
+    "-- (a synced-table replace drops grants/indexes/view; re-applying this DDL restores them).\n"
 )
 
 
@@ -176,13 +177,16 @@ def pg_table_name(table: dict) -> str:
 # This keeps ONE definition of each statement's shape for both paths.
 
 def role_guard_sql(app_role: str) -> str:
-    """Idempotent CREATE ROLE, guarded by a `pg_roles` existence check (Postgres has no
-    `CREATE ROLE IF NOT EXISTS`). NOLOGIN: a read-only app role consumers are GRANTed into."""
+    """Check that the admin-created `app_role` exists in `pg_roles`; raise a clear error if missing.
+
+    Separation of duties: only an admin creates app roles (`CREATE ROLE <app_role> NOLOGIN`); the
+    migration never creates a role (even when the caller holds `CREATEROLE`)."""
+    role = validate_identifier(app_role, "app_role")
     return (
         "DO $$\n"
         "BEGIN\n"
-        f"  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{app_role}') THEN\n"
-        f"    CREATE ROLE {app_role} NOLOGIN;\n"
+        f"  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
+        f"    RAISE EXCEPTION 'app role {role} does not exist; an admin must create it';\n"
         "  END IF;\n"
         "END $$"
     )

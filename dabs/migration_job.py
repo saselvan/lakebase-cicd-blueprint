@@ -11,11 +11,12 @@ in dabs/databricks.yml). On a run it:
   4. applies it to Lakebase using a RUNTIME OAuth token minted inside the workspace (no stored
      secret; consistent with the repo's no-secret posture).
 
-Re-running is a reconciling no-op: the renderer emits a pg_roles-guarded CREATE ROLE, idempotent
-GRANT, CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE VIEW (ADR 0002). There is no
-version-tracking table — so there is no version bookkeeping to collide with, and nothing to roll
-back on a 2nd apply. A synced-table replace therefore self-heals: every run re-applies the object
-DDL cleanly. (Why the version-tracking variant was dropped: docs/adr/0006-dabs-variant-mechanics.md.)
+Re-running is a reconciling no-op: the renderer emits a `pg_roles` existence check (an admin
+creates each app role once), idempotent GRANT, CREATE INDEX IF NOT EXISTS, and CREATE OR REPLACE
+VIEW (ADR 0002). There is no version-tracking table — so there is no version bookkeeping to collide
+with, and nothing to roll back on a 2nd apply. A synced-table replace therefore self-heals: every
+run re-applies the object DDL cleanly. (Why the version-tracking variant was dropped:
+docs/adr/0006-dabs-variant-mechanics.md.)
 
 Design constraints that keep this OFFLINE-UNIT-TESTABLE (the live apply runs against a real
 Lakebase branch):
@@ -212,10 +213,10 @@ def render_migration_sql(*, config_path: str | Path | None = None) -> str:
 
     Delegates to ``dabs/render_ddl.py`` — the SAME "config in, idempotent SQL out" the Liquibase
     generator consumes. The result (what ``--dry-run`` prints AND what ``apply_sql_to_lakebase``
-    executes) is a pg_roles-guarded CREATE ROLE + idempotent GRANT + CREATE INDEX IF NOT EXISTS +
-    CREATE OR REPLACE VIEW, per table. There is no version-tracking table, so applying this SQL a
-    second time — e.g. after a synced-table replace — is a clean reconciling no-op, never a
-    version-bookkeeping rollback. Returns the SQL.
+    executes) is a `pg_roles` existence check (raising if the admin-created app role is missing) +
+    idempotent GRANT + CREATE INDEX IF NOT EXISTS + CREATE OR REPLACE VIEW, per table. There is no
+    version-tracking table, so applying this SQL a second time — e.g. after a synced-table replace
+    — is a clean reconciling no-op, never a version-bookkeeping rollback. Returns the SQL.
     """
     render = _load_render_ddl()
     path = config_path if config_path else tables_config_path()
@@ -424,9 +425,9 @@ def apply_sql_to_lakebase(
     raises there. No instance name is needed on this path.
 
     `sql` is the output of render_migration_sql (the shared Python renderer), which is RE-RUNNABLE
-    by construction (guarded CREATE ROLE / idempotent GRANT / CREATE INDEX IF NOT EXISTS / CREATE
-    OR REPLACE VIEW, and no version-tracking table), so executing this blob a second time — e.g.
-    after a synced-table replace — is a clean reconciling no-op.
+    by construction (`pg_roles` existence check / idempotent GRANT / CREATE INDEX IF NOT EXISTS /
+    CREATE OR REPLACE VIEW, and no version-tracking table), so executing this blob a second time —
+    e.g. after a synced-table replace — is a clean reconciling no-op.
 
     Live path — exercised by the live apply against a real Lakebase branch, not by offline unit
     tests. psycopg is
