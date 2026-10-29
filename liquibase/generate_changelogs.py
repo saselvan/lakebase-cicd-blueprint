@@ -81,6 +81,25 @@ def _generated_header(logical_path: str) -> str:
     )
 
 
+# A changelog counts as generated only when its first line is the Liquibase header and its SECOND
+# line is this marker. A file that merely quotes the marker further down, or a symlink, is not ours
+# and is never removed.
+_GENERATED_MARKER = _generated_header("x").splitlines()[1]
+
+
+def _is_generated(path: Path) -> bool:
+    """True for a regular file (never a symlink) written by this generator."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        with path.open(encoding="utf-8") as fh:
+            first = fh.readline().rstrip("\n")
+            second = fh.readline().rstrip("\n")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return first.startswith("--liquibase formatted sql") and second == _GENERATED_MARKER
+
+
 # `load_tables`, `validate_identifier`, and `pg_table_name` are imported from dabs.render_ddl (the
 # single home shared with the DABs path); they remain part of this module's public surface via that
 # import. `load_tables` lives in one place so both engines read config identically.
@@ -246,8 +265,27 @@ def render_changelog(table: dict) -> str:
     return _generated_header(logical_file_path(table)) + "\n" + body
 
 
+def stale_changelogs(tables: list[dict], out_dir: str | Path) -> tuple[list[Path], list[Path]]:
+    """The `*.changelog.sql` files in `out_dir` that no config row generates, split in two:
+    (generated files that are now stale, files this generator did not write).
+    Write mode removes only the first list; `--check` reports both and removes nothing."""
+    expected = {changelog_filename(t) for t in tables}
+    out = Path(out_dir)
+    stale: list[Path] = []
+    foreign: list[Path] = []
+    if out.is_dir():
+        for path in sorted(out.glob("*.changelog.sql")):
+            if path.name in expected:
+                continue
+            (stale if _is_generated(path) else foreign).append(path)
+    return stale, foreign
+
+
 def write_changelogs(tables: list[dict], out_dir: str | Path) -> list[Path]:
-    """Generate and write one changelog file per table to `out_dir`. Returns the paths written.
+    """Generate and write one changelog file per table to `out_dir`, then remove the generated
+    changelogs of entries that are no longer in the config (a renamed or deleted entry would
+    otherwise leave its old changelog behind). Files this generator did not write are never removed.
+    Returns the paths written.
 
     Fully deterministic (no timestamps/ids) so re-running is a clean diff.
     """
@@ -255,11 +293,15 @@ def write_changelogs(tables: list[dict], out_dir: str | Path) -> list[Path]:
     validate_view_names_unique(tables)  # cross-entry: two entries must not resolve to one view
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    # Computed first: an invalid config raises here, before anything is written or removed.
+    stale, _foreign = stale_changelogs(tables, out)
     written: list[Path] = []
     for table in tables:
         path = out / changelog_filename(table)
         path.write_text(render_changelog(table))
         written.append(path)
+    for path in stale:
+        path.unlink()
     return written
 
 
@@ -327,9 +369,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     tables = load_tables(args.config)
+    stale, foreign = stale_changelogs(tables, args.out)
     written = write_changelogs(tables, args.out)
     for path in written:
         print(f"wrote {path}")
+    for path in stale:
+        print(f"removed stale generated changelog {path} (no entry in {args.config} generates it)")
+    for path in foreign:
+        print(
+            f"kept {path}: this generator did not write it, so it is not removed; "
+            "`--check` flags it, so delete it by hand if it is stale"
+        )
     print(f"generated {len(written)} changelog(s) for {len(tables)} table(s) from {args.config}")
     return 0
 
