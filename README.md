@@ -491,10 +491,14 @@ cp terraform/terraform.tfvars.example terraform/terraform.tfvars   # edit for yo
 SP's **application id** instead.
 
 `BRANCH` defaults to `production` (matching `terraform/variables.tf`). `deploy.sh` passes explicit
-`PROJECT`, `BRANCH`, and `PROFILE` values to Terraform via `TF_VAR_*`, reads back the resolved
-`project_id`, `branch`, `databricks_profile`, and `logical_database` from `terraform output -raw`
-after `terraform apply`, and aborts on any mismatch between an explicit caller setting and what
-Terraform resolved (for example when `terraform.tfvars` overrides `TF_VAR_*`).
+`PROJECT`, `BRANCH`, and `PROFILE` values to Terraform via `TF_VAR_*`. **Before** `terraform apply`
+it asks Terraform for the resolved `project_id`, `branch`, `databricks_profile`, and
+`logical_database` (`terraform console`: no providers, no state, no changes), and it aborts on any
+mismatch between an explicit caller setting and what Terraform resolved (for example when
+`terraform.tfvars` overrides `TF_VAR_*`). It also checks, still before the apply, that the committed
+Liquibase changelogs match `config/tables.json`. The order matters: an apply can replace a synced
+table, and a replace drops that table's grants. After the apply, `deploy.sh` reads the same four
+values from `terraform output -raw` and stops if they differ from what it checked.
 
 The Terraform provider takes its CLI profile from `databricks_profile` in `terraform/terraform.tfvars`
 (`provider "databricks" { profile = var.databricks_profile != "" ? var.databricks_profile : null }`

@@ -106,24 +106,32 @@ lakebase_validate_database() {
   fi
 }
 
-# lakebase_resolve_database [repo_root]
-# Resolve the target Postgres logical database name on no-apply paths (branch_test.sh,
-# pr-validate.yml) by asking Terraform (`echo var.logical_database | terraform console`) in a
+# lakebase_resolve_tf_var <variable_name> [repo_root]
+# Resolve one Terraform input variable (project_id, branch, databricks_profile, logical_database)
+# WITHOUT changing anything: ask Terraform (`echo var.<name> | terraform console`) in a
 # provider-free scratch copy of terraform/variables.tf + terraform/terraform.tfvars(.json) +
 # terraform/*.auto.tfvars(.json). Terraform itself is the single source of truth for its variable
-# precedence (from lowest to highest: variables.tf default -> TF_VAR_logical_database ->
+# precedence (from lowest to highest: variables.tf default -> TF_VAR_<name> ->
 # terraform.tfvars -> terraform.tfvars.json -> *.auto.tfvars / *.auto.tfvars.json in lexical order).
+# Used before `terraform apply` (deploy.sh) and on no-apply paths (branch_test.sh, pr-validate.yml).
 # If the terraform binary is unavailable, fails closed on any terraform.tfvars,
 # terraform.tfvars.json, or *.auto.tfvars(.json) file ("unsupported var file: <name>; set
-# TF_VAR_logical_database"), and requires TF_VAR_logical_database to be set explicitly.
-# PGDATABASE never overrides Terraform's variable resolution. Validates the resolved name via
-# lakebase_validate_database before printing it.
-lakebase_resolve_database() {
-  local root="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# TF_VAR_<name>"), and requires TF_VAR_<name> to be set explicitly.
+lakebase_resolve_tf_var() {
+  local name="${1:?lakebase_resolve_tf_var needs a variable name}"
+  local root="${2:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
   local tf_dir="$root/terraform"
-  local db=""
+  local val=""
 
-  if ! db="$(python3 - "$tf_dir" <<'PY'
+  case "$name" in
+    project_id | branch | databricks_profile | logical_database) ;;
+    *)
+      printf 'lakebase_resolve_tf_var: unsupported variable %q\n' "$name" >&2
+      return 1
+      ;;
+  esac
+
+  if ! val="$(python3 - "$tf_dir" "$name" <<'PY'
 from __future__ import annotations
 
 import json
@@ -135,6 +143,7 @@ import sys
 import tempfile
 
 tf_dir = pathlib.Path(sys.argv[1])
+name = sys.argv[2]
 vars_tf = tf_dir / "variables.tf"
 
 
@@ -153,7 +162,7 @@ def ask_terraform_console() -> str | None:
                 shutil.copy(p, scratch / p.name)
         res = subprocess.run(
             ["terraform", f"-chdir={scratch}", "console"],
-            input="var.logical_database\n",
+            input=f"var.{name}\n",
             capture_output=True,
             text=True,
         )
@@ -162,7 +171,7 @@ def ask_terraform_console() -> str | None:
             sys.exit(1)
         lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip()]
         if not lines:
-            sys.stderr.write("terraform console returned empty output for var.logical_database\n")
+            sys.stderr.write(f"terraform console returned empty output for var.{name}\n")
             sys.exit(1)
         try:
             val = json.loads(lines[-1])
@@ -170,7 +179,7 @@ def ask_terraform_console() -> str | None:
             sys.stderr.write(f"terraform console returned invalid JSON {lines[-1]!r}: {exc}\n")
             sys.exit(1)
         if not isinstance(val, str):
-            sys.stderr.write(f"terraform console returned non-string {val!r} for var.logical_database\n")
+            sys.stderr.write(f"terraform console returned non-string {val!r} for var.{name}\n")
             sys.exit(1)
         return val
 
@@ -183,12 +192,12 @@ if val is None:
                 p.name in ("terraform.tfvars", "terraform.tfvars.json")
                 or p.name.endswith((".auto.tfvars", ".auto.tfvars.json"))
             ):
-                sys.stderr.write(f"unsupported var file: {p.name}; set TF_VAR_logical_database\n")
+                sys.stderr.write(f"unsupported var file: {p.name}; set TF_VAR_{name}\n")
                 sys.exit(1)
-    if "TF_VAR_logical_database" not in os.environ:
-        sys.stderr.write("terraform binary not found; install terraform or set TF_VAR_logical_database\n")
+    if f"TF_VAR_{name}" not in os.environ:
+        sys.stderr.write(f"terraform binary not found; install terraform or set TF_VAR_{name}\n")
         sys.exit(1)
-    val = os.environ["TF_VAR_logical_database"]
+    val = os.environ[f"TF_VAR_{name}"]
 
 sys.stdout.write(val)
 PY
@@ -196,6 +205,16 @@ PY
     return 1
   fi
 
+  printf '%s\n' "$val"
+}
+
+# lakebase_resolve_database [repo_root]
+# The target Postgres logical database name on no-apply paths (branch_test.sh, pr-validate.yml).
+# PGDATABASE never overrides Terraform's variable resolution. Validates the resolved name via
+# lakebase_validate_database before printing it.
+lakebase_resolve_database() {
+  local db=""
+  db="$(lakebase_resolve_tf_var logical_database "${1:-}")" || return 1
   lakebase_validate_database "$db" || return 1
   printf '%s\n' "$db"
 }

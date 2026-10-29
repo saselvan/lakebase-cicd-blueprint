@@ -125,8 +125,10 @@ sys.stdout.write(val)
 PY
 }
 
-case "$*" in
-  *apply*)
+# Match whole words, never substrings: the -chdir=<path> argument can contain "apply" or "console"
+# (pytest names its temp folders after the test).
+case " $* " in
+  *" apply "*)
     if [ -n "${TF_APPLY_ENV_LOG:-}" ]; then
       python3 - "$dir" "$TF_APPLY_ENV_LOG" <<'PY'
 import json, os, sys
@@ -143,7 +145,7 @@ PY
     fi
     exit 0
     ;;
-  *"output -raw "*)
+  *" output -raw "*)
     out_name="${@: -1}"
     # Verify the output is actually declared in terraform/outputs.tf!
     if ! grep -Eq "output[[:space:]]+\"${out_name}\"" "$dir/outputs.tf"; then
@@ -166,8 +168,12 @@ PY
     resolve_var "$out_name" "$dir"
     exit 0
     ;;
-  *console*)
-    printf '"%s"\n' "$(resolve_var "logical_database" "$dir")"
+  *" console "*)
+    # Like the real `terraform console`: evaluate `var.<name>` read from stdin, one JSON line each.
+    while IFS= read -r expr; do
+      [ -n "$expr" ] || continue
+      printf '"%s"\n' "$(resolve_var "${expr#var.}" "$dir")"
+    done
     exit 0
     ;;
 esac
@@ -559,3 +565,138 @@ def test_attacker_5_make_branch_and_branch_test_sh_thread_profile(tmp_path):
         f"branch_test.sh invoked with 2 args ignored PROFILE=env-prof from env:\n{db_calls}"
     )
     assert "-p DEFAULT" not in db_calls, db_calls
+
+
+# --- Attacker 6: nothing changes before the target and the changelogs are checked ---------------
+#
+# What this protects: the production synced tables and their grants. `terraform apply` can replace a
+# synced table (new primary key, source change) and a replace drops its grants.
+# What must never happen: `terraform apply` runs against a target the caller did not mean (for
+# example BRANCH=pr-123 while terraform.tfvars says production), or with changelogs that no longer
+# match config/tables.json, and only then does the script stop.
+# Attacker list (minimum):
+#   1. env BRANCH conflicts with tfvars `branch`                      -> stop before apply
+#   2. env PROJECT conflicts with an *.auto.tfvars `project_id`       -> stop before apply
+#   3. env PROFILE conflicts with tfvars `databricks_profile`         -> stop before apply
+#   4. tfvars `project_id` and `branch` name different projects       -> stop before apply
+#   5. committed changelog drifted from config/tables.json            -> stop before apply
+#   6. tfvars `logical_database` is not a valid database name         -> stop before apply
+#   7. apply returns an output that differs from the pre-apply value  -> stop before wait/Liquibase
+#   8. control: no conflict                                           -> apply DOES run (the harness can see it)
+
+def _run_deploy(work: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["bash", str(work / "scripts" / "deploy.sh")],
+        cwd=str(work),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _drift_members_changelog(work: Path, env: dict[str, str]) -> None:
+    p = work / "liquibase" / "generated" / "members.changelog.sql"
+    p.write_text(p.read_text() + "\n-- hand edit that config/tables.json does not produce\n")
+
+
+def _write_tfvars(name: str, text: str):
+    def apply(work: Path, env: dict[str, str]) -> None:
+        (work / "terraform" / name).write_text(text)
+
+    return apply
+
+
+def _tfvars_and_env(name: str, text: str, **env_set: str):
+    def apply(work: Path, env: dict[str, str]) -> None:
+        (work / "terraform" / name).write_text(text)
+        env.update(env_set)
+
+    return apply
+
+
+_BEFORE_APPLY_CASES = [
+    (
+        "env_branch_vs_tfvars_branch",
+        _tfvars_and_env(
+            "terraform.tfvars",
+            'project_id = "my-lakebase-project"\n'
+            'branch = "projects/my-lakebase-project/branches/tfvars-branch"\n',
+            BRANCH="env-branch",
+        ),
+        "mismatch",
+    ),
+    (
+        "env_project_vs_auto_tfvars_project",
+        _tfvars_and_env(
+            "prod.auto.tfvars",
+            'project_id = "auto-proj"\nbranch = "projects/auto-proj/branches/production"\n',
+            PROJECT="env-proj",
+        ),
+        "mismatch",
+    ),
+    (
+        "env_profile_vs_tfvars_profile",
+        _tfvars_and_env("terraform.tfvars", 'databricks_profile = "tfvars-prof"\n', PROFILE="env-prof"),
+        "mismatch",
+    ),
+    (
+        "tfvars_project_and_branch_disagree",
+        _write_tfvars("prod.auto.tfvars", 'project_id = "auto-proj"\n'),
+        "mismatch",
+    ),
+    ("changelog_drift", _drift_members_changelog, "drift"),
+    (
+        "invalid_database_name",
+        _write_tfvars("terraform.tfvars", 'logical_database = "bad name; drop"\n'),
+        "invalid database name",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("case_id", "arrange", "expected_text"),
+    _BEFORE_APPLY_CASES,
+    ids=[c[0] for c in _BEFORE_APPLY_CASES],
+)
+def test_attacker_6_target_and_drift_are_checked_before_terraform_apply(
+    tmp_path, case_id, arrange, expected_text
+):
+    work, env, logs = _setup_deploy_harness(tmp_path / case_id)
+    arrange(work, env)
+    r = _run_deploy(work, env)
+    out = (r.stdout + r.stderr).lower()
+    assert r.returncode != 0, f"{case_id}: deploy.sh exited 0:\n{r.stdout}\n{r.stderr}"
+    assert expected_text in out, f"{case_id}: expected {expected_text!r} in:\n{r.stdout}\n{r.stderr}"
+    assert not logs["tf_apply"].exists(), (
+        f"{case_id}: `terraform apply` ran before the script stopped; the stub saw TF_VAR_* "
+        f"{logs['tf_apply'].read_text() if logs['tf_apply'].exists() else ''}"
+    )
+    for later in ("wait", "liquibase"):
+        assert not logs[later].exists() or logs[later].read_text() == "", f"{case_id}: {later} ran"
+
+
+def test_attacker_6_control_without_conflict_reaches_terraform_apply(tmp_path):
+    """The stub records an apply only when `terraform apply` runs, so a green control proves the
+    cases above would have shown it."""
+    work, env, logs = _setup_deploy_harness(tmp_path / "control")
+    r = _run_deploy(work, env)
+    assert r.returncode == 0, f"{r.stdout}\n{r.stderr}"
+    assert logs["tf_apply"].is_file(), "control run never reached `terraform apply`"
+
+
+def test_attacker_6_apply_output_that_differs_from_the_pre_apply_target_stops_the_deploy(tmp_path):
+    work, env, logs = _setup_deploy_harness(tmp_path / "output_diverges")
+    env["TF_STUB_FORCE_OUTPUTS_JSON"] = json.dumps(
+        {
+            "project_id": "my-lakebase-project",
+            "branch": "projects/my-lakebase-project/branches/not-the-one-we-resolved",
+            "databricks_profile": "DEFAULT",
+            "logical_database": "databricks_postgres",
+        }
+    )
+    r = _run_deploy(work, env)
+    out = (r.stdout + r.stderr).lower()
+    assert r.returncode != 0, f"deploy.sh exited 0:\n{r.stdout}\n{r.stderr}"
+    assert "mismatch" in out, out
+    assert not logs["wait"].exists() or logs["wait"].read_text() == ""
+    assert not logs["liquibase"].exists() or logs["liquibase"].read_text() == ""

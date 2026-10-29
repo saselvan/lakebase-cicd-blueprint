@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # THE PIPELINE. Exactly what CI runs, runnable by hand so you can watch each step.
+#   0. resolve + check target -> project, branch, profile, database from Terraform's own variables
+#                                 (terraform console, changes nothing); abort on any mismatch
+#   0b. check changelog drift -> verify committed changelogs match config; abort deploy on drift
 #   1. terraform apply        -> for_each creates ALL synced tables in config/tables.json
-#   1b. check changelog drift -> verify committed changelogs match config; abort deploy on drift
+#                                 (steps 0 and 0b run first: an apply can replace a table and its grants)
+#   1b. read back the applied target and compare it with step 0
 #   then FOR EACH table in config/tables.json:
 #   2. wait_for_sync          -> block until the initial load is ONLINE (so indexes come after)
 #   3. liquibase update       -> that table's OWN changelog: app role + grants + indexes + view
@@ -63,14 +67,16 @@ fi
 # shellcheck source=scripts/verify_table.sh
 . "$ROOT/scripts/verify_table.sh"
 
-echo "== 1. terraform apply (for_each creates all tables in config/tables.json) =="
-( cd "$ROOT/terraform" && terraform init -input=false >/dev/null && terraform apply -auto-approve -input=false )
-DB="$(terraform -chdir="$ROOT/terraform" output -raw logical_database)"
-lakebase_validate_database "$DB"
-
-TF_PROJECT="$(terraform -chdir="$ROOT/terraform" output -raw project_id)"
-TF_BRANCH="$(terraform -chdir="$ROOT/terraform" output -raw branch)"
-TF_PROFILE="$(terraform -chdir="$ROOT/terraform" output -raw databricks_profile)"
+# Everything that can stop the deploy for a wrong target or stale artifacts runs BEFORE
+# `terraform apply`. An apply can replace a synced table, and a replace drops that table's grants,
+# so a deploy that stops after the apply has already changed the wrong place.
+echo "== 0. resolve the target and check it before anything changes =="
+# Terraform resolves its own variables (`terraform console`: no providers, no state, no changes), so a
+# terraform.tfvars that beats a TF_VAR_* or env setting is caught here, not after the apply.
+TF_PROJECT="$(lakebase_resolve_tf_var project_id "$ROOT")"
+TF_BRANCH="$(lakebase_resolve_tf_var branch "$ROOT")"
+TF_PROFILE="$(lakebase_resolve_tf_var databricks_profile "$ROOT")"
+DB="$(lakebase_resolve_database "$ROOT")"
 
 if [ -n "$TF_PROJECT" ] && [ -n "$TF_BRANCH" ]; then
   case "$TF_BRANCH" in
@@ -110,12 +116,33 @@ if [ -z "$USER_SET_PROFILE" ] && [ -n "$TF_PROFILE" ]; then
   PROFILE="$TF_PROFILE"
 fi
 
-echo "== 1b. verify committed per-table Liquibase changelogs are in sync with config/tables.json =="
+echo "== 0b. verify committed per-table Liquibase changelogs are in sync with config/tables.json =="
 # Do NOT regenerate at deploy time — that could apply something other than the reviewed, committed
 # artifacts. Instead VERIFY the committed liquibase/generated/*.changelog.sql byte-match a fresh
 # generation from config/tables.json, and ABORT the deploy (non-zero under `set -e`) on any drift.
 # Regenerate + commit is a reviewed change, done before deploy; the deploy applies exactly that.
+# This runs before the apply: a changed primary key replaces the table, and stale changelogs would
+# then leave it without the grants they reapply.
 python3 "$ROOT/liquibase/generate_changelogs.py" --check
+
+echo "== 1. terraform apply (for_each creates all tables in config/tables.json) =="
+( cd "$ROOT/terraform" && terraform init -input=false >/dev/null && terraform apply -auto-approve -input=false )
+
+echo "== 1b. confirm Terraform applied the target that was checked before the apply =="
+APPLIED_PROJECT="$(terraform -chdir="$ROOT/terraform" output -raw project_id)"
+APPLIED_BRANCH="$(terraform -chdir="$ROOT/terraform" output -raw branch)"
+APPLIED_PROFILE="$(terraform -chdir="$ROOT/terraform" output -raw databricks_profile)"
+APPLIED_DB="$(terraform -chdir="$ROOT/terraform" output -raw logical_database)"
+# A wrapper that adds lines to stdout (hashicorp/setup-terraform with its wrapper on) makes this value
+# junk; refuse it by name before comparing.
+lakebase_validate_database "$APPLIED_DB"
+if [ "$APPLIED_PROJECT" != "$TF_PROJECT" ] || [ "$APPLIED_BRANCH" != "$TF_BRANCH" ] \
+  || [ "$APPLIED_PROFILE" != "$TF_PROFILE" ] || [ "$APPLIED_DB" != "$DB" ]; then
+  printf 'target mismatch: terraform apply reports project_id=%q branch=%q databricks_profile=%q logical_database=%q, but the target checked before the apply was project_id=%q branch=%q databricks_profile=%q logical_database=%q\n' \
+    "$APPLIED_PROJECT" "$APPLIED_BRANCH" "$APPLIED_PROFILE" "$APPLIED_DB" \
+    "$TF_PROJECT" "$TF_BRANCH" "$TF_PROFILE" "$DB" >&2
+  exit 1
+fi
 
 # Iterate every table entry in the single source of truth.
 COUNT=$(python3 -c "import json;print(len(json.load(open('$CONFIG'))))")
