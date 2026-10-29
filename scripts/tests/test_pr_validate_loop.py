@@ -83,13 +83,25 @@ resolve_stub_db() {
     printf '%s' "${TF_VAR_logical_database:-databricks_postgres}"
   fi
 }
+resolve_stub_var() {
+  case "$1" in
+    logical_database) resolve_stub_db "$dir" ;;
+    project_id) printf '%s' "${TF_VAR_project_id:-my-lakebase-project}" ;;
+    branch) printf '%s' "${TF_VAR_branch:-projects/my-lakebase-project/branches/production}" ;;
+    databricks_profile) printf '%s' "${TF_VAR_databricks_profile-DEFAULT}" ;;
+  esac
+}
+# Like the real Terraform: `output -raw <name>` and `console` (var.<name> on stdin) agree.
 case "$*" in
-  *"output -raw logical_database"*)
-    resolve_stub_db "$dir"
+  *"output -raw "*)
+    resolve_stub_var "${@: -1}"
     exit 0
     ;;
   *console*)
-    printf '"%s"\n' "$(resolve_stub_db "$dir")"
+    while IFS= read -r expr; do
+      [ -n "$expr" ] || continue
+      printf '"%s"\n' "$(resolve_stub_var "${expr#var.}")"
+    done
     exit 0
     ;;
 esac
@@ -286,45 +298,68 @@ printf '%s\\n' "$*" >> "$LB_LOG"
 exit 0
 """,
     )
-    # Stub terraform so `output -raw logical_database` prints `applied_via_var_file_db`
     tf_stub = Path(env["PATH"].split(os.pathsep)[0]) / "terraform"
-    tf_stub.write_text(
-        """#!/usr/bin/env bash
+    apply_log = tmp_path / "tf_apply_ran.log"
+
+    def run_with(console_db: str, output_db: str) -> subprocess.CompletedProcess:
+        """A fake terraform whose `console` (checked BEFORE the apply) reports `console_db` and whose
+        `output -raw` (read AFTER the apply) reports `output_db`; the other variables are defaults."""
+        apply_log.unlink(missing_ok=True)
+        lb_log.write_text("")
+        tf_stub.write_text(
+            f"""#!/usr/bin/env bash
 case "$*" in
-  *"output -raw logical_database"*) printf 'applied_via_var_file_db\\n' ;;
+  *apply*) echo applied >> "{apply_log}"; exit 0 ;;
+  *"output -raw logical_database"*) printf '%s\\n' '{output_db}' ;;
+  *"output -raw project_id"*) printf '%s' "${{TF_VAR_project_id:-my-lakebase-project}}" ;;
+  *"output -raw branch"*) printf '%s' "${{TF_VAR_branch:-projects/my-lakebase-project/branches/production}}" ;;
+  *"output -raw databricks_profile"*) printf '%s' "${{TF_VAR_databricks_profile-DEFAULT}}" ;;
+  *" console"*)
+    while IFS= read -r expr; do
+      case "$expr" in
+        var.logical_database) printf '"%s"\\n' '{console_db}' ;;
+        var.project_id) printf '"%s"\\n' "${{TF_VAR_project_id:-my-lakebase-project}}" ;;
+        var.branch) printf '"%s"\\n' "${{TF_VAR_branch:-projects/my-lakebase-project/branches/production}}" ;;
+        var.databricks_profile) printf '"%s"\\n' "${{TF_VAR_databricks_profile-DEFAULT}}" ;;
+      esac
+    done
+    ;;
   *) exit 0 ;;
 esac
 """
-    )
-    tf_stub.chmod(0o755)
+        )
+        tf_stub.chmod(0o755)
+        return subprocess.run(
+            ["bash", str(work / "scripts" / "deploy.sh")],
+            cwd=str(work), env=env, capture_output=True, text=True,
+        )
 
-    r = subprocess.run(
-        ["bash", str(work / "scripts" / "deploy.sh")],
-        cwd=str(work), env=env, capture_output=True, text=True,
-    )
+    # 1. The database Terraform resolves from the var file is the one the whole deploy uses.
+    r = run_with("applied_via_var_file_db", "applied_via_var_file_db")
     assert r.returncode == 0, f"deploy.sh failed:\n{r.stdout}\n{r.stderr}"
     calls = lb_log.read_text()
     assert f"jdbc:postgresql://{RW_HOST}:5432/applied_via_var_file_db?sslmode=require" in calls, (
-        f"deploy.sh did not use `terraform output -raw logical_database` after apply:\n{calls}"
+        f"deploy.sh did not use the database Terraform resolved:\n{calls}"
     )
+    assert apply_log.is_file(), "control: the apply must run when the target is fine"
 
-    # And if `terraform output -raw logical_database` returns a hostile DB name, deploy.sh fails closed
-    lb_log.write_text("")
-    tf_stub.write_text(
-        """#!/usr/bin/env bash
-case "$*" in
-  *"output -raw logical_database"*) printf 'db?sslmode=disable\\n' ;;
-  *) exit 0 ;;
-esac
-"""
-    )
-    tf_stub.chmod(0o755)
-    r_bad = subprocess.run(
-        ["bash", str(work / "scripts" / "deploy.sh")],
-        cwd=str(work), env=env, capture_output=True, text=True,
-    )
+    # 2. A hostile name reported by `terraform output -raw logical_database` after the apply fails closed.
+    r_bad = run_with("applied_via_var_file_db", "db?sslmode=disable")
     assert r_bad.returncode != 0, "deploy.sh accepted hostile database name from terraform output"
+    assert "invalid database name" in r_bad.stderr.lower(), r_bad.stderr
     assert lb_log.read_text() == "", "liquibase ran despite hostile terraform output database name"
+
+    # 3. A valid name after the apply that differs from the one checked before it also fails closed.
+    r_diff = run_with("applied_via_var_file_db", "some_other_db")
+    assert r_diff.returncode != 0, "deploy.sh followed a database that differs from the one it checked"
+    assert "mismatch" in (r_diff.stdout + r_diff.stderr).lower(), r_diff.stderr
+    assert lb_log.read_text() == "", "liquibase ran against a database that differs from the checked one"
+
+    # 4. A hostile name resolved BEFORE the apply stops the deploy before `terraform apply` runs.
+    r_pre = run_with("db?sslmode=disable", "db?sslmode=disable")
+    assert r_pre.returncode != 0, "deploy.sh accepted a hostile database name before the apply"
+    assert not apply_log.exists(), "terraform apply ran although the database name was invalid"
+    assert lb_log.read_text() == ""
 
 
 def test_seed_source_sh_fails_on_bad_config_or_failed_statement_and_isolates_stdin(tmp_path):
@@ -555,3 +590,24 @@ exit 0
     assert "idx_members_region_code" in joined
     assert "providers_v" in joined
 
+
+
+def test_seed_source_sh_prints_the_row_count_it_selects(tmp_path):
+    """The seed script ends each source with `SELECT count(*)`; the number must be shown, not only
+    `SUCCEEDED`, so the person seeding can see the rows landed. A failing statement still exits 1."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    db_stub = bin_dir / "databricks"
+    db_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '{\"status\":{\"state\":\"SUCCEEDED\"},\"result\":{\"data_array\":[[\"3\"]]}}\\n'\n"
+    )
+    db_stub.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["WAREHOUSE_ID"] = "stub-warehouse"
+    r = subprocess.run(["bash", str(SEED_SH)], cwd=str(REPO_ROOT), env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    idx = next(i for i, ln in enumerate(lines) if ln.startswith("-> SELECT count(*)"))
+    assert any("3" in ln and "result" in ln for ln in lines[idx + 1 : idx + 3]), r.stdout

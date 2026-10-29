@@ -60,6 +60,9 @@ no-database pytest suite; live-proven = verified against a live Lakebase branch 
 | App role reads the consumer VIEW but not the base synced table (least privilege) | least-privilege assertions in `docker_multitable_proof.sh` + `docker_double_apply_proof.sh` + `docker_verify_step.sh` + `test_checks.py` + `test_generate_changelogs.py::test_only_view_select_is_granted_across_changelog`; live-confirmed | Docker + offline + live |
 | `view_name` override is honored — the overridden view is created, the derived `<tbl>_v` is not | `docker_multitable_proof.sh` + `test_generate_changelogs.py::test_view_name_override_appears_in_changelog`; deploy verify: `scripts/tests/test_deploy_view_name.py` | Docker + offline |
 | Deploy aborts on committed-changelog drift (uses reviewed artifacts, never regenerates) | `test_deploy_drift_gate.py` | offline |
+| The Terraform-path deploy checks the target and the changelogs before `terraform apply` (a wrong target, a conflicting `terraform.tfvars`, a bad database name, or drift stops it before anything changes) | `test_deploy_target_parity.py::test_attacker_6_*`; mutation-checked | offline |
+| Renamed or deleted entries leave no stale generated file: write mode removes only files the generator wrote (never hand-written files, symlinks, or files that merely quote the marker), prints each removal, and `--check` removes nothing | `test_generate_resources.py` and `test_generate_changelogs.py` (the `renamed_entries`, `hand_written`, `symlink`, `only_quotes_the_marker` and `check_mode_deletes` tests); mutation-checked | offline |
+| `docs/CHANGE-IMPACT.md` names only tests and scripts that exist | `test_docs_parity.py::test_change_impact_cites_only_tests_and_scripts_that_exist` | offline |
 | Deploy, Terraform, Liquibase, and verify target one project, branch, profile, and database (and `make branch` threads `PROFILE`) | `test_deploy_target_parity.py` + `test_deploy_workflow.py` + `test_wait_for_sync.py` | offline |
 | Endpoint-based credential minting (projects API, no instance name; READ_WRITE endpoint with ready host and resource name required on both paths) | `test_endpoint_credential.py::test_shell_and_dabs_endpoint_parity_matrix` + `test_migration_job.py::test_select_endpoint_and_conninfo_attacker_matrix` | offline |
 | Duplicate table names and duplicate resolved view names are rejected at generation time across both generators | `test_generate_changelogs.py` (`test_duplicate_table_names_rejected_in_write_changelogs_and_load_tables`, `test_duplicate_resolved_view_names_are_rejected`) + `test_render_ddl.py` + `test_generate_resources.py` | offline |
@@ -94,7 +97,7 @@ python3 -c "import json; json.load(open('config/tables.json'))"
 |---|---|
 | Tables the pipeline manages | `config/tables.json` |
 | Shared workspace settings | `terraform/terraform.tfvars.example` (+ your own `.tfvars`) |
-| Migration SQL shape (role/grants/indexes/view) — both paths | `dabs/render_ddl.py` (the shared SQL helpers both engines use) |
+| Migration SQL shape (role/grants/indexes/view) — both paths | `dabs/render_ddl.py` (the shared SQL helpers both engines use). Read `docs/CHANGE-IMPACT.md` first: it lists what each grant, role and ownership step needs, what breaks, and which test proves it |
 | Non-standard index shape for a table | the `index_columns` for that row in `config/tables.json`, and the shared SQL helpers in `dabs/render_ddl.py` (never the generated `liquibase/generated/*.changelog.sql` — those are regenerated and drift-checked in CI) |
 | Pipeline steps / ordering | `scripts/deploy.sh` |
 | CI behavior | `.github/workflows/` |

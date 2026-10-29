@@ -428,3 +428,72 @@ def test_readme_has_tested_on_and_tested_vs_not_tested_sections_matching_ci():
         )
 
 
+
+
+# --- docs/CHANGE-IMPACT.md may only cite tests and scripts that exist -----------------------------
+#
+# What this protects: a reader who trusts a row of the change-impact table because it names a test.
+# What must never happen: a row names a test or script that was renamed or never existed, so the
+# row looks proven and is not.
+# Attacker list: 1. a cited test name that does not exist; 2. a cited test that exists in another file than
+# the one named; 3. a cited script that does not exist; 4. the doc itself is missing; 5. the doc cites nothing
+# (a table with no evidence passes a loop that never runs).
+
+import re as _re
+
+
+def _test_files() -> list:
+    skip = {".venv-dev", ".git", ".scratch", "node_modules", "__pycache__"}
+    out = []
+    for p in REPO.rglob("test_*.py"):
+        if skip.isdisjoint(p.parts):
+            out.append(p)
+    return out
+
+
+def _defined_tests(path) -> set:
+    return set(_re.findall(r"^def (test_\w+)\(", path.read_text(), _re.M))
+
+
+def _cited(doc_text: str) -> tuple:
+    """(file-qualified test citations, bare test names, script names) found in backticks."""
+    qualified = _re.findall(r"`([\w./-]+\.py)::(test_\w+)`", doc_text)
+    bare = [m for m in _re.findall(r"`(test_\w+)`", doc_text)]
+    scripts = _re.findall(r"`([\w./-]+\.sh)`", doc_text)
+    return qualified, bare, scripts
+
+
+def test_change_impact_cites_only_tests_and_scripts_that_exist():
+    doc = REPO / "docs" / "CHANGE-IMPACT.md"
+    assert doc.is_file(), "docs/CHANGE-IMPACT.md is missing"
+    qualified, bare, scripts = _cited(doc.read_text())
+    assert qualified and scripts, "the change-impact table cites no tests or no scripts: it proves nothing"
+
+    files = _test_files()
+    by_name = {}
+    for f in files:
+        by_name.setdefault(f.name, []).append(f)
+    all_defined = set().union(*(_defined_tests(f) for f in files))
+
+    missing = []
+    for fname, test in qualified:
+        candidates = by_name.get(Path(fname).name, [])
+        if not any(test in _defined_tests(f) for f in candidates):
+            missing.append(f"{fname}::{test}")
+    for test in bare:
+        if test not in all_defined:
+            missing.append(test)
+    assert not missing, f"CHANGE-IMPACT.md cites tests that do not exist: {missing}"
+
+    all_scripts = {p.name for p in REPO.rglob("*.sh") if ".venv-dev" not in p.parts and ".git" not in p.parts}
+    missing_scripts = [s for s in scripts if Path(s).name not in all_scripts]
+    assert not missing_scripts, f"CHANGE-IMPACT.md cites scripts that do not exist: {missing_scripts}"
+
+
+def test_change_impact_checker_catches_a_renamed_test():
+    """The checker itself must go red on a fake citation (it is not a loop that never runs)."""
+    qualified, bare, _ = _cited("| `test_checks.py::test_this_was_renamed` | `test_nothing_here` |")
+    all_defined = set().union(*(_defined_tests(f) for f in _test_files()))
+    assert ("test_checks.py", "test_this_was_renamed") in qualified
+    assert "test_nothing_here" in bare
+    assert "test_this_was_renamed" not in all_defined and "test_nothing_here" not in all_defined

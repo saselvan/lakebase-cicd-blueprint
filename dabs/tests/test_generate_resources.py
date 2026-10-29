@@ -540,3 +540,112 @@ def test_duplicate_table_names_rejected_in_dabs_generator(tmp_path, second_name)
         f"--check output did not name duplicate 'members':\n{res_check.stderr}\n{res_check.stdout}"
     )
 
+
+
+# --- Write mode removes the generated files of entries that are no longer in the config ----------
+#
+# What this protects: a customer who renames or removes the example tables (the README's first step)
+# and then deploys. What must never happen: the old entries' generated files stay in dabs/resources/,
+# `bundle validate` passes, and `bundle deploy` half-applies resources that still point at the old
+# (placeholder) names and then fails.
+# Attacker list (minimum):
+#   1. an entry is renamed: its old generated file must be gone and the folder must pass --check
+#   2. a hand-written .yml in the folder must NOT be deleted (it is reported, and --check still flags it)
+#   3. a symlink named *.yml must not be followed, deleted, or used to delete its target
+#   4. a file that only quotes the marker later in the file is not "generated"
+#   5. --check must delete nothing
+#   6. the generated, expected migration_targets.yml must never be removed
+
+
+def _renamed_config(tmp_path: Path) -> Path:
+    rows = json.loads(REAL_CONFIG.read_text())
+    for r in rows:
+        r["name"] = r["name"] + "_indep"
+    cfg = tmp_path / "renamed_tables.json"
+    cfg.write_text(json.dumps(rows))
+    return cfg
+
+
+def _run_gen(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "dabs.generate_resources", *args],
+        cwd=str(GEN_MODULE_DIR),
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_renamed_entries_leave_no_stale_generated_files_and_pass_check(tmp_path):
+    out = _copy_committed(tmp_path / "resources")
+    assert (out / "members.yml").is_file()
+    cfg = _renamed_config(tmp_path)
+
+    r = _run_gen("--config", str(cfg), "--out", str(out))
+    assert r.returncode == 0, r.stderr
+
+    names = sorted(p.name for p in out.glob("*.yml"))
+    assert "members.yml" not in names and "providers.yml" not in names, names
+    assert "members_indep.yml" in names and "providers_indep.yml" in names, names
+    assert "migration_targets.yml" in names, names
+    assert "members.yml" in r.stdout, "the removal must be reported, not silent"
+    chk = _run_gen("--check", "--config", str(cfg), "--out", str(out))
+    assert chk.returncode == 0, chk.stderr
+
+
+def test_write_keeps_a_hand_written_file_and_check_still_flags_it(tmp_path):
+    out = _copy_committed(tmp_path / "resources")
+    mine = out / "notes.yml"
+    mine.write_text("# my own bundle fragment\nresources: {}\n")
+
+    r = _run_gen("--config", str(REAL_CONFIG), "--out", str(out))
+    assert r.returncode == 0, r.stderr
+    assert mine.read_text() == "# my own bundle fragment\nresources: {}\n", "a hand-written file was deleted"
+    assert "notes.yml" in (r.stdout + r.stderr), "the kept file must be reported"
+    chk = _run_gen("--check", "--config", str(REAL_CONFIG), "--out", str(out))
+    assert chk.returncode != 0 and "notes.yml" in chk.stderr, chk.stderr
+
+
+def test_write_never_follows_or_deletes_a_symlink(tmp_path):
+    from dabs.generate_resources import _GENERATED_HEADER
+
+    out = _copy_committed(tmp_path / "resources")
+    outside = tmp_path / "outside.yml"
+    outside.write_text(_GENERATED_HEADER + "resources: {}\n")
+    link = out / "ghost.yml"
+    link.symlink_to(outside)
+
+    r = _run_gen("--config", str(REAL_CONFIG), "--out", str(out))
+    assert r.returncode == 0, r.stderr
+    assert outside.is_file(), "the file a symlink pointed at was deleted"
+    assert link.is_symlink(), "a symlink was removed"
+
+
+def test_a_file_that_only_quotes_the_marker_later_is_not_treated_as_generated(tmp_path):
+    from dabs.generate_resources import _GENERATED_HEADER
+
+    out = _copy_committed(tmp_path / "resources")
+    quoted = out / "quoted.yml"
+    quoted.write_text("# I copied the header below to explain it\n" + _GENERATED_HEADER + "resources: {}\n")
+
+    r = _run_gen("--config", str(REAL_CONFIG), "--out", str(out))
+    assert r.returncode == 0, r.stderr
+    assert quoted.is_file(), "a file with the marker mid-file was deleted"
+
+
+def test_check_mode_deletes_nothing(tmp_path):
+    from dabs.generate_resources import _GENERATED_HEADER
+
+    out = _copy_committed(tmp_path / "resources")
+    stale = out / "old_entry.yml"
+    stale.write_text(_GENERATED_HEADER + "resources: {}\n")
+
+    chk = _run_gen("--check", "--config", str(REAL_CONFIG), "--out", str(out))
+    assert chk.returncode != 0 and "old_entry.yml" in chk.stderr, chk.stderr
+    assert stale.is_file(), "--check removed a file; it must be verify-only"
+
+
+def test_migration_targets_file_is_never_removed(tmp_path):
+    out = _copy_committed(tmp_path / "resources")
+    r = _run_gen("--config", str(_renamed_config(tmp_path)), "--out", str(out))
+    assert r.returncode == 0, r.stderr
+    assert (out / "migration_targets.yml").is_file()

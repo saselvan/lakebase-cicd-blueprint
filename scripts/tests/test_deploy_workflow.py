@@ -353,6 +353,21 @@ case "$*" in
     printf '::debug::Terraform exited with code 0.\\n'
     exit 0
     ;;
+  *"output -raw project_id"*) printf 'my-lakebase-project'; exit 0 ;;
+  *"output -raw branch"*) printf 'projects/my-lakebase-project/branches/production'; exit 0 ;;
+  *"output -raw databricks_profile"*) exit 0 ;;
+  *" console"*)
+    # This scenario wraps only `output`; `console` answers like the real binary. PROFILE is "" here.
+    while IFS= read -r expr; do
+      case "$expr" in
+        var.logical_database) printf '"databricks_postgres"\\n' ;;
+        var.project_id) printf '"my-lakebase-project"\\n' ;;
+        var.branch) printf '"projects/my-lakebase-project/branches/production"\\n' ;;
+        var.databricks_profile) printf '""\\n' ;;
+      esac
+    done
+    exit 0
+    ;;
   *)
     exit 0
     ;;
