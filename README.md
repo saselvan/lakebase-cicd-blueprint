@@ -89,7 +89,7 @@ databricks bundle validate --target dev \
 # 4. on merge, deploy the bundle and run the migration job:
 databricks bundle deploy --target dev \
   --var lakebase_branch=... --var lakebase_database=...
-databricks bundle run lakebase_migration \
+databricks bundle run lakebase_migration --target dev \
   --var lakebase_branch=... --var lakebase_database=...
 ```
 
@@ -292,15 +292,23 @@ When it fails:
 
 ### Tear it down (DABs path)
 
-To remove a trial deployment:
+To remove a trial deployment, in this order. A run from zero on 2026-10-29 used exactly this order and left
+nothing behind:
 
-1. **Drop each consumer view first**, as the deploy identity that owns it:
-   `DROP VIEW <app_schema>.<view_name>;`. A view blocks the delete of the synced table under it (see "One
-   caveat about self-healing" below).
-2. Run `databricks bundle destroy --target dev` with the same `--var` values. It removes the resources the
-   deployment recorded and deletes the whole deployment folder,
+1. **Drop each consumer view first**, as the deploy identity that owns it. The view is named
+   `<table>_v` unless you set `view_name`, and `verify` prints its name. Connect with the `databricks psql`
+   command from Step 2b and run `DROP VIEW <app_schema>.<view_name>`. A view blocks the delete of the synced
+   table under it (see "One caveat about self-healing" below).
+2. Run `databricks bundle destroy --target dev` with the same `--var` values (add `--auto-approve` in a
+   script). It removes the resources the deployment recorded and deletes the whole deployment folder,
    `/Workspace/Users/<you>/.bundle/<bundle name>/<target>`.
-3. **If a deploy failed partway, look for synced tables it created.** In an independent run from zero on
+3. **Only then delete a throwaway child branch**:
+   `databricks postgres delete-branch projects/<project-id>/branches/<branch-id>`. Deleting the branch
+   removes the views with it, so delete it after steps 1 and 2, not before.
+4. **Demo only: remove what `seed_source.sh` made.** It creates the source tables and their Unity Catalog
+   schema, and neither of the steps above removes them. If the schema is yours alone, drop it in the SQL
+   editor: `DROP SCHEMA <catalog>.<schema> CASCADE`.
+5. **If a deploy failed partway, look for synced tables it created.** In an independent run from zero on
    2026-10-29, `bundle destroy` after a failed deploy removed only the job: the two synced tables that
    deploy had created were not in the deployment's record. Find them and delete them yourself:
    `databricks postgres delete-synced-table synced_tables/<catalog>.<schema>.<table>`.
@@ -678,6 +686,16 @@ Verified `2026-10-14` through `2026-10-23`:
 ### Tested vs not tested
 
 - **Tested live on Lakebase (`1–8 CU` child branches, 2026-10-14 to 2026-10-23):** 1-table end-to-end deploy and primary-key replace as a non-superuser deploy service principal on both the DABs path and the Terraform + Liquibase path; identity policy guard pass and fail (`databricks_superuser` rejection); 2-table `verify` (`16/16` checks in those runs; `verify` now runs `9` checks per table / `18` across the two shipped tables) and all 6 base-table grant routes (direct, column, `PUBLIC`, inherited role, `NOINHERIT` role, `DELETE`); drift `REVOKE` and re-reconcile; `python -m dabs.render_ddl --config config/tables.json | psql "$LAKEBASE_CONNINFO"` and `examples/read_via_view.py`.
+- **Tested live on 2026-10-29 (`1–8 CU` child branches, deleted afterwards):** `migrate` refused a missing app
+  role (exit 1, `app role ... does not exist; an admin must create it`, nothing left behind); `verify` failed
+  with exactly one failing check when the consumer view had `security_invoker = true` and passed after the
+  reset; the `databricks psql` command in Step 2b ran as written.
+- **Run from zero by an independent agent (2026-10-29):** a model with no project context followed the DABs
+  path of this README on a throwaway child branch, with its own table, schema, role and bundle names.
+  `verify` passed 18 of 18 checks on two tables, renaming an entry and regenerating removed the old entry's
+  file, and teardown left nothing of its own behind. It used the author's Databricks login, so it says
+  nothing about what another person's permissions allow. An earlier run, on the README before this change,
+  stopped at `bundle deploy` because of stale example files; that is fixed.
 - **Tested in Docker PostgreSQL 16 + offline test suite (on every run):** 2 shared-schema tables with `view_name` override (`docker_multitable_proof.sh`), `runAlways` view body edit (`docker_view_edit_proof.sh`), atomic consumer view rebuild across column drop/rename/reorder with a concurrent reader loop (`docker_view_column_change_proof.sh`), double-apply idempotency and missing-role refusal with/without `CREATEROLE` (`docker_double_apply_proof.sh`), verify post-conditions (`docker_verify_step.sh`), and 350+ offline unit/workflow/parity tests.
 - **Not tested live end to end:** Running `.github/workflows/deploy.yml` or `pr-validate.yml` on a GitHub Actions runner against a live workspace; GitHub Actions OIDC workload identity federation; an end-to-end blue/green sync-mode swap on a live table; `lifecycle.prevent_destroy` or `existing_pipeline_id` bundle options; per-consumer-group `WHERE` views; and a fresh from-zero run by a second person outside the author's workspace.
 
@@ -711,8 +729,9 @@ Shared:
 
 - A Databricks workspace with a Lakebase Autoscaling project and a `production` branch (live tests in this repo ran on Lakebase child branches configured at `1–8 CU` autoscaling with a `3600s` TTL; note that changing an endpoint's CU ceiling restarts compute and drops open connections).
 - Databricks CLI, authenticated to your workspace (a named CLI profile).
-- A SQL warehouse (for seeding the demo Delta source tables) and an existing UC (Unity Catalog) catalog
-  and schema.
+- A SQL warehouse (for seeding the demo Delta source tables) and an existing UC (Unity Catalog) catalog.
+  The schema that holds your source tables must exist too; for the demo, `scripts/seed_source.sh`
+  creates it.
 
 For the DABs path:
 

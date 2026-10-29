@@ -28,8 +28,10 @@ Last checked: 2026-10-29, against the code on `main` plus the before-apply deplo
 
 ## What no test here covers
 
-- **A second person or identity running the README from zero.** Every live run above was done by the author's
-  workspace identities. (Also listed in the README under "Tested vs not tested".)
+- **A second person or identity running the README from zero.** Every live run above used the author's workspace
+  login. On 2026-10-29 an independent agent (no project context) ran the whole DABs path from zero with that
+  login and passed; that tests the README, not another person's permissions. (Also listed in the README under
+  "Tested vs not tested".)
 - **Per-consumer-group `WHERE` views** and **row-level security on a synced table.** Postgres refuses `ENABLE ROW
   LEVEL SECURITY` on a table you do not own; the per-group view pattern is described in `docs/DESIGN-NOTES.md` as
   not tested.
