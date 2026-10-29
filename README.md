@@ -16,6 +16,41 @@ already standardized on Terraform. Both produce the same database objects from t
 
 ---
 
+## How it fits together
+
+One file, `config/tables.json`, feeds both paths. The paths share two things, so they cannot drift apart:
+the SQL (`dabs/render_ddl.py`) and the checks (`dabs/checks.py`).
+
+```mermaid
+flowchart LR
+  CFG["config/tables.json<br/>the one file you edit"]
+  CFG --> GR["dabs/generate_resources.py"] --> RES["dabs/resources/*.yml"]
+  CFG --> TF["terraform/main.tf<br/>one synced table per entry"]
+  CFG --> RD["dabs/render_ddl.py<br/>role check, grants, indexes, view"]
+  RD --> GC["liquibase/generate_changelogs.py"] --> LB["liquibase/generated/*.sql"]
+  RES --> BD["bundle deploy"] --> ST[("synced tables")]
+  TF --> ST
+  ST --> W{"ONLINE?"}
+  RD --> MJ["migration job (DABs path)"]
+  LB --> LQ["liquibase update (Terraform path)"]
+  W --> MJ --> PG[("role check, grants,<br/>indexes, view")]
+  W --> LQ --> PG
+  PG --> CK["dabs/checks.py<br/>9 checks per table"]
+```
+
+| Step | DABs path (recommended) | Terraform + Liquibase path |
+|---|---|---|
+| Before anything changes | `bundle validate` in CI (needs no cloud) | `deploy.sh` step 0: resolves the target with `terraform console`, checks it, and checks the changelogs, all before `terraform apply` |
+| Create the synced tables | `bundle deploy` | `terraform apply` |
+| Wait for `ONLINE`, apply the SQL | job task `migrate` | `wait_for_sync.sh`, then `liquibase update` for each table |
+| Check the result | job task `verify` (9 checks per table) | `verify_table` for each table (the same 9 checks) |
+| Identity guard | job task `verify_identity_policy` before `migrate`, in the `prod` target only | none on this path: run it as a service principal that is not in `databricks_superuser` |
+
+Before you change a grant, a role, or who owns the view, read [`docs/CHANGE-IMPACT.md`](docs/CHANGE-IMPACT.md):
+for each of those steps it says what must be true first, what breaks if it is wrong, and what proves it.
+
+---
+
 ## Recommended path: Declarative Automation Bundles (DABs)
 
 Declarative Automation Bundles (DABs; formerly Databricks Asset Bundles,
@@ -30,16 +65,25 @@ The flow: edit one config file, generate the bundle resources, then deploy and r
 as a Databricks Workflow job. There is no Terraform and no Liquibase on this path.
 
 ```bash
-# 1. list the tables you want to manage (the single source of truth):
+# 0. once, from the repo root: a Python environment for the generator (PyYAML)
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r dabs/requirements-dev.txt
+
+# 1. list the tables you want to manage (the single source of truth). Replace the two example
+#    entries (members, providers) with your own: catalog, schema, tables, app role, indexes.
 $EDITOR config/tables.json
 
-# 2. generate the bundle resources from that config:
+# 2. generate the bundle resources from that config. It also removes the generated files of any
+#    entry you renamed or deleted, and prints each one it removed:
 python -m dabs.generate_resources          # writes dabs/resources/*.yml
 
-# 3. from the bundle root, check the bundle (safe to run on a pull request):
+# 2b. once, before the first deploy: the source tables and the app roles (next section)
+
+# 3. from the bundle root, check the bundle (safe to run on a pull request). For a first run, use a
+#    child branch of your project (`databricks postgres create-branch`), not `production`:
 cd dabs
 databricks bundle validate --target dev \
-  --var lakebase_branch=projects/<project-id>/branches/main \
+  --var lakebase_branch=projects/<project-id>/branches/<branch-id> \
   --var lakebase_database=databricks_postgres
 
 # 4. on merge, deploy the bundle and run the migration job:
@@ -48,6 +92,30 @@ databricks bundle deploy --target dev \
 databricks bundle run lakebase_migration \
   --var lakebase_branch=... --var lakebase_database=...
 ```
+
+### Step 2b: the source tables and the app roles (once, before the first deploy)
+
+Two things must exist before the first `bundle deploy`:
+
+- **The source tables.** A synced table copies a Unity Catalog Delta table, so every
+  `source_table_full_name` in `config/tables.json` must exist, with Change Data Feed on. In real use your
+  data pipeline produces them. For the demo only, `scripts/seed_source.sh` creates them from
+  `config/tables.json` and adds 3 rows to each:
+  `PROFILE=<profile> WAREHOUSE_ID=<sql-warehouse-id> ./scripts/seed_source.sh`.
+- **The app roles.** The pipeline never creates a role: the migration job checks that it exists and stops
+  if it does not. An admin creates each `app_role` from `config/tables.json` once, as the project owner.
+  The `psql` client must be installed; `databricks psql` connects with a credential it mints for you:
+
+```bash
+databricks psql --project <project-id> --branch <branch-id> --endpoint primary -- \
+  -d databricks_postgres \
+  -c "CREATE ROLE members_app_ro NOLOGIN" \
+  -c "CREATE ROLE providers_app_ro NOLOGIN"
+```
+
+Checked 2026-10-29 on a throwaway child branch: this ran as written, and the role came back with
+`rolcanlogin = f`. A child branch copies its parent, so a role that already exists on the parent already
+exists on the branch; when you test this path, use new role names so the step is not a silent no-op.
 
 The migration job takes no database-instance name. It stays on the projects (Autoscaling) API: it
 resolves the target branch's READ_WRITE compute endpoint and mints a runtime OAuth credential from
@@ -221,6 +289,26 @@ When it fails:
   drop the view as the deploy service principal, which owns it (another identity gets
   `must be owner of view`): `DROP VIEW cicd_proj.members_v;`. Then deploy and run again; migrate
   puts the view, its grant and the indexes back.
+
+### Tear it down (DABs path)
+
+To remove a trial deployment:
+
+1. **Drop each consumer view first**, as the deploy identity that owns it:
+   `DROP VIEW <app_schema>.<view_name>;`. A view blocks the delete of the synced table under it (see "One
+   caveat about self-healing" below).
+2. Run `databricks bundle destroy --target dev` with the same `--var` values. It removes the resources the
+   deployment recorded and deletes the whole deployment folder,
+   `/Workspace/Users/<you>/.bundle/<bundle name>/<target>`.
+3. **If a deploy failed partway, look for synced tables it created.** In an independent run from zero on
+   2026-10-29, `bundle destroy` after a failed deploy removed only the job: the two synced tables that
+   deploy had created were not in the deployment's record. Find them and delete them yourself:
+   `databricks postgres delete-synced-table synced_tables/<catalog>.<schema>.<table>`.
+
+**A deployment is named by the bundle name and your user.** The bundle name here is `lakebase-cicd-dabs`.
+If you already have a deployment with that name, `bundle deploy` updates it and `bundle destroy` deletes
+it. To try this repo next to an existing deployment, change `bundle.name` in `dabs/databricks.yml` in a
+scratch copy first.
 
 ### Beta status and CLI pin
 
@@ -628,6 +716,9 @@ Shared:
 
 For the DABs path:
 
+- Python 3.11 and PyYAML for the generator: `pip install -r dabs/requirements-dev.txt` (it also installs
+  `pytest`, which only the tests need).
+- The `psql` client, for the one-time admin step that creates the app roles (`databricks psql` runs it).
 - Databricks CLI 1.5.0 or newer (`dabs/scripts/offline_validate.sh` enforces `>= 1.5.0`; tested with `1.17.0` and `1.19.0`, and Lakebase DAB support is Beta).
 - The bundle uses the Autoscaling resource `postgres_synced_tables`. If your existing bundle still
   declares the Provisioned resources (`database_instances`, `synced_database_tables`), move it first

@@ -590,3 +590,24 @@ exit 0
     assert "idx_members_region_code" in joined
     assert "providers_v" in joined
 
+
+
+def test_seed_source_sh_prints_the_row_count_it_selects(tmp_path):
+    """The seed script ends each source with `SELECT count(*)`; the number must be shown, not only
+    `SUCCEEDED`, so the person seeding can see the rows landed. A failing statement still exits 1."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    db_stub = bin_dir / "databricks"
+    db_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '{\"status\":{\"state\":\"SUCCEEDED\"},\"result\":{\"data_array\":[[\"3\"]]}}\\n'\n"
+    )
+    db_stub.chmod(0o755)
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["WAREHOUSE_ID"] = "stub-warehouse"
+    r = subprocess.run(["bash", str(SEED_SH)], cwd=str(REPO_ROOT), env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.splitlines()
+    idx = next(i for i, ln in enumerate(lines) if ln.startswith("-> SELECT count(*)"))
+    assert any("3" in ln and "result" in ln for ln in lines[idx + 1 : idx + 3]), r.stdout
