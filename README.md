@@ -93,6 +93,18 @@ databricks bundle run lakebase_migration --target dev \
   --var lakebase_branch=... --var lakebase_database=...
 ```
 
+A green run ends `TERMINATED SUCCESS`, each synced table reports
+`SYNCED_TABLE_ONLINE_NO_PENDING_UPDATE`, and the verify task prints one `PASS` line per check —
+18 for the demo's two tables, scaling with `config/tables.json`:
+
+```text
+== verify: 18 check(s) on projects/<project>/branches/<branch> ==
+  PASS role members_app_ro exists
+  PASS consumer view cicd_proj.members_v exists
+  ... one PASS line per check ...
+VERIFY OK
+```
+
 ### Step 2b: the source tables and the app roles (once, before the first deploy)
 
 Two things must exist before the first `bundle deploy`:
@@ -732,6 +744,12 @@ Shared:
 - A SQL warehouse (for seeding the demo Delta source tables) and an existing UC (Unity Catalog) catalog.
   The schema that holds your source tables must exist too; for the demo, `scripts/seed_source.sh`
   creates it.
+- For the dev target, the commands run as you. You need `CAN_USE` on the Lakebase project, UC
+  `USE CATALOG` and `USE SCHEMA`, `SELECT` on the schema that holds the source tables and
+  `CREATE TABLE` on the one that holds the synced tables. `CAN_USE` does not allow creating
+  Lakebase branches, so a first run on a child branch needs `CAN_MANAGE` on the project, which
+  the project owner has. "Run the prod target" below shows the same grants for a fixed deploy
+  service principal.
 
 For the DABs path:
 
@@ -748,7 +766,8 @@ For the Terraform path:
 - Terraform and the `databricks/databricks` provider. This reference was built and tested live on
   2026-10-14 with Terraform 1.16.2 and `databricks/databricks` provider 1.132.0. Use those or newer.
   The `databricks_postgres_*` resources are recent, so do not pin older.
-- Liquibase (OSS) 4.33.0 or newer, and `psql`.
+- Liquibase (OSS) 4.33.0, and `psql`. Stay on 4.x: Liquibase 5.0 and later is FSL-1.1-ALv2-licensed,
+  not Apache-2.0 (see the third-party software table below).
 
 ---
 
